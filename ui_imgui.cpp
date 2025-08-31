@@ -8,7 +8,9 @@
 #include <windows.h>
 #include <intrin.h>
 #include <shlwapi.h>
+#include <shellapi.h>
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "shell32.lib")
 #else
 #include <unistd.h>
 #include <sys/mman.h>
@@ -105,6 +107,46 @@ struct DuplicateItem {
 };
 
 static std::vector<DuplicateItem> g_duplicates;
+
+#ifdef _WIN32
+static bool taskbar_search_is_enabled(){
+    HKEY key;
+    bool ok = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\anything", 0, KEY_READ, &key) == ERROR_SUCCESS;
+    if(ok) RegCloseKey(key);
+    return ok;
+}
+
+static void set_taskbar_search(bool enable){
+    if(enable){
+        HKEY key;
+        wchar_t exe[MAX_LONG_PATH];
+        GetModuleFileNameW(NULL, exe, MAX_LONG_PATH);
+        if(RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\anything", 0, NULL, 0,
+            KEY_SET_VALUE | KEY_CREATE_SUB_KEY, NULL, &key, NULL) == ERROR_SUCCESS){
+            const wchar_t* desc = L"URL:Anything search";
+            RegSetValueExW(key, NULL, 0, REG_SZ, (const BYTE*)desc,
+                (DWORD)((wcslen(desc)+1)*sizeof(wchar_t)));
+            RegSetValueExW(key, L"URL Protocol", 0, REG_SZ, (const BYTE*)L"",
+                (DWORD)sizeof(wchar_t));
+            HKEY cmd;
+            if(RegCreateKeyExW(key, L"shell\\open\\command", 0, NULL, 0,
+                KEY_SET_VALUE, NULL, &cmd, NULL) == ERROR_SUCCESS){
+                wchar_t cmdline[MAX_LONG_PATH*2];
+                _snwprintf(cmdline, ARRAYSIZE(cmdline), L"\"%s\" \"%%1\"", exe);
+                RegSetValueExW(cmd, NULL, 0, REG_SZ, (const BYTE*)cmdline,
+                    (DWORD)((wcslen(cmdline)+1)*sizeof(wchar_t)));
+                RegCloseKey(cmd);
+            }
+            RegCloseKey(key);
+        }
+    } else {
+        RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\anything");
+    }
+}
+#else
+static bool taskbar_search_is_enabled(){ return false; }
+static void set_taskbar_search(bool){ }
+#endif
 
 struct Date {
     int year = 2020;
@@ -793,10 +835,23 @@ int run_ui(void){
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     std::string query_str;
+#ifdef _WIN32
+    {
+        int argc = 0;
+        wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if(argv && argc > 1 && wcsncmp(argv[1], L"anything:", 9) == 0){
+            char tmp[512];
+            to_utf8(argv[1] + 9, tmp, sizeof(tmp));
+            query_str = tmp;
+        }
+        if(argv) LocalFree(argv);
+    }
+#endif
     std::vector<Result> filtered;
     int selected = -1;
     bool show_advanced = false;
     Filters filters;
+    bool taskbar_integration = taskbar_search_is_enabled();
     bool need_update = true;
     bool need_sort = true;
     Db* db = nullptr;
@@ -988,6 +1043,16 @@ int run_ui(void){
                 if (ImGui::Button("Delete Selected")) {
                     // TODO: delete selected files
                 }
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Settings")) {
+#ifdef _WIN32
+                if (ImGui::Checkbox("Enable Taskbar Search integration", &taskbar_integration)) {
+                    set_taskbar_search(taskbar_integration);
+                }
+#else
+                ImGui::Text("No settings available");
+#endif
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
