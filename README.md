@@ -16,7 +16,7 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
   - Trigram-based full-text search
   - Full Boolean query syntax (AND/OR/NOT with grouping)
   - Full content extraction for text and common document formats (TXT, source code, PDF, DOCX, etc.)
-  - Optional content snippets and simple author metadata for text files
+  - Optional content snippets and rich metadata extraction (author, photo EXIF camera/lens, music ID3 artist/album, document title)
 - Archive content indexing (ZIP/RAR/7z) via libzip.
 - Pluggable scanners for cloud drives (OneDrive/Google Drive/pCloud/Dropbox).
 - Experimental WSL filesystem indexing.
@@ -25,7 +25,7 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
 - Fuzzy filename and content search using Levenshtein distance.
 - Command-line tools:
   - `anything.exe index` — build or update the database
-  - `search.exe` — query the database with filters (size, date, path, extension, content, author, regex, etc.). Add `--json` to emit results as structured JSON
+  - `search.exe` — query the database with filters (size, date, path, extension, content, author, camera, lens, artist, album, title, regex, etc.). Add `--json` to emit results as structured JSON
 
 ## Archive Content Indexing
 Anything can open common archives and index contained filenames so a search result can point directly to a file inside a ZIP, RAR, or 7z archive.
