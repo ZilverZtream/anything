@@ -346,16 +346,41 @@ BOOL fuzzy_match(const char* text, const char* pattern, int max_dist){
 
 void normalize_filename_utf8(const char* name_utf8, char* out, size_t outcap){
     if(!name_utf8 || !out || outcap==0){ if(out) out[0]=0; return; }
-    size_t len=strlen(name_utf8); size_t end=len;
-    for(size_t i=len;i>0;i--){ if(name_utf8[i-1]=='.'){ end=i-1; break; } }
+
+    /* If the caller supplied the same buffer for input and output we can
+       operate directly on it without any additional allocations. */
+    if(name_utf8 == out){
+        size_t len=strlen(out), end=len;
+        for(size_t i=len;i>0;i--){ if(out[i-1]=='.'){ end=i-1; break; } }
+        size_t o=0;
+        for(size_t i=0;i<end && o+1<outcap;i++){
+            char c=out[i];
+            if(c=='_'||c=='-'||c=='.') c=' ';
+            if(c>='A'&&c<='Z') c=(char)(c-'A'+'a');
+            out[o++]=c;
+        }
+        out[o]=0;
+        return;
+    }
+
+    /* Allocate only as much memory as needed for the copy instead of using
+       a fixed, over-sized buffer. */
+    size_t len=strlen(name_utf8);
+    char* tmp=(char*)malloc(len+1);
+    if(!tmp){ out[0]=0; return; }
+    memcpy(tmp,name_utf8,len+1);
+
+    size_t end=len;
+    for(size_t i=len;i>0;i--){ if(tmp[i-1]=='.'){ end=i-1; break; } }
     size_t o=0;
     for(size_t i=0;i<end && o+1<outcap;i++){
-        char c=name_utf8[i];
+        char c=tmp[i];
         if(c=='_'||c=='-'||c=='.') c=' ';
         if(c>='A'&&c<='Z') c=(char)(c-'A'+'a');
         out[o++]=c;
     }
     out[o]=0;
+    free(tmp);
 }
 
 typedef struct {
