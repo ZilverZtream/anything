@@ -244,19 +244,22 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
     if(needed<=0) return 0;
     char* u8 = (char*)_malloca(needed);
     WideCharToMultiByte(CP_UTF8,0,s,-1,u8,needed,NULL,NULL);
-    // lowercase ascii to normalize for trigram/ext uses (storage remains as-is)
-    // (We don't modify the primary string; for ext we compute separately.)
-    MDB_txn* rtxn=NULL;
-    if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn)!=0) return 0;
+    // Try to read using the current write txn if present; otherwise open a RO txn.
+    MDB_txn* rtxn = d->wtxn ? d->wtxn : NULL;
+    BOOL need_abort = FALSE;
+    if(!rtxn){
+        if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn)!=0){ _freea(u8); return 0; }
+        need_abort = TRUE;
+    }
     MDB_val k={.mv_data=u8,.mv_size=(size_t)(needed-1)}, v;
     int rc = mdb_get(rtxn, d->dbi_strrev, &k, &v);
     if(rc==0){
         uint64_t id = *(uint64_t*)v.mv_data;
-        mdb_txn_abort(rtxn);
+        if(need_abort) mdb_txn_abort(rtxn);
         _freea(u8);
         return id;
     }
-    mdb_txn_abort(rtxn);
+    if(need_abort) mdb_txn_abort(rtxn);
     if(!d->wtxn){ if(!db_begin_write(db_)){ _freea(u8); return 0; } }
     uint64_t new_id = d->header_cache.string_count + 1;
     d->header_cache.string_count = new_id;
