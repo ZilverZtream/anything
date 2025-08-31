@@ -14,8 +14,45 @@
 #include "anything.h"
 #include "database.h"
 #include "util.h"
+#include "lmdb.h"
 
 // ---- MPMC queue implementation ----
+static BOOL should_index_content(const wchar_t* name){
+    const wchar_t* ext = wcsrchr(name, L'.');
+    if(!ext) return FALSE;
+    ext++;
+    return _wcsicmp(ext,L"txt")==0 || _wcsicmp(ext,L"md")==0 ||
+           _wcsicmp(ext,L"c")==0   || _wcsicmp(ext,L"h")==0   ||
+           _wcsicmp(ext,L"cpp")==0 || _wcsicmp(ext,L"py")==0;
+}
+
+static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t* name, uint64_t* author_out){
+    *author_out = 0;
+    if(!should_index_content(name)) return 0;
+    wchar_t path[MAX_LONG_PATH];
+    _snwprintf(path, MAX_LONG_PATH, L"%s\\%s", parent, name);
+    FILE* f = _wfopen(path, L"rb");
+    if(!f) return 0;
+    char buf[4096+1]; size_t n = fread(buf,1,4096,f); fclose(f);
+    if(n==0) return 0;
+    buf[n]=0;
+    // crude binary check
+    for(size_t i=0;i<n;i++){ if(buf[i]==0){ buf[0]=0; break; } }
+    if(buf[0]==0) return 0;
+    char* a = StrStrIA(buf, "author:");
+    if(a){
+        a += 7;
+        while(*a==' '||*a=='\t') a++;
+        char tmp[256]; size_t len=0;
+        while(a[len] && a[len]!='\r' && a[len]!='\n' && len<255) len++;
+        memcpy(tmp,a,len); tmp[len]=0;
+        wchar_t wa[256]; to_wide(tmp, wa, 256);
+        *author_out = db_intern_wstring(db, wa);
+    }
+    wchar_t wbuf[4096];
+    MultiByteToWideChar(CP_UTF8,0,buf,-1,wbuf,4096);
+    return db_intern_wstring(db, wbuf);
+}
 BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size){
     if(!q) return FALSE;
     LONG size=1; while(size<pow2_size) size<<=1;
@@ -138,6 +175,9 @@ static DWORD WINAPI DbWriterThread(void* p){
         r.modified_time = wi->modified_time;
         r.access_time   = wi->access_time;
         r.attributes    = wi->attributes;
+        if(r.type == DB_REC_FILE){
+            r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id);
+        }
         _aligned_free(wi);
 
         buf[in_batch++] = r;

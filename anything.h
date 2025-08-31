@@ -34,6 +34,8 @@ typedef struct DbRecord {
     uint64_t  access_time;
     uint32_t  attributes;
     uint8_t   type;
+    uint64_t  content_str_id;
+    uint64_t  author_str_id;
 } DbRecord;
 
 typedef struct DbHeader {

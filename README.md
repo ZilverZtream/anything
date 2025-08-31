@@ -14,10 +14,11 @@ It scans drives (via NTFS USN journal or generic directory walking), stores file
   - Extension
   - Path hierarchy
   - Trigram-based full-text search
+- Optional content snippets and simple author metadata for text files
 - Bloom filters for quick name filtering.
 - Command-line tools:
   - `anything.exe index` — build or update the database
-  - `search.exe` — query the database with filters (size, date, path, extension, regex, etc.)
+  - `search.exe` — query the database with filters (size, date, path, extension, content, author, regex, etc.)
 
 ## Build
 This project is written in **C** for Windows.
