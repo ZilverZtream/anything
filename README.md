@@ -21,6 +21,7 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
 - Archive content indexing (ZIP/RAR/7z) via libzip.
 - Pluggable scanners for cloud drives (OneDrive/Google Drive/pCloud/Dropbox).
 - Native WSL filesystem indexing without wsl.exe overhead.
+- Incremental content indexing avoids re-scanning unchanged files.
 - Extensible plugin system so third parties can add new scanners.
 - Optional code-aware indexing plugin that parses source code (C/C++/Rust/Go/C#/VB.NET/Java/Python) and indexes function, class, and variable definitions for queries like `function:render_widget`.
 - Bloom filters for quick name filtering.
