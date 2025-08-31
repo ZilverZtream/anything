@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 #include <intrin.h>
 #include <objbase.h>
@@ -24,6 +25,8 @@
 #include "scanner.h"
 
 #include <stdbool.h>
+#include <zip.h>
+#include <libpst/libpst.h>
 
 static MPMCQueue g_live_updates;
 static BOOL g_live_inited = FALSE;
@@ -64,7 +67,7 @@ static void push_live_update(const DbWorkItem* wi){
 #endif
 
 // ---- MPMC queue implementation ----
-typedef enum { CONTENT_NONE, CONTENT_TEXT, CONTENT_IFILTER } ContentMode;
+typedef enum { CONTENT_NONE, CONTENT_TEXT, CONTENT_IFILTER, CONTENT_EMAIL, CONTENT_EPUB, CONTENT_PST } ContentMode;
 
 static ContentMode get_content_mode(const wchar_t* name){
     const wchar_t* ext = wcsrchr(name, L'.');
@@ -83,6 +86,15 @@ static ContentMode get_content_mode(const wchar_t* name){
        _wcsicmp(ext,L"pptx")==0 || _wcsicmp(ext,L"xls")==0  ||
        _wcsicmp(ext,L"xlsx")==0)
         return CONTENT_IFILTER;
+
+    if(_wcsicmp(ext,L"eml")==0 || _wcsicmp(ext,L"emlx")==0)
+        return CONTENT_EMAIL;
+
+    if(_wcsicmp(ext,L"epub")==0)
+        return CONTENT_EPUB;
+
+    if(_wcsicmp(ext,L"pst")==0)
+        return CONTENT_PST;
 
     return CONTENT_NONE;
 }
@@ -125,6 +137,202 @@ static wchar_t* extract_with_ifilter(const wchar_t* path){
     filter->Release();
     CoUninitialize();
     return out;
+}
+
+static wchar_t* extract_email_content(Db* db, const wchar_t* path, uint64_t* author_out, uint64_t* title_out){
+    *author_out = 0;
+    *title_out = 0;
+    FILE* f = _wfopen(path, L"rb");
+    if(!f) return NULL;
+    if(fseek(f,0,SEEK_END)!=0){ fclose(f); return NULL; }
+    long size = ftell(f);
+    if(size < 0){ fclose(f); return NULL; }
+    if(size > MAX_INDEXED_CONTENT) size = MAX_INDEXED_CONTENT;
+    rewind(f);
+    char* buf = (char*)malloc((size_t)size + 1);
+    if(!buf){ fclose(f); return NULL; }
+    size_t n = fread(buf,1,(size_t)size,f);
+    fclose(f);
+    buf[n]=0;
+    char* header_end = strstr(buf, "\r\n\r\n");
+    int advance = 4;
+    if(!header_end){ header_end = strstr(buf, "\n\n"); advance = 2; }
+    if(header_end){
+        char* line = buf;
+        while(line < header_end){
+            char* next = strstr(line, "\r\n");
+            size_t sep = 2;
+            if(!next || next > header_end){
+                next = strstr(line, "\n");
+                sep = 1;
+            }
+            if(!next || next > header_end) break;
+            size_t len = (size_t)(next - line);
+            if(_strnicmp(line, "From:",5)==0){
+                char tmp[256]; if(len>255) len=255; memcpy(tmp,line+5,len-5); tmp[len-5]=0;
+                wchar_t wtmp[256]; to_wide(tmp,wtmp,256); *author_out = db_intern_wstring(db,wtmp);
+            } else if(_strnicmp(line, "Subject:",8)==0){
+                char tmp[256]; if(len>255) len=255; memcpy(tmp,line+8,len-8); tmp[len-8]=0;
+                wchar_t wtmp[256]; to_wide(tmp,wtmp,256); *title_out = db_intern_wstring(db,wtmp);
+            }
+            line = next + sep;
+        }
+        header_end += advance;
+    } else {
+        header_end = buf;
+    }
+    char* body = header_end;
+    int wlen = MultiByteToWideChar(CP_UTF8,0,body,-1,NULL,0);
+    wchar_t* wbuf = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
+    if(wbuf) MultiByteToWideChar(CP_UTF8,0,body,-1,wbuf,wlen);
+    free(buf);
+    return wbuf;
+}
+
+static char* strip_html_tags(const char* in){
+    size_t len = strlen(in);
+    char* out = (char*)malloc(len+1);
+    if(!out) return NULL;
+    size_t o=0; int tag=0;
+    for(size_t i=0;i<len;i++){
+        if(in[i]=='<') tag=1;
+        else if(in[i]=='>') tag=0;
+        else if(!tag) out[o++]=in[i];
+    }
+    out[o]=0;
+    return out;
+}
+
+static wchar_t* extract_epub_content(Db* db, const wchar_t* path, uint64_t* author_out, uint64_t* title_out){
+    *author_out = 0;
+    *title_out = 0;
+    char u8[MAX_LONG_PATH*3];
+    to_utf8(path, u8, sizeof(u8));
+    int err=0; zip_t* z = zip_open(u8,0,&err);
+    if(!z) return NULL;
+    zip_stat_t st; char root[256]={0};
+    if(zip_stat(z,"META-INF/container.xml",0,&st)==0){
+        char* cbuf=(char*)malloc(st.size+1);
+        if(cbuf){
+            zip_file_t* cf=zip_fopen(z,"META-INF/container.xml",0);
+            zip_fread(cf,cbuf,st.size); zip_fclose(cf); cbuf[st.size]=0;
+            char* fp=strstr(cbuf,"full-path=");
+            if(fp){ fp=strchr(fp,'"'); if(fp){ fp++; char* end=strchr(fp,'"'); if(end){ size_t l=end-fp; if(l>255) l=255; memcpy(root,fp,l); root[l]=0; }}}
+            free(cbuf);
+        }
+    }
+    if(root[0]){
+        if(zip_stat(z,root,0,&st)==0){
+            char* obuf=(char*)malloc(st.size+1);
+            if(obuf){
+                zip_file_t* of=zip_fopen(z,root,0);
+                zip_fread(of,obuf,st.size); zip_fclose(of); obuf[st.size]=0;
+                char* t=strstr(obuf,"<dc:title");
+                if(t){ t=strchr(t,'>'); if(t){ t++; char* e=strstr(t,"</dc:title>"); if(e){ char tmp[256]; size_t l=e-t; if(l>255) l=255; memcpy(tmp,t,l); tmp[l]=0; wchar_t wtmp[256]; to_wide(tmp,wtmp,256); *title_out=db_intern_wstring(db,wtmp); }}}
+                char* a=strstr(obuf,"<dc:creator");
+                if(a){ a=strchr(a,'>'); if(a){ a++; char* e=strstr(a,"</dc:creator>"); if(e){ char tmp[256]; size_t l=e-a; if(l>255) l=255; memcpy(tmp,a,l); tmp[l]=0; wchar_t wtmp[256]; to_wide(tmp,wtmp,256); *author_out=db_intern_wstring(db,wtmp); }}}
+                free(obuf);
+            }
+        }
+    }
+    size_t cap=4096,len=0; char* textbuf=(char*)malloc(cap);
+    if(textbuf) textbuf[0]=0;
+    zip_int64_t count=zip_get_num_entries(z,0);
+    for(zip_int64_t i=0;i<count;i++){
+        const char* name=zip_get_name(z,i,0);
+        if(!name) continue;
+        size_t namelen=strlen(name);
+        if(namelen>5 && (_stricmp(name+namelen-5,".html")==0 || _stricmp(name+namelen-6,".xhtml")==0)){
+            if(zip_stat_index(z,i,0,&st)!=0) continue;
+            if(len + st.size >= MAX_INDEXED_CONTENT) break;
+            char* buf=(char*)malloc(st.size+1);
+            if(!buf) continue;
+            zip_file_t* f=zip_fopen_index(z,i,0);
+            zip_fread(f,buf,st.size); zip_fclose(f); buf[st.size]=0;
+            char* stripped=strip_html_tags(buf); free(buf);
+            if(!stripped) continue;
+            size_t slen=strlen(stripped);
+            if(len + slen +1 > cap){
+                cap=(cap+slen+1)*2; char* tmp=(char*)realloc(textbuf,cap); if(!tmp){ free(stripped); break; } textbuf=tmp;
+            }
+            memcpy(textbuf+len,stripped,slen); len+=slen; textbuf[len]=0; free(stripped);
+        }
+    }
+    zip_close(z);
+    wchar_t* wbuf=NULL;
+    if(textbuf){
+        int wlen=MultiByteToWideChar(CP_UTF8,0,textbuf,-1,NULL,0);
+        wbuf=(wchar_t*)malloc(sizeof(wchar_t)*wlen);
+        if(wbuf) MultiByteToWideChar(CP_UTF8,0,textbuf,-1,wbuf,wlen);
+        free(textbuf);
+    }
+    return wbuf;
+}
+
+static void append_utf8_line(char** buf, size_t* len, size_t* cap, const char* src){
+    if(!src) return;
+    size_t slen = strlen(src);
+    if(*len + slen + 2 > MAX_INDEXED_CONTENT){
+        if(*len >= MAX_INDEXED_CONTENT) return;
+        slen = MAX_INDEXED_CONTENT - *len - 1;
+    }
+    if(*len + slen + 2 > *cap){
+        size_t newcap = (*cap + slen + 2)*2;
+        char* tmp = (char*)realloc(*buf, newcap);
+        if(!tmp) return;
+        *buf = tmp; *cap = newcap;
+    }
+    memcpy(*buf + *len, src, slen);
+    *len += slen;
+    (*buf)[(*len)++]='\n';
+    (*buf)[*len]=0;
+}
+
+static void walk_pst_tree(pst_file* pf, pst_desc_tree* node, char** buf, size_t* len, size_t* cap){
+    for(pst_desc_tree* cur=node; cur; cur=cur->next){
+        pst_item* item = pst_parse_item(pf, cur, NULL);
+        if(item){
+            pst_convert_utf8_null(item, &item->subject);
+            pst_convert_utf8_null(item, &item->body);
+            if(item->email){
+                pst_convert_utf8_null(item, &item->email->sender_address);
+                if(item->email->sender_address.str)
+                    append_utf8_line(buf,len,cap,item->email->sender_address.str);
+            }
+            if(item->subject.str) append_utf8_line(buf,len,cap,item->subject.str);
+            if(item->body.str) append_utf8_line(buf,len,cap,item->body.str);
+            pst_freeItem(item);
+        }
+        if(cur->child) walk_pst_tree(pf, cur->child, buf, len, cap);
+    }
+}
+
+static wchar_t* extract_pst_content(Db* db, const wchar_t* path, uint64_t* author_out, uint64_t* title_out){
+    *author_out = 0;
+    *title_out = 0;
+    (void)db;
+    char u8[MAX_LONG_PATH*3];
+    to_utf8(path, u8, sizeof(u8));
+    pst_file pf; memset(&pf,0,sizeof(pf));
+    if(pst_open(&pf, u8, NULL)!=0) return NULL;
+    if(pst_load_index(&pf)!=0){ pst_close(&pf); return NULL; }
+    if(pst_load_extended_attributes(&pf)!=0){ pst_close(&pf); return NULL; }
+    pst_item* root = pst_parse_item(&pf, pf.d_head, NULL);
+    if(!root){ pst_close(&pf); return NULL; }
+    pst_desc_tree* top = pst_getTopOfFolders(&pf, root);
+    size_t cap=4096,len=0; char* buf=(char*)malloc(cap);
+    if(buf) buf[0]=0;
+    if(top && top->child) walk_pst_tree(&pf, top->child, &buf, &len, &cap);
+    pst_freeItem(root);
+    pst_close(&pf);
+    wchar_t* wbuf=NULL;
+    if(buf){
+        int wlen=MultiByteToWideChar(CP_UTF8,0,buf,-1,NULL,0);
+        wbuf=(wchar_t*)malloc(sizeof(wchar_t)*wlen);
+        if(wbuf) MultiByteToWideChar(CP_UTF8,0,buf,-1,wbuf,wlen);
+        free(buf);
+    }
+    return wbuf;
 }
 
 static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t* name, uint64_t* author_out, uint64_t* title_out){
@@ -177,6 +385,12 @@ static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t*
         free(buf);
     } else if(mode == CONTENT_IFILTER){
         wbuf = extract_with_ifilter(path);
+    } else if(mode == CONTENT_EMAIL){
+        wbuf = extract_email_content(db, path, author_out, title_out);
+    } else if(mode == CONTENT_EPUB){
+        wbuf = extract_epub_content(db, path, author_out, title_out);
+    } else if(mode == CONTENT_PST){
+        wbuf = extract_pst_content(db, path, author_out, title_out);
     }
     if(!wbuf) return 0;
     wchar_t* meta_a = StrStrIW(wbuf, L"author:");

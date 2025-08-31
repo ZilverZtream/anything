@@ -15,7 +15,8 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
   - Path hierarchy
   - Trigram-based full-text search
   - Full Boolean query syntax (AND/OR/NOT with grouping)
-  - Full content extraction for text and common document formats (TXT, source code, PDF, DOCX, etc.)
+  - Full content extraction for text and common document formats (TXT, source code, PDF, DOCX, etc.), plus native parsing for email (.eml), Outlook archives (.pst) and ebook (.epub) files
+  - Native parsers for email, Outlook archives and ebook formats extract sender, subject, author and title without relying on system IFilters
   - Optional content snippets and rich metadata extraction (author, photo EXIF camera/lens, music ID3 artist/album, document title)
 - Archive content indexing (ZIP/RAR/7z) via libzip.
 - Pluggable scanners for cloud drives (OneDrive/Google Drive/pCloud/Dropbox).
