@@ -77,6 +77,11 @@ static uint64_t today_day(void){
     return filetime_days(u.QuadPart);
 }
 
+static uint64_t day_to_filetime(uint64_t day){
+    const uint64_t TICKS_PER_DAY = 864000000000ULL;
+    return day * TICKS_PER_DAY;
+}
+
 static BOOL parse_date(const char* s, uint64_t* out_day){
     if(_stricmp(s,"today")==0){ *out_day = today_day(); return TRUE; }
     if(_stricmp(s,"yesterday")==0){ *out_day = today_day()-1; return TRUE; }
@@ -576,6 +581,19 @@ static void get_all_records(MDB_txn* txn, MDB_dbi dbi_date, IdVec* out){
     mdb_cursor_close(cd);
 }
 
+static void records_for_range(MDB_txn* txn, MDB_dbi dbi, uint64_t minv, uint64_t maxv, IdVec* out){
+    MDB_cursor* c=NULL; mdb_cursor_open(txn, dbi, &c);
+    MDB_val k={.mv_data=&minv,.mv_size=sizeof(minv)}, v;
+    int rc = mdb_cursor_get(c,&k,&v,MDB_SET_RANGE);
+    MDB_cmp_fn* cmp = mdb_cmp(txn, dbi);
+    MDB_val maxk={.mv_data=&maxv,.mv_size=sizeof(maxv)};
+    while(rc==0 && cmp(&k,&maxk) <= 0){
+        idvec_push(out, *(uint64_t*)v.mv_data);
+        rc = mdb_cursor_get(c,&k,&v,MDB_NEXT);
+    }
+    mdb_cursor_close(c);
+}
+
 static void records_for_meta(MDB_txn* txn, MDB_dbi dbi_index, MDB_dbi dbi_strrev, const char* val, IdVec* out){
     MDB_val k={.mv_data=(void*)val,.mv_size=strlen(val)}, v;
     if(mdb_get(txn, dbi_strrev,&k,&v)==0){
@@ -778,12 +796,13 @@ int wmain(int argc, wchar_t** argv){
     char u8db[MAX_PATH*3]; to_utf8(dbPath,u8db,sizeof(u8db));
     if(mdb_env_open(env, u8db, MDB_RDONLY, 0664)!=0){ fwprintf(stderr,L"env_open failed\n"); return 1; }
     if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ fwprintf(stderr,L"txn_begin failed\n"); return 1; }
-    MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_strrev;
+    MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_mtime, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_strrev, dbi_attr;
     if(mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
        mdb_dbi_open(txn,"records",0,&dbi_records)!=0 ||
        mdb_dbi_open(txn,"filename_index",0,&dbi_fname_index)!=0 ||
        mdb_dbi_open(txn,"trigram_index",0,&dbi_trigram)!=0 ||
        mdb_dbi_open(txn,"size_index",0,&dbi_size)!=0 ||
+       mdb_dbi_open(txn,"mtime_index",0,&dbi_mtime)!=0 ||
        mdb_dbi_open(txn,"date_index",0,&dbi_date)!=0 ||
        mdb_dbi_open(txn,"extension_index",0,&dbi_ext)!=0 ||
        mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0 ||
@@ -794,7 +813,8 @@ int wmain(int argc, wchar_t** argv){
        mdb_dbi_open(txn,"artist_index",0,&dbi_artist)!=0 ||
        mdb_dbi_open(txn,"album_index",0,&dbi_album)!=0 ||
        mdb_dbi_open(txn,"title_index",0,&dbi_title)!=0 ||
-       mdb_dbi_open(txn,"strrev",0,&dbi_strrev)!=0){
+       mdb_dbi_open(txn,"strrev",0,&dbi_strrev)!=0 ||
+       mdb_dbi_open(txn,"attr_index",0,&dbi_attr)!=0){
        fwprintf(stderr,L"dbi_open failed\n"); mdb_txn_abort(txn); mdb_env_close(env); return 1;
     }
 
@@ -808,6 +828,22 @@ int wmain(int argc, wchar_t** argv){
         get_all_records(txn, dbi_date, &rec_ids);
     }
     sort_unique(&rec_ids);
+
+    // Use secondary indexes to restrict candidate IDs
+    if(q.size_min>0 || q.size_max<~0ULL){
+        IdVec sz; idvec_init(&sz);
+        records_for_range(txn, dbi_size, q.size_min, q.size_max, &sz);
+        if(rec_ids.n>0){ intersect_inplace(&rec_ids,&sz); idvec_free(&sz); }
+        else { rec_ids = sz; }
+    }
+    if(q.date_min_day>0 || q.date_max_day<~0ULL){
+        uint64_t minft = day_to_filetime(q.date_min_day);
+        uint64_t maxft = day_to_filetime(q.date_max_day+1) - 1;
+        IdVec dt; idvec_init(&dt);
+        records_for_range(txn, dbi_mtime, minft, maxft, &dt);
+        if(rec_ids.n>0){ intersect_inplace(&rec_ids,&dt); idvec_free(&dt); }
+        else { rec_ids = dt; }
+    }
 
     MDB_stat st; mdb_stat(txn, dbi_records, &st);
     size_t total_docs = st.ms_entries;
