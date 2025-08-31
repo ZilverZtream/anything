@@ -2,6 +2,7 @@
 #include "util.h"
 #include <shlwapi.h>
 #include <string.h>
+#include <stdlib.h>
 #include <immintrin.h>
 #include <stdio.h>
 #include <math.h>
@@ -174,4 +175,59 @@ float bm25_score(int tf, int doc_len, float avg_doc_len, int docs_total, int doc
                      ((float)docs_with_term + 0.5f) + 1.0f);
     float denom = (float)tf + k1 * (1.0f - b + b * ((float)doc_len / avg_doc_len));
     return idf * ((float)tf * (k1 + 1.0f) / denom);
+}
+
+int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen){
+    if(!a) return (int)blen;
+    if(!b) return (int)alen;
+    int* prev=(int*)malloc((blen+1)*sizeof(int));
+    int* curr=(int*)malloc((blen+1)*sizeof(int));
+    if(!prev || !curr){ free(prev); free(curr); return (int)(alen>blen?alen:blen); }
+    for(size_t j=0;j<=blen;j++) prev[j]=(int)j;
+    for(size_t i=0;i<alen;i++){
+        curr[0]=(int)(i+1);
+        for(size_t j=0;j<blen;j++){
+            int cost=(a[i]==b[j])?0:1;
+            int del=prev[j+1]+1;
+            int ins=curr[j]+1;
+            int sub=prev[j]+cost;
+            int m=del<ins?del:ins;
+            if(sub<m) m=sub;
+            curr[j+1]=m;
+        }
+        int* tmp=prev; prev=curr; curr=tmp;
+    }
+    int dist=prev[blen];
+    free(prev); free(curr);
+    return dist;
+}
+
+BOOL fuzzy_match(const char* text, const char* pattern, int max_dist){
+    if(!text || !pattern) return FALSE;
+    size_t n=strlen(text), m=strlen(pattern);
+    if(m==0) return TRUE;
+    if(n<=m){
+        return levenshtein_distance(text, n, pattern, m) <= max_dist;
+    }
+    for(size_t i=0;i<=n-m;i++){
+        size_t win=m + (size_t)max_dist;
+        if(i+win>n) win=n-i;
+        int d=levenshtein_distance(text+i, win, pattern, m);
+        if(d<=max_dist) return TRUE;
+    }
+    return FALSE;
+}
+
+void normalize_filename_utf8(const char* name_utf8, char* out, size_t outcap){
+    if(!name_utf8 || !out || outcap==0){ if(out) out[0]=0; return; }
+    size_t len=strlen(name_utf8); size_t end=len;
+    for(size_t i=len;i>0;i--){ if(name_utf8[i-1]=='.'){ end=i-1; break; } }
+    size_t o=0;
+    for(size_t i=0;i<end && o+1<outcap;i++){
+        char c=name_utf8[i];
+        if(c=='_'||c=='-'||c=='.') c=' ';
+        if(c>='A'&&c<='Z') c=(char)(c-'A'+'a');
+        out[o++]=c;
+    }
+    out[o]=0;
 }

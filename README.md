@@ -20,6 +20,7 @@ It scans drives (via NTFS USN journal or generic directory walking), stores file
 - Pluggable scanners for cloud drives (OneDrive/Google Drive/pCloud/Dropbox).
 - Experimental WSL filesystem indexing.
 - Bloom filters for quick name filtering.
+- Fuzzy filename and content search using Levenshtein distance.
 - Command-line tools:
   - `anything.exe index` — build or update the database
   - `search.exe` — query the database with filters (size, date, path, extension, content, author, regex, etc.)
