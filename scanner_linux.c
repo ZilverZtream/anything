@@ -1,11 +1,13 @@
-#ifdef __linux__
+#if defined(__linux__) || defined(__ANDROID__)
 #define _XOPEN_SOURCE 700
 #include "scanner.h"
 #include <pthread.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#if !defined(__ANDROID__)
 #include <linux/magic.h>
+#endif
 #include <unistd.h>
 #include <ftw.h>
 #include <linux/limits.h>
@@ -108,6 +110,7 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
     (void)threads; (void)cancelEvent;
     char tmp[PATH_MAX];
     wcstombs(tmp, rootPath, PATH_MAX);
+#if !defined(__ANDROID__)
     struct statfs sfs;
     if(statfs(tmp, &sfs)==0){
         if(sfs.f_type==NFS_SUPER_MAGIC || sfs.f_type==SMB_SUPER_MAGIC || sfs.f_type==CIFS_SUPER_MAGIC){
@@ -119,6 +122,7 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
             return s;
         }
     }
+#endif
     FileScanner* s = (FileScanner*)calloc(1, sizeof(FileScanner));
     if(!s) return NULL;
     wcstombs(s->root, rootPath, PATH_MAX);

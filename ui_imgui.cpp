@@ -1,34 +1,47 @@
-#ifdef HAS_IMGUI
-#include <imgui.h>
-#include <imgui_impl_glfw.h>
-#include <imgui_impl_opengl3.h>
-#include <GLFW/glfw3.h>
-#include "stb_image.h"
-#include <windows.h>
-#include <wchar.h>
-#include <algorithm>
-#include <vector>
-#include <string>
-#include <unordered_set>
-#include <cctype>
-#include <ctime>
-#include <cmath>
-#include <limits.h>
-#include <intrin.h>
-#include <shlwapi.h>
-#include <inttypes.h>
-#include <ctype.h>
-#include <string.h>
-#include <stdlib.h>
-extern "C" {
-#include "lmdb.h"
-#include "database.h"
-#include "util.h"
-#include "anything.h"
-}
-#pragma comment(lib, "shlwapi.lib")
-#endif
-#include <stdio.h>
+ #ifdef HAS_IMGUI
+ #include <imgui.h>
+ #include <imgui_impl_glfw.h>
+ #include <imgui_impl_opengl3.h>
+ #include <GLFW/glfw3.h>
+ #include "stb_image.h"
+ #ifdef _WIN32
+ #include <windows.h>
+ #include <intrin.h>
+ #include <shlwapi.h>
+ #pragma comment(lib, "shlwapi.lib")
+ #else
+ #include <unistd.h>
+ #endif
+ #include <wchar.h>
+ #include <algorithm>
+ #include <vector>
+ #include <string>
+ #include <unordered_set>
+ #include <cctype>
+ #include <ctime>
+ #include <cmath>
+ #include <limits.h>
+ #include <inttypes.h>
+ #include <ctype.h>
+ #include <string.h>
+ #include <stdlib.h>
+ #include <thread>
+ #include <mutex>
+ extern "C" {
+ #include "lmdb.h"
+ #include "database.h"
+ #include "util.h"
+ #include "anything.h"
+ }
+ #endif
+ #include <stdio.h>
+
+ #ifndef MAX_PATH
+ #define MAX_PATH 260
+ #endif
+ #ifndef MAX_LONG_PATH
+ #define MAX_LONG_PATH 32767
+ #endif
 
 #ifdef HAS_IMGUI
 struct Result {
@@ -112,6 +125,12 @@ enum ResultColumn { COL_NAME, COL_PATH, COL_SIZE, COL_MOD, COL_SCORE };
 static void open_file_os(const std::string& p){
 #ifdef _WIN32
     ShellExecuteA(NULL, "open", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+    std::string cmd = std::string("open \"") + p + "\"";
+    system(cmd.c_str());
+#elif defined(__ANDROID__)
+    std::string cmd = std::string("am start -a android.intent.action.VIEW -d \"file://") + p + "\"";
+    system(cmd.c_str());
 #else
     std::string cmd = std::string("xdg-open \"") + p + "\"";
     system(cmd.c_str());
@@ -121,6 +140,12 @@ static void open_file_os(const std::string& p){
 static void open_folder_os(const std::string& p){
 #ifdef _WIN32
     ShellExecuteA(NULL, "open", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+    std::string cmd = std::string("open \"") + p + "\"";
+    system(cmd.c_str());
+#elif defined(__ANDROID__)
+    std::string cmd = std::string("am start -a android.intent.action.VIEW -d \"file://") + p + "\"";
+    system(cmd.c_str());
 #else
     std::string cmd = std::string("xdg-open \"") + p + "\"";
     system(cmd.c_str());
@@ -548,12 +573,11 @@ struct SearchThreadArgs {
     Filters filters;
     std::vector<Result>* results;
     bool* done;
-    SRWLOCK* lock;
+    std::mutex* mutex;
     char db_path[MAX_PATH * 3];
 };
 
-DWORD WINAPI search_thread(void* arg) {
-    SearchThreadArgs* sta = (SearchThreadArgs*)arg;
+static void search_thread(SearchThreadArgs* sta) {
     MDB_txn* txn = nullptr;
     mdb_txn_begin(sta->env, nullptr, MDB_RDONLY, &txn);
     MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_strrev;
@@ -623,41 +647,41 @@ DWORD WINAPI search_thread(void* arg) {
         rankedn++;
     }
     qsort(ranked.data(), rankedn, sizeof(RankedResult), cmp_rank);
-    AcquireSRWLockExclusive(sta->lock);
-    sta->results->clear();
-    for (size_t i = 0; i < rankedn && i < 1000; i++) {
-        uint64_t rid = ranked[i].rec_id;
-        MDB_val rk = {.mv_data = &rid, .mv_size = sizeof(rid)};
-        MDB_val rv;
-        mdb_get(txn, dbi_records, &rk, &rv);
-        DbRecord* r = (DbRecord*)rv.mv_data;
-        MDB_val pv, nv;
-        MDB_val pk = {.mv_data = &r->parent_str_id, .mv_size = sizeof(r->parent_str_id)};
-        MDB_val nk = {.mv_data = &r->name_str_id, .mv_size = sizeof(r->name_str_id)};
-        mdb_get(txn, dbi_strings, &pk, &pv);
-        mdb_get(txn, dbi_strings, &nk, &nv);
-        std::string path = std::string((char*)pv.mv_data, pv.mv_size);
-        std::string filename = std::string((char*)nv.mv_data, nv.mv_size);
-        std::string snippet = "";
-        if (r->content_str_id) {
-            MDB_val ck = {.mv_data = &r->content_str_id, .mv_size = sizeof(r->content_str_id)};
-            MDB_val cv;
-            mdb_get(txn, dbi_strings, &ck, &cv);
-            snippet = std::string((char*)cv.mv_data, cv.mv_size).substr(0, 500);
+    {
+        std::lock_guard<std::mutex> guard(*sta->mutex);
+        sta->results->clear();
+        for (size_t i = 0; i < rankedn && i < 1000; i++) {
+            uint64_t rid = ranked[i].rec_id;
+            MDB_val rk = {.mv_data = &rid, .mv_size = sizeof(rid)};
+            MDB_val rv;
+            mdb_get(txn, dbi_records, &rk, &rv);
+            DbRecord* r = (DbRecord*)rv.mv_data;
+            MDB_val pv, nv;
+            MDB_val pk = {.mv_data = &r->parent_str_id, .mv_size = sizeof(r->parent_str_id)};
+            MDB_val nk = {.mv_data = &r->name_str_id, .mv_size = sizeof(r->name_str_id)};
+            mdb_get(txn, dbi_strings, &pk, &pv);
+            mdb_get(txn, dbi_strings, &nk, &nv);
+            std::string path = std::string((char*)pv.mv_data, pv.mv_size);
+            std::string filename = std::string((char*)nv.mv_data, nv.mv_size);
+            std::string snippet = "";
+            if (r->content_str_id) {
+                MDB_val ck = {.mv_data = &r->content_str_id, .mv_size = sizeof(r->content_str_id)};
+                MDB_val cv;
+                mdb_get(txn, dbi_strings, &ck, &cv);
+                snippet = std::string((char*)cv.mv_data, cv.mv_size).substr(0, 500);
+            }
+            std::string type = "text";
+            size_t dot = filename.rfind('.');
+            if (dot != std::string::npos) {
+                std::string e = to_lower(filename.substr(dot + 1));
+                if (e == "jpg" || e == "png" || e == "gif" || e == "bmp") type = "image";
+                else if (e == "pdf") type = "pdf";
+            }
+            sta->results->push_back({filename, path, snippet, (int64_t)r->file_size, (time_t)(r->modified_time / 10000000 - 11644473600LL), type, ranked[i].score});
         }
-        std::string type = "text";
-        size_t dot = filename.rfind('.');
-        if (dot != std::string::npos) {
-            std::string e = to_lower(filename.substr(dot + 1));
-            if (e == "jpg" || e == "png" || e == "gif" || e == "bmp") type = "image";
-            else if (e == "pdf") type = "pdf";
-        }
-        sta->results->push_back({filename, path, snippet, (int64_t)r->file_size, (time_t)(r->modified_time / 10000000 - 11644473600LL), type, ranked[i].score});
+        *sta->done = true;
     }
-    *sta->done = true;
-    ReleaseSRWLockExclusive(sta->lock);
     mdb_txn_abort(txn);
-    return 0;
 }
 
 #endif
@@ -693,24 +717,32 @@ int run_ui(void){
     bool need_update = true;
     bool need_sort = true;
     Db* db = nullptr;
-    const DbHeader* header = db_open_readonly(L"anything.mdb", &db); // Assume DB path
+    const DbHeader* header;
+#ifdef _WIN32
+    header = db_open_readonly(L"anything.mdb", &db);
+    char u8db[MAX_PATH*3];
+    to_utf8(L"anything.mdb", u8db, sizeof(u8db));
+#else
+    wchar_t wdb[MAX_PATH];
+    mbstowcs(wdb, "anything.mdb", MAX_PATH);
+    header = db_open_readonly(wdb, &db);
+    char u8db[MAX_PATH*3];
+    strncpy(u8db, "anything.mdb", sizeof(u8db));
+#endif
     if (!header) {
         fprintf(stderr, "Failed to open DB\n");
     }
     MDB_env* env = nullptr;
     mdb_env_create(&env);
-    char u8db[MAX_PATH*3];
-    to_utf8(L"anything.mdb", u8db, sizeof(u8db));
     mdb_env_open(env, u8db, MDB_RDONLY, 0664);
-    HANDLE search_th = NULL;
+    std::thread search_th;
     SearchThreadArgs sta;
     bool search_done = true;
-    SRWLOCK search_lock;
-    InitializeSRWLock(&search_lock);
+    std::mutex search_lock;
     sta.env = env;
     sta.results = &filtered;
     sta.done = &search_done;
-    sta.lock = &search_lock;
+    sta.mutex = &search_lock;
     strcpy(sta.db_path, u8db);
 
     std::vector<Result> all_items; // Dummy if needed
@@ -718,15 +750,13 @@ int run_ui(void){
     live_updates_init();
 
     auto update_results = [&]() {
-        if (search_th) {
-            WaitForSingleObject(search_th, INFINITE);
-            CloseHandle(search_th);
-            search_th = NULL;
+        if (search_th.joinable()) {
+            search_th.join();
         }
         search_done = false;
         sta.query = query_str;
         sta.filters = filters;
-        search_th = CreateThread(NULL, 0, search_thread, &sta, 0, NULL);
+        search_th = std::thread(search_thread, &sta);
         need_sort = true;
     };
 
@@ -884,12 +914,9 @@ int run_ui(void){
         if (need_update) {
             update_results();
             need_update = false;
-        } else if (search_th && search_done) {
-            WaitForSingleObject(search_th, INFINITE);
-            CloseHandle(search_th);
-            search_th = NULL;
+        } else if (search_th.joinable() && search_done) {
+            search_th.join();
             need_sort = true;
-            search_done = true;
         }
 
         ImGui::Render();
@@ -902,9 +929,8 @@ int run_ui(void){
         glfwSwapBuffers(window);
     }
 
-    if (search_th) {
-        WaitForSingleObject(search_th, INFINITE);
-        CloseHandle(search_th);
+    if (search_th.joinable()) {
+        search_th.join();
     }
 
     for (auto& r : all_items) {
