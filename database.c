@@ -288,6 +288,7 @@ static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     memcpy(tmp, name_u8, len+1);
     lowercase_ascii(tmp, len);
 
+    // Deduplicate trigrams to avoid duplicate index entries
     uint32_t seen[256]; UINT seen_n=0;
     for(size_t i=0;i+3<=len;i++){
         uint32_t key = ((uint8_t)tmp[i]<<16)|((uint8_t)tmp[i+1]<<8)|((uint8_t)tmp[i+2]);
