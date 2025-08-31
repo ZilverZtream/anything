@@ -23,6 +23,7 @@
 #include "archive.h"
 #include "plugin.h"
 #include "scanner.h"
+#include "enterprise.h"
 
 #include <stdbool.h>
 #include <zip.h>
@@ -728,6 +729,7 @@ static DWORD WINAPI scan_drive_thread(void* p){
 }
 
 int wmain(int argc, wchar_t** argv){
+    enterprise_deploy_msi();
     if(argc>1 && wcscmp(argv[1], L"compress")==0){
         const wchar_t* dbPath=NULL; const wchar_t* outPath=NULL;
         for(int i=2;i<argc;i++){
@@ -750,6 +752,8 @@ int wmain(int argc, wchar_t** argv){
     Args args;
     live_updates_init();
     if(!parse_args(argc, argv, &args)) return 1;
+    enterprise_ad_authenticate("user", "");
+    enterprise_index_network("\\\\networkshare");
 
     Db* db=NULL;
     if(!db_create(args.dbPath, /*init_mb*/1024, /*max_mb*/16384, &db)){

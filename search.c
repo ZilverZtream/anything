@@ -17,6 +17,7 @@
 #include "anything.h"
 #include "util.h"
 #include "lmdb.h"
+#include "enterprise.h"
 
 #ifdef HAS_PCRE2
 #include <pcre2.h>
@@ -805,6 +806,8 @@ int wmain(int argc, wchar_t** argv){
         size_t ulen = strlen(u8);
         if(qpos + ulen + 2 < sizeof(qcanon)){ memcpy(qcanon+qpos,u8,ulen); qpos+=ulen; qcanon[qpos++]=' '; qcanon[qpos]=0; }
     }
+    enterprise_audit_log("user", qcanon);
+    enterprise_ad_authenticate("user", "");
     wchar_t dbPath[MAX_PATH];
     SearchQuery q; TokenList tokens;
     int workers=1; bool json_output=false;
@@ -818,6 +821,10 @@ int wmain(int argc, wchar_t** argv){
     }
     parse_query(argc, argv, dbPath, &q, &tokens);
     if(!dbPath[0]){ usage(); return 1; }
+    if(!enterprise_check_permission("user", "db")){
+        fwprintf(stderr, L"Permission denied\n");
+        return 1;
+    }
     if(!open_bloom(dbPath)){ fwprintf(stderr,L"bloom open failed\n"); return 1; }
 
     // Try cache
