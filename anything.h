@@ -118,6 +118,12 @@ GenericScanner* GenericScanner_Start(const wchar_t* rootPath, int threads, MPMCQ
 void GenericScanner_Wait(GenericScanner* s);
 void GenericScanner_Free(GenericScanner* s);
 
+// ---- Network share scanner ----
+typedef struct NetworkScanner NetworkScanner;
+NetworkScanner* NetworkScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent);
+void NetworkScanner_Wait(NetworkScanner* s);
+void NetworkScanner_Free(NetworkScanner* s);
+
 // ---- NTFS USN-based scanner ----
 typedef struct NTFSScanner NTFSScanner;
 NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue* outQueue, HANDLE cancelEvent);
