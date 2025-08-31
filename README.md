@@ -50,3 +50,14 @@ This project is written in **C** for Windows.
 ```bat
 cl /O2 /MD anything.c database.c exfat.c ntfs.c search.c util.c plugin.c lmdb.lib shlwapi.lib
 ```
+
+## Graphical User Interface
+`ui_imgui.cpp` provides a Dear ImGui front end that streams instant search results from the LMDB database. It features a preview pane with highlighted text snippets or image thumbnails and an "Advanced Search Builder" for extension, size, date, path, regex and whole-word filters.
+
+Compile with `HAS_IMGUI` (and optionally `HAS_STB_IMAGE` for image previews) and link against ImGui, GLFW, OpenGL, LMDB, stb_image and the Win32 shlwapi library:
+
+```
+cl /std:c++17 /EHsc ui_imgui.cpp imgui*.cpp glfw3.lib opengl32.lib lmdb.lib shlwapi.lib
+```
+
+Without these libraries the `run_ui` function prints a message and exits so command-line tools remain usable.
