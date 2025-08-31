@@ -31,6 +31,7 @@ static void emit(MPMCQueue* q, const wchar_t* parent, const WIN32_FIND_DATAW* f)
     wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
     wcscpy_s(wi->name, MAX_PATH, f->cFileName);
     wi->attributes = f->dwFileAttributes;
+    wi->clone_id = 0;
     ULARGE_INTEGER s; s.LowPart=f->nFileSizeLow; s.HighPart=f->nFileSizeHigh; wi->file_size=s.QuadPart;
     wi->creation_time = ((ULARGE_INTEGER){.LowPart=f->ftCreationTime.dwLowDateTime,.HighPart=f->ftCreationTime.dwHighDateTime}).QuadPart;
     wi->modified_time = ((ULARGE_INTEGER){.LowPart=f->ftLastWriteTime.dwLowDateTime,.HighPart=f->ftLastWriteTime.dwHighDateTime}).QuadPart;

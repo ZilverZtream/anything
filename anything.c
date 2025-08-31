@@ -585,6 +585,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                 wcscpy_s(next->name, MAX_PATH, wi->name);
                 next->file_size = next->creation_time = next->modified_time = next->access_time = 0;
                 next->attributes = wi->attributes;
+                next->clone_id = 0;
                 next->stage = INDEX_METADATA_LIGHT; next->op = WI_ADD;
                 while(!MPMC_Push(&ctx->queue, next)) Sleep(0);
             }
@@ -612,6 +613,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                     wcscpy_s(next->name, MAX_PATH, wi->name);
                     next->file_size = sz; next->creation_time=ct; next->modified_time=mt; next->access_time=at;
                     next->attributes = attrs;
+                    next->clone_id = 0;
                     next->stage = INDEX_FULL_CONTENT; next->op = WI_ADD;
                     while(!MPMC_Push(&ctx->queue, next)) Sleep(0);
                 }

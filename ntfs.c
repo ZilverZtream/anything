@@ -213,6 +213,7 @@ static DWORD WINAPI usn_thread(void* p){
         wi->file_size = 0;
         wi->creation_time = wi->modified_time = wi->access_time = 0;
         wi->attributes = e->attrs;
+        wi->clone_id = 0;
         wi->stage = INDEX_NAMES_ONLY;
         wi->op = WI_ADD;
         while(!MPMC_Push(s->outq, wi)) { SwitchToThread(); }
@@ -297,6 +298,7 @@ static DWORD WINAPI tail_thread(void* p){
                         wcscpy_s(wi->name, MAX_PATH, name);
                         wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
                         wi->attributes = 0;
+                        wi->clone_id = 0;
                         wi->stage = INDEX_NAMES_ONLY;
                         wi->op = WI_DELETE;
                         while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }
@@ -324,6 +326,7 @@ static DWORD WINAPI tail_thread(void* p){
                         get_file_info_basic(fn, &attrs, &sz, &ct, &mt, &at);
                         wi->attributes = attrs?attrs: r->FileAttributes;
                         wi->file_size = sz; wi->creation_time=ct; wi->modified_time=mt; wi->access_time=at;
+                        wi->clone_id = 0;
                         wi->stage = INDEX_METADATA_LIGHT;
                         wi->op = WI_ADD;
                         while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }
