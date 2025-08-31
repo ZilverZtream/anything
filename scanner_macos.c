@@ -46,7 +46,11 @@ static void emit(FileScanner* s, const char* path){
     mbstowcs(wi->parent_path, parent, MAX_LONG_PATH);
     mbstowcs(wi->name, name, MAX_PATH);
     wi->file_size = st.st_size;
+#if defined(__APPLE__)
+    wi->creation_time = st.st_birthtime;
+#else
     wi->creation_time = st.st_mtime;
+#endif
     wi->modified_time = st.st_mtime;
     wi->access_time = st.st_atime;
     wi->attributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : 0;
