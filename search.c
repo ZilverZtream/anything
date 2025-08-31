@@ -22,6 +22,21 @@
 #include <pcre2.h>
 #endif
 
+typedef struct { uint32_t trigram_count; uint64_t bloom_offset; } StringMeta;
+static const uint8_t* g_bloom_base = NULL;
+static size_t g_bloom_size = 0;
+static BOOL open_bloom(const wchar_t* dbPath){
+    wchar_t bp[MAX_PATH]; swprintf(bp, MAX_PATH, L"%s\\bloom.dat", dbPath);
+    HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if(f==INVALID_HANDLE_VALUE) return FALSE;
+    LARGE_INTEGER sz; GetFileSizeEx(f,&sz); g_bloom_size = sz.QuadPart;
+    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL); CloseHandle(f);
+    if(!m) return FALSE;
+    g_bloom_base = (const uint8_t*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0); CloseHandle(m);
+    return g_bloom_base != NULL;
+}
+static void close_bloom(void){ if(g_bloom_base) UnmapViewOfFile(g_bloom_base); }
+
 typedef struct {
     char* name_pattern;
     char* content_pattern;
@@ -689,8 +704,10 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
         }
         for(size_t i=0;i<name_ids.n;i++){
             MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
-            if(mdb_get(txn, dbi_smeta,&k,&v)!=0 || v.mv_size<8196) continue;
-            const uint8_t* bloom=(const uint8_t*)v.mv_data+4;
+            if(mdb_get(txn, dbi_smeta,&k,&v)!=0 || v.mv_size<sizeof(StringMeta)) continue;
+            const StringMeta* sm = (const StringMeta*)v.mv_data;
+            if(sm->bloom_offset + 8192 > g_bloom_size) continue;
+            const uint8_t* bloom = g_bloom_base + sm->bloom_offset;
             BOOL ok=TRUE;
             for(size_t j=0;j<hn;j++){
                 uint32_t bit=hbuf[j];
@@ -801,6 +818,7 @@ int wmain(int argc, wchar_t** argv){
     }
     parse_query(argc, argv, dbPath, &q, &tokens);
     if(!dbPath[0]){ usage(); return 1; }
+    if(!open_bloom(dbPath)){ fwprintf(stderr,L"bloom open failed\n"); return 1; }
 
     // Try cache
     if(q.name_pattern){
@@ -818,8 +836,8 @@ int wmain(int argc, wchar_t** argv){
     if(mdb_env_create(&env)!=0){ fwprintf(stderr,L"env_create failed\n"); return 1; }
     mdb_env_set_maxdbs(env, 64);
     char u8db[MAX_PATH*3]; to_utf8(dbPath,u8db,sizeof(u8db));
-    if(mdb_env_open(env, u8db, MDB_RDONLY, 0664)!=0){ fwprintf(stderr,L"env_open failed\n"); return 1; }
-    if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ fwprintf(stderr,L"txn_begin failed\n"); return 1; }
+    if(mdb_env_open(env, u8db, MDB_RDONLY, 0664)!=0){ fwprintf(stderr,L"env_open failed\n"); close_bloom(); return 1; }
+    if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ fwprintf(stderr,L"txn_begin failed\n"); close_bloom(); return 1; }
     MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_mtime, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_strrev, dbi_attr;
     if(mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
        mdb_dbi_open(txn,"records",0,&dbi_records)!=0 ||
@@ -839,7 +857,7 @@ int wmain(int argc, wchar_t** argv){
        mdb_dbi_open(txn,"title_index",0,&dbi_title)!=0 ||
        mdb_dbi_open(txn,"strrev",0,&dbi_strrev)!=0 ||
        mdb_dbi_open(txn,"attr_index",0,&dbi_attr)!=0){
-       fwprintf(stderr,L"dbi_open failed\n"); mdb_txn_abort(txn); mdb_env_close(env); return 1;
+       fwprintf(stderr,L"dbi_open failed\n"); mdb_txn_abort(txn); mdb_env_close(env); close_bloom(); return 1;
     }
 
 
@@ -945,18 +963,20 @@ int wmain(int argc, wchar_t** argv){
     if(q.path_filter) free(q.path_filter);
     idvec_free(&rec_ids);
     tokenlist_free(&tokens);
+    close_bloom();
     return 0;
 
 do_search_with_ids: ;
     // If we jump here (cache hit), we need to reopen env to resolve
     MDB_env* env2=NULL; MDB_txn* txn2=NULL;
     mdb_env_create(&env2); mdb_env_set_maxdbs(env2,64);
-    if(mdb_env_open(env2, u8db, MDB_RDONLY, 0664)!=0){ return 1; }
+    if(mdb_env_open(env2, u8db, MDB_RDONLY, 0664)!=0){ close_bloom(); return 1; }
     mdb_txn_begin(env2,NULL,MDB_RDONLY,&txn2);
     MDB_dbi dbi_strings2, dbi_records2;
     mdb_dbi_open(txn2,"strings",0,&dbi_strings2);
     mdb_dbi_open(txn2,"records",0,&dbi_records2);
     // Actually, cached ids were in 'cached', but we didn't carry it here. For brevity, skip cache reopen path.
     mdb_txn_abort(txn2); mdb_env_close(env2);
+    close_bloom();
     return 0;
 }

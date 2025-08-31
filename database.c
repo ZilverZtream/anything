@@ -19,16 +19,16 @@
 
 typedef struct {
     uint32_t trigram_count;
-    uint8_t  bloom[8192]; // 64Kb bits
+    uint64_t bloom_offset; // offset in bloom file
 } StringMeta;
 
-static inline void bloom_set(StringMeta* sm, uint32_t h){
+static inline void bloom_set(uint8_t* bloom, uint32_t h){
     uint32_t bit = h & 0xFFFFu; // 65536 bits
-    sm->bloom[bit>>3] |= (uint8_t)(1u << (bit & 7));
+    bloom[bit>>3] |= (uint8_t)(1u << (bit & 7));
 }
-static inline BOOL bloom_has(const StringMeta* sm, uint32_t h){
+static inline BOOL bloom_has(const uint8_t* bloom, uint32_t h){
     uint32_t bit = h & 0xFFFFu;
-    return (sm->bloom[bit>>3] & (uint8_t)(1u << (bit & 7))) != 0;
+    return (bloom[bit>>3] & (uint8_t)(1u << (bit & 7))) != 0;
 }
 static uint32_t hash32_seed(const void* data, size_t len, uint32_t seed){
     const uint8_t* p=(const uint8_t*)data;
@@ -45,18 +45,20 @@ static void build_bloom_hashes_simd(const char* tri, uint32_t* out4){
     __m128i res = _mm_mullo_epi32(x, mul);
     _mm_storeu_si128((__m128i*)out4, res);
 }
-static void build_bloom_for_name(const char* name_u8, StringMeta* sm){
-    ZeroMemory(sm, sizeof(*sm));
+static uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom){
+    ZeroMemory(bloom, 8192);
+    uint32_t tcount = 0;
     size_t len = strlen(name_u8);
-    if(len<3) return;
+    if(len<3) return 0;
     char* tmp=(char*)_malloca(len+1); memcpy(tmp,name_u8,len+1); lowercase_ascii(tmp,len);
     for(size_t i=0;i+3<=len;i++){
         uint32_t hs[4];
         build_bloom_hashes_simd(&tmp[i], hs);
-        bloom_set(sm, hs[0]); bloom_set(sm, hs[1]); bloom_set(sm, hs[2]); bloom_set(sm, hs[3]);
-        sm->trigram_count++;
+        bloom_set(bloom, hs[0]); bloom_set(bloom, hs[1]); bloom_set(bloom, hs[2]); bloom_set(bloom, hs[3]);
+        tcount++;
     }
     _freea(tmp);
+    return tcount;
 }
 
 
@@ -89,6 +91,8 @@ typedef struct {
     int      last_err;
     size_t   map_init;
     size_t   map_max;
+    HANDLE   bloom_file;
+    uint64_t bloom_offset;
     DbHeader header_cache;
 } DbImpl;
 
@@ -149,6 +153,11 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
     char u8[MAX_PATH*3]; WideCharToMultiByte(CP_UTF8,0,path,-1,u8,sizeof(u8),NULL,NULL);
     rc = mdb_env_open(d->env, u8, MDB_WRITEMAP|MDB_MAPASYNC, 0664);
     if(rc){ set_last_err(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
+    wchar_t bloomPath[MAX_PATH];
+    swprintf(bloomPath, MAX_PATH, L"%s\\bloom.dat", path);
+    d->bloom_file = CreateFileW(bloomPath, GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(d->bloom_file==INVALID_HANDLE_VALUE){ set_last_err(d, GetLastError()); mdb_env_close(d->env); free(d); return FALSE; }
+    LARGE_INTEGER sz; sz.QuadPart = 0; GetFileSizeEx(d->bloom_file, &sz); d->bloom_offset = sz.QuadPart; SetFilePointerEx(d->bloom_file, sz, NULL, FILE_BEGIN);
     MDB_txn* txn;
     if((rc = mdb_txn_begin(d->env, NULL, 0, &txn))){ set_last_err(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
     if((rc = open_core_dbs(txn, d, TRUE))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
@@ -192,6 +201,7 @@ void db_close(Db* db_){
     DbImpl* d = (DbImpl*)db_;
     if(d->wtxn){ mdb_txn_abort(d->wtxn); d->wtxn=NULL; }
     if(d->env){ mdb_env_close(d->env); }
+    if(d->bloom_file && d->bloom_file!=INVALID_HANDLE_VALUE){ CloseHandle(d->bloom_file); }
     free(d);
 }
 
@@ -448,7 +458,12 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
             // ensure bloom meta exists
             MDB_val mk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, mv;
             if(mdb_get(d->wtxn, d->dbi_string_meta, &mk, &mv)!=0){
-                StringMeta sm; build_bloom_for_name((const char*)namev.mv_data, &sm);
+                uint8_t bloom[8192];
+                uint32_t tc = build_bloom_for_name((const char*)namev.mv_data, bloom);
+                uint64_t off = d->bloom_offset;
+                DWORD wr; WriteFile(d->bloom_file, bloom, 8192, &wr, NULL);
+                d->bloom_offset += wr;
+                StringMeta sm={.trigram_count=tc,.bloom_offset=off};
                 MDB_val smv={.mv_data=&sm,.mv_size=sizeof(sm)};
                 mdb_put(d->wtxn, d->dbi_string_meta, &mk, &smv, 0);
             }
@@ -468,7 +483,12 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
             if(str_by_id(d, d->wtxn, r->content_str_id, &cvstr)){
                 MDB_val mk={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, mv;
                 if(mdb_get(d->wtxn, d->dbi_string_meta, &mk, &mv)!=0){
-                    StringMeta sm; build_bloom_for_name((const char*)cvstr.mv_data, &sm);
+                    uint8_t bloom[8192];
+                    uint32_t tc = build_bloom_for_name((const char*)cvstr.mv_data, bloom);
+                    uint64_t off = d->bloom_offset;
+                    DWORD wr; WriteFile(d->bloom_file, bloom, 8192, &wr, NULL);
+                    d->bloom_offset += wr;
+                    StringMeta sm={.trigram_count=tc,.bloom_offset=off};
                     MDB_val smv={.mv_data=&sm,.mv_size=sizeof(sm)};
                     mdb_put(d->wtxn, d->dbi_string_meta, &mk, &smv, 0);
                 }
