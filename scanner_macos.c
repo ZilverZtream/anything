@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
+#include <ftw.h>
 
 #ifndef FILE_ATTRIBUTE_DIRECTORY
 #define FILE_ATTRIBUTE_DIRECTORY 0x10
@@ -16,7 +17,10 @@ struct FileScanner {
     FSEventStreamRef stream;
     pthread_t thread;
     MPMCQueue* outq;
+    char root[PATH_MAX];
 };
+
+static FileScanner* g_current;
 
 static void emit(FileScanner* s, const char* path){
     struct stat st;
@@ -44,6 +48,12 @@ static void emit(FileScanner* s, const char* path){
     while(!MPMC_Push(s->outq, wi)) sched_yield();
 }
 
+static int enum_cb(const char* fpath, const struct stat* sb, int typeflag, struct FTW* ftwbuf){
+    (void)sb; (void)typeflag; (void)ftwbuf;
+    emit(g_current, fpath);
+    return 0;
+}
+
 static void fsevent_cb(ConstFSEventStreamRef streamRef,
                        void *clientCallBackInfo,
                        size_t numEvents,
@@ -60,6 +70,8 @@ static void fsevent_cb(ConstFSEventStreamRef streamRef,
 
 static void* runloop_thread(void* arg){
     FileScanner* s = (FileScanner*)arg;
+    g_current = s;
+    nftw(s->root, enum_cb, 16, FTW_PHYS);
     FSEventStreamScheduleWithRunLoop(s->stream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
     FSEventStreamStart(s->stream);
     CFRunLoopRun();
@@ -71,9 +83,8 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
     FileScanner* s = (FileScanner*)calloc(1,sizeof(FileScanner));
     if(!s) return NULL;
     s->outq = outQueue;
-    char utf8[PATH_MAX];
-    wcstombs(utf8, rootPath, PATH_MAX);
-    CFStringRef path = CFStringCreateWithCString(NULL, utf8, kCFStringEncodingUTF8);
+    wcstombs(s->root, rootPath, PATH_MAX);
+    CFStringRef path = CFStringCreateWithCString(NULL, s->root, kCFStringEncodingUTF8);
     CFArrayRef paths = CFArrayCreate(NULL, (const void**)&path, 1, &kCFTypeArrayCallBacks);
     FSEventStreamContext ctx = {0, s, NULL, NULL, NULL};
     s->stream = FSEventStreamCreate(NULL, fsevent_cb, &ctx, paths,
