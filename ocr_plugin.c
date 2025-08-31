@@ -35,6 +35,7 @@ static void scan(void){
     WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pattern, &fd);
     if(h==INVALID_HANDLE_VALUE) return;
     do{
+        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
         if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         const wchar_t* ext = wcsrchr(fd.cFileName, L'.');
         if(!ext) continue; ext++;
@@ -57,7 +58,16 @@ static void scan(void){
         wi->access_time   = ((ULARGE_INTEGER){fd.ftLastAccessTime.dwLowDateTime, fd.ftLastAccessTime.dwHighDateTime}).QuadPart;
         wi->attributes = fd.dwFileAttributes;
         wi->op = WI_ADD;
-        while(!MPMC_Push(g_host.queue, wi)) Sleep(0);
+        int tries = 0;
+        while(!MPMC_Push(g_host.queue, wi)){
+            if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
+                free(wi->content);
+                _aligned_free(wi);
+                FindClose(h);
+                return;
+            }
+            Sleep(0);
+        }
     }while(FindNextFileW(h,&fd));
     FindClose(h);
 }
