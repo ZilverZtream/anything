@@ -180,7 +180,6 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0);
     if(!base){ CloseHandle(m); CloseHandle(f); return FALSE; }
     const CacheHeader* h = (const CacheHeader*)base;
-    uint64_t sig = hash64(qstr, strlen(qstr));
     BOOL ok = FALSE;
     if(h->sig == sig && sz >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
         out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
@@ -215,11 +214,22 @@ static int cmp_u64(const void* A, const void* B){
     return (a>b) - (a<b);
 }
 static void sort_unique(IdVec* v){
+    qsort(v->ids, v->n, sizeof(uint64_t), cmp_u64);
+    size_t w=0; uint64_t prev=0;
+    for(size_t i=0;i<v->n;i++){
+        if(i==0 || v->ids[i]!=prev){
+            v->ids[w++]=prev=v->ids[i];
+        }
+    }
+    v->n = w;
+}
+
 typedef struct {
     MDB_env* envs[4];
     SRWLOCK  lock;
     int count;
 } EnvPool;
+
 static void envpool_init(EnvPool* p, const char* dbpath, int want){
     InitializeSRWLock(&p->lock); p->count = (want<1)?1:(want>4?4:want);
     for(int i=0;i<p->count;i++){
@@ -227,6 +237,7 @@ static void envpool_init(EnvPool* p, const char* dbpath, int want){
         mdb_env_open(p->envs[i], dbpath, MDB_RDONLY, 0664);
     }
 }
+
 static void envpool_close(EnvPool* p){
     for(int i=0;i<p->count;i++){ if(p->envs[i]) mdb_env_close(p->envs[i]); }
 }
@@ -236,8 +247,20 @@ typedef struct {
     float score;
 } RankedResult;
 
-typedef struct FilterArgs FilterArgs;
+typedef struct FilterArgs {
+    MDB_env* env;
+    uint64_t* ids;
+    size_t start, end;
+    SearchQuery* q;
+    RankedResult* out;
+    size_t* outn;
+    char db_path[MAX_PATH*3];
+    SRWLOCK* lock;
+    size_t total_docs;
+    size_t docs_with_term;
+} FilterArgs;
 
+static float calculate_relevance(const DbRecord* r, const char* parent_utf8, const char* name_utf8, const SearchQuery* q, size_t total_docs, size_t docs_with_term);
 
 static DWORD WINAPI filter_worker_thread(void* p){
     FilterArgs* a=(FilterArgs*)p;
@@ -333,15 +356,6 @@ static float calculate_relevance(const DbRecord* r, const char* parent_utf8, con
     if(is_executable_ext(name_utf8)) score += 15.0f;
     if(r->file_size>0 && r->file_size < 4096) score -= 2.0f;
     return score;
-}
-
-    if(v->n==0) return;
-    qsort(v->ids, v->n, sizeof(uint64_t), cmp_u64);
-    size_t w=1;
-    for(size_t i=1;i<v->n;i++){
-        if(v->ids[i]!=v->ids[w-1]) v->ids[w++]=v->ids[i];
-    }
-    v->n=w;
 }
 static void intersect_inplace(IdVec* a, const IdVec* b){
     size_t i=0,j=0,w=0;
@@ -481,8 +495,9 @@ int wmain(int argc, wchar_t** argv){
             }
             if(ok){ name_ids.ids[keep++]=name_ids.ids[i]; }
         }
-        name_ids.n=keep;
-        _freea(tl);
+    name_ids.n=keep;
+    _freea(tl);
+}
     }
     if(q.content_pattern){
         collect_trigram_candidates(txn, dbi_trigram, q.content_pattern, &content_ids);
@@ -561,18 +576,6 @@ int wmain(int argc, wchar_t** argv){
     size_t docs_with_term = rec_ids.n;
 
     // Step 3: Apply filters, rank, and print (parallel)
-    typedef struct {
-    MDB_env* env; 
-    uint64_t* ids; 
-    size_t start, end; 
-    SearchQuery* q; 
-    RankedResult* out; 
-    size_t* outn;
-    char db_path[MAX_PATH*3];
-    SRWLOCK* lock;
-    size_t total_docs;
-    size_t docs_with_term;
-} FilterArgs;
     SRWLOCK outlock; InitializeSRWLock(&outlock);
     int tcount = workers;
     HANDLE th[4]; FilterArgs fa[4];
@@ -603,8 +606,11 @@ int wmain(int argc, wchar_t** argv){
         const char *pstr="?", *nstr="?";
         if(mdb_get(txnprint, dbi_stringsP, &pk, &pv)==0) pstr=(const char*)pv.mv_data;
         if(mdb_get(txnprint, dbi_stringsP, &nk, &nv)==0) nstr=(const char*)nv.mv_data;
-        printf("%s\%s  size=%llu  mtime=%llu  score=%.1f
-", pstr, nstr, (unsigned long long)r->file_size, (unsigned long long)r->modified_time, all[i2].score);
+        printf("%s\\%s  size=%llu  mtime=%llu  score=%.1f\n",
+               pstr, nstr,
+               (unsigned long long)r->file_size,
+               (unsigned long long)r->modified_time,
+               all[i2].score);
     }
     mdb_txn_abort(txnprint);
     free(all);

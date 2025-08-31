@@ -82,8 +82,6 @@ static FrnEntry* frnmap_get(FrnMap* m, uint64_t frn){
     }
     return NULL;
 }
-    return NULL;
-}
 
 typedef struct USNScanner {
     HANDLE hVol;
