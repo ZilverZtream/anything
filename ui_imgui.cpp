@@ -50,7 +50,10 @@
 
 #ifdef HAS_IMGUI
 struct StringMeta { uint32_t trigram_count; uint64_t bloom_offset; };
-static const uint8_t* g_bloom_base = nullptr;
+#ifdef _WIN32
+static HANDLE bloom_mapping = NULL;
+#endif
+static const uint8_t* bloom_readonly_base = nullptr;
 static size_t g_bloom_size = 0;
 static bool open_bloom(const wchar_t* dbPath){
 #ifdef _WIN32
@@ -58,10 +61,12 @@ static bool open_bloom(const wchar_t* dbPath){
     HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER sz; GetFileSizeEx(f,&sz); g_bloom_size = sz.QuadPart;
-    HANDLE m = CreateFileMappingW(f,NULL,PAGE_READONLY,0,0,NULL); CloseHandle(f);
-    if(!m) return false;
-    g_bloom_base = (const uint8_t*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0); CloseHandle(m);
-    return g_bloom_base != nullptr;
+    bloom_mapping = CreateFileMappingW(f,NULL,PAGE_READONLY,0,0,NULL);
+    CloseHandle(f);
+    if(!bloom_mapping) return false;
+    bloom_readonly_base = (const uint8_t*)MapViewOfFile(bloom_mapping, FILE_MAP_READ, 0,0,0);
+    if(!bloom_readonly_base){ CloseHandle(bloom_mapping); bloom_mapping=NULL; return false; }
+    return true;
 #else
     char bp[MAX_PATH]; wcstombs(bp, dbPath, MAX_PATH);
     strncat(bp, "/bloom.dat", MAX_PATH - strlen(bp) - 1);
@@ -69,19 +74,21 @@ static bool open_bloom(const wchar_t* dbPath){
     if(fd<0) return false;
     struct stat st; if(fstat(fd,&st)!=0){ close(fd); return false; }
     g_bloom_size = st.st_size;
-    g_bloom_base = (const uint8_t*)mmap(NULL, g_bloom_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    bloom_readonly_base = (const uint8_t*)mmap(NULL, g_bloom_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    return g_bloom_base != MAP_FAILED;
+    return bloom_readonly_base != MAP_FAILED;
 #endif
 }
 static void close_bloom(){
-    if(!g_bloom_base) return;
+    if(!bloom_readonly_base) return;
 #ifdef _WIN32
-    UnmapViewOfFile(g_bloom_base);
+    UnmapViewOfFile(bloom_readonly_base);
+    if(bloom_mapping) CloseHandle(bloom_mapping);
+    bloom_mapping=NULL;
 #else
-    munmap((void*)g_bloom_base, g_bloom_size);
+    munmap((void*)bloom_readonly_base, g_bloom_size);
 #endif
-    g_bloom_base = nullptr;
+    bloom_readonly_base = nullptr;
 }
 struct Result {
     std::string filename;
@@ -523,7 +530,7 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
             if (mdb_get(txn, dbi_smeta, &k, &v) != 0 || v.mv_size < sizeof(StringMeta)) continue;
             const StringMeta* sm = (const StringMeta*)v.mv_data;
             if (sm->bloom_offset + 8192 > g_bloom_size) continue;
-            const uint8_t* bloom = g_bloom_base + sm->bloom_offset;
+            const uint8_t* bloom = bloom_readonly_base + sm->bloom_offset;
             bool ok = true;
             for (size_t j = 0; j < hn; j++) {
                 uint32_t bit = hbuf[j];
