@@ -39,6 +39,7 @@ BOOL db_set_index_state(Db* db, const IndexState* st);
 uint64_t db_intern_wstring(Db* db, const wchar_t* s);
 BOOL db_put_records(Db* db, const DbRecord* recs, size_t count);
 BOOL db_delete_path(Db* db, const wchar_t* parent, const wchar_t* name);
+BOOL db_get_record_by_path(Db* db, const wchar_t* parent, const wchar_t* name, DbRecord* out);
 
 #ifdef __cplusplus
 }

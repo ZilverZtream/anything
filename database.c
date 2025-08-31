@@ -593,3 +593,38 @@ BOOL db_delete_path(Db* db_, const wchar_t* parent, const wchar_t* name){
     mdb_cursor_close(cur);
     return TRUE;
 }
+
+BOOL db_get_record_by_path(Db* db_, const wchar_t* parent, const wchar_t* name, DbRecord* out){
+    DbImpl* d = (DbImpl*)db_;
+    MDB_txn* txn = d->wtxn;
+    BOOL own_txn = FALSE;
+    if(!txn){
+        if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &txn)!=0) return FALSE;
+        own_txn = TRUE;
+    }
+    uint64_t parent_id = db_intern_wstring(db_, parent);
+    uint64_t name_id   = db_intern_wstring(db_, name);
+    if(!parent_id || !name_id){ if(own_txn) mdb_txn_abort(txn); return FALSE; }
+    MDB_cursor* cur;
+    MDB_val key={.mv_data=&name_id,.mv_size=sizeof(name_id)}, val;
+    int rc = mdb_cursor_open(txn, d->dbi_fname_index, &cur);
+    if(rc){ if(own_txn) mdb_txn_abort(txn); return FALSE; }
+    rc = mdb_cursor_get(cur, &key, &val, MDB_SET);
+    BOOL found = FALSE;
+    while(rc==0){
+        uint64_t id = *(uint64_t*)val.mv_data;
+        MDB_val rk,rv; to_mdb_val(&id,sizeof(id),&rk);
+        if(mdb_get(txn, d->dbi_records, &rk, &rv)==0){
+            DbRecord* r=(DbRecord*)rv.mv_data;
+            if(r->parent_str_id == parent_id){
+                if(out) *out = *r;
+                found = TRUE;
+                break;
+            }
+        }
+        rc = mdb_cursor_get(cur, &key, &val, MDB_NEXT_DUP);
+    }
+    mdb_cursor_close(cur);
+    if(own_txn) mdb_txn_abort(txn);
+    return found;
+}
