@@ -406,6 +406,40 @@ static void remove_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     _freea(tmp);
 }
 
+BOOL db_get_compressed_trigram(Db* db_, uint32_t trigram, CompressedTrigram* out){
+    if(!db_ || !out) return FALSE;
+    DbImpl* d = (DbImpl*)db_;
+    MDB_txn* txn; if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &txn)!=0) return FALSE;
+    MDB_cursor* c=NULL; if(mdb_cursor_open(txn, d->dbi_trigram_index, &c)!=0){ mdb_txn_abort(txn); return FALSE; }
+    uint8_t key_bytes[3]={ (uint8_t)(trigram>>16), (uint8_t)(trigram>>8), (uint8_t)trigram };
+    MDB_val k={.mv_data=key_bytes,.mv_size=3}, v;
+    uint32_t cap=0, n=0; uint32_t* buf=NULL; uint64_t prev=0;
+    if(mdb_cursor_get(c,&k,&v,MDB_SET_KEY)==0){
+        do{
+            if(n==cap){
+                uint32_t newcap = cap?cap*2:16;
+                uint32_t* nb = (uint32_t*)realloc(buf, newcap*sizeof(uint32_t));
+                if(!nb){ free(buf); mdb_cursor_close(c); mdb_txn_abort(txn); return FALSE; }
+                buf = nb; cap = newcap;
+            }
+            uint64_t id = *(uint64_t*)v.mv_data;
+            buf[n++] = (uint32_t)(id - prev);
+            prev = id;
+        }while(mdb_cursor_get(c,&k,&v,MDB_NEXT_DUP)==0);
+    }
+    mdb_cursor_close(c); mdb_txn_abort(txn);
+    out->trigram.bytes[0]=key_bytes[0];
+    out->trigram.bytes[1]=key_bytes[1];
+    out->trigram.bytes[2]=key_bytes[2];
+    out->string_id_count=n;
+    out->string_ids=buf;
+    return TRUE;
+}
+
+void db_free_compressed_trigram(CompressedTrigram* ct){
+    if(ct && ct->string_ids){ free(ct->string_ids); ct->string_ids=NULL; ct->string_id_count=0; }
+}
+
 
 
 BOOL db_get_index_state(Db* db_, IndexState* out){

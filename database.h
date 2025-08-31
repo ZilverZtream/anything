@@ -21,6 +21,16 @@ typedef struct IndexState {
     IndexingLevel indexing_level;
 } IndexState;
 
+typedef struct {
+    uint8_t bytes[3];
+} uint24_t;
+
+typedef struct CompressedTrigram {
+    uint24_t trigram;          // packed 24-bit trigram
+    uint32_t string_id_count;  // number of encoded deltas
+    uint32_t* string_ids;      // delta-encoded string IDs
+} CompressedTrigram;
+
 BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** out_db);
 const DbHeader* db_open_readonly(const wchar_t* path, Db** out_db);
 void db_close(Db* db);
@@ -38,6 +48,9 @@ void db_abort_write(Db* db);
 BOOL db_get_index_state(Db* db, IndexState* out);
 BOOL db_set_index_state(Db* db, const IndexState* st);
 BOOL db_compress(Db* db, const wchar_t* out_path);
+
+BOOL db_get_compressed_trigram(Db* db, uint32_t trigram, CompressedTrigram* out);
+void db_free_compressed_trigram(CompressedTrigram* ct);
 
 uint64_t db_intern_wstring(Db* db, const wchar_t* s);
 BOOL db_put_records(Db* db, const DbRecord* recs, size_t count);
