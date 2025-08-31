@@ -59,6 +59,7 @@ static void emit_net(struct NetworkScanner* s, const char* parent, const char* n
     DbWorkItem* wi;
     if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
     wi->content = NULL;
+    wi->preview = NULL;
     mbstowcs(wi->parent_path, parent, MAX_LONG_PATH);
     mbstowcs(wi->name, name, MAX_PATH);
     wi->file_size = st->st_size;

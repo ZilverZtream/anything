@@ -160,6 +160,23 @@ static void delete_path_os(const std::string& p){
 #endif
 }
 
+static void load_result_texture(Result& r) {
+    std::string full = r.path + "\\" + r.filename;
+    int channels;
+    unsigned char* data = stbi_load(full.c_str(), &r.width, &r.height, &channels, 0);
+    if (!data) return;
+    glGenTextures(1, &r.texture);
+    glBindTexture(GL_TEXTURE_2D, r.texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    GLenum fmt = (channels == 4) ? GL_RGBA : (channels == 3) ? GL_RGB : GL_RED;
+    glTexImage2D(GL_TEXTURE_2D, 0, fmt, r.width, r.height, 0, fmt, GL_UNSIGNED_BYTE, data);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    stbi_image_free(data);
+}
+
 static void apply_sort(std::vector<Result>& items, const ImGuiTableSortSpecs* specs){
     if(!specs || specs->SpecsCount==0) return;
     const ImGuiTableColumnSortSpecs& spec = specs->Specs[0];
@@ -784,8 +801,9 @@ int run_ui(void){
             ImGui::Separator();
             ImGui::BeginChild("ResultsList", ImVec2(0, 0), false, ImGuiWindowFlags_None);
             ImGuiTableFlags tflags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_NoSavedSettings;
-            if (ImGui::BeginTable("ResultsTable", 5, tflags)) {
+            if (ImGui::BeginTable("ResultsTable", 6, tflags)) {
                 ImGui::TableSetupScrollFreeze(0,1);
+                ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthFixed, 60.0f);
                 ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort, 0.0f, COL_NAME);
                 ImGui::TableSetupColumn("Path", 0, 0.0f, COL_PATH);
                 ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_SIZE);
@@ -801,29 +819,15 @@ int run_ui(void){
                 for (size_t i = 0; i < filtered.size(); ++i) {
                     Result& r = filtered[i];
                     ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
+                    ImGui::TableSetColumnIndex(1);
                     ImGui::PushID((int)i);
                     bool is_selected = (selected == (int)i);
-                    if (ImGui::Selectable("##row", is_selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                    if (ImGui::Selectable(r.filename.c_str(), is_selected, ImGuiSelectableFlags_SpanAllColumns)) {
                         selected = (int)i;
-                        if (r.type == "image") {
-                            std::string full_path = r.path + "\\" + r.filename;
-                            int channels;
-                            unsigned char* data = stbi_load(full_path.c_str(), &r.width, &r.height, &channels, 0);
-                            if (data) {
-                                glGenTextures(1, &r.texture);
-                                glBindTexture(GL_TEXTURE_2D, r.texture);
-                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                                GLenum internal_format = (channels == 4) ? GL_RGBA : (channels == 3) ? GL_RGB : GL_RED;
-                                GLenum format = internal_format;
-                                glTexImage2D(GL_TEXTURE_2D, 0, internal_format, r.width, r.height, 0, format, GL_UNSIGNED_BYTE, data);
-                                glBindTexture(GL_TEXTURE_2D, 0);
-                                stbi_image_free(data);
-                            }
-                        }
+                    }
+                    bool hovered = ImGui::IsItemHovered();
+                    if ((hovered || is_selected) && r.type == "image" && r.texture == 0) {
+                        load_result_texture(r);
                     }
                     if (ImGui::BeginPopupContextItem()) {
                         std::string full = r.path + "\\" + r.filename;
@@ -834,16 +838,18 @@ int run_ui(void){
                         ImGui::EndPopup();
                     }
                     ImGui::TableSetColumnIndex(0);
-                    ImGui::TextUnformatted(r.filename.c_str());
-                    ImGui::TableSetColumnIndex(1);
-                    ImGui::TextUnformatted(r.path.c_str());
+                    if (r.type == "image" && r.texture != 0) {
+                        ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(48, 48));
+                    }
                     ImGui::TableSetColumnIndex(2);
-                    ImGui::Text("%lld", (long long)r.size);
+                    ImGui::TextUnformatted(r.path.c_str());
                     ImGui::TableSetColumnIndex(3);
+                    ImGui::Text("%lld", (long long)r.size);
+                    ImGui::TableSetColumnIndex(4);
                     char dstr[64];
                     std::strftime(dstr, sizeof(dstr), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
                     ImGui::Text("%s", dstr);
-                    ImGui::TableSetColumnIndex(4);
+                    ImGui::TableSetColumnIndex(5);
                     ImGui::Text("%.1f", r.score);
                     ImGui::PopID();
                 }
@@ -852,28 +858,33 @@ int run_ui(void){
             ImGui::EndChild();
 
             ImGui::TableNextColumn();
-            ImGui::Text("Preview:");
-            ImGui::Separator();
-            ImGui::BeginChild("PreviewPane", ImVec2(0, 0), false, ImGuiWindowFlags_None);
+            ImGui::BeginChild("QuickViewPane", ImVec2(0, 0), false, ImGuiWindowFlags_None);
             if (selected >= 0 && selected < static_cast<int>(filtered.size())) {
                 const Result& r = filtered[selected];
-                ImGui::Text("Path: %s", r.path.c_str());
-                ImGui::Text("Size: %lld bytes", r.size);
-                char date_str[64];
-                std::strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
-                ImGui::Text("Modified: %s", date_str);
-                ImGui::Separator();
-                if (r.type == "text" || r.type == "pdf") {
-                    ImGui::Text("Snippet:");
-                    draw_highlighted(r.snippet, query_str);
-                } else if (r.type == "image") {
-                    if (r.texture != 0) {
-                        float aspect = static_cast<float>(r.height) / static_cast<float>(r.width);
-                        float preview_width = ImGui::GetContentRegionAvail().x;
-                        ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(preview_width, preview_width * aspect));
-                    } else {
-                        ImGui::Text("Failed to load image thumbnail.");
+                if (ImGui::BeginTabBar("QuickViewTabs")) {
+                    if (ImGui::BeginTabItem("Info")) {
+                        ImGui::Text("Path: %s", r.path.c_str());
+                        ImGui::Text("Size: %lld bytes", r.size);
+                        char date_str[64];
+                        std::strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
+                        ImGui::Text("Modified: %s", date_str);
+                        ImGui::EndTabItem();
                     }
+                    if (ImGui::BeginTabItem("Preview")) {
+                        if (r.type == "text" || r.type == "pdf") {
+                            draw_highlighted(r.snippet, query_str);
+                        } else if (r.type == "image") {
+                            if (r.texture != 0) {
+                                float aspect = static_cast<float>(r.height) / static_cast<float>(r.width);
+                                float preview_width = ImGui::GetContentRegionAvail().x;
+                                ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(preview_width, preview_width * aspect));
+                            } else {
+                                ImGui::Text("No thumbnail loaded.");
+                            }
+                        }
+                        ImGui::EndTabItem();
+                    }
+                    ImGui::EndTabBar();
                 }
             }
             ImGui::EndChild();

@@ -125,6 +125,7 @@ static void enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_u
     DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
     if(!wi) return;
     wi->content = NULL;
+    wi->preview = NULL;
     wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
     wchar_t wname[MAX_PATH]; to_wide(name_utf8, wname, MAX_PATH);
     wcscpy_s(wi->name, MAX_PATH, wname);
