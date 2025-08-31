@@ -49,7 +49,7 @@ typedef struct Node{ int type; TermType ttype; char* text; struct Node* left; st
 static void free_node(Node* n){ if(!n)return; free_node(n->left); free_node(n->right); if(n->type==TOK_TERM && n->text) free(n->text); free(n); }
 
 static void usage(void){
-    wprintf(L"search.exe --db <path> [--workers N] <terms and filters>\n");
+    wprintf(L"search.exe --db <path> [--workers N] [--json] <terms and filters>\n");
 }
 
 static uint64_t parse_size(const char* s){
@@ -90,6 +90,31 @@ static BOOL parse_date(const char* s, uint64_t* out_day){
         return TRUE;
     }
     return FALSE;
+}
+
+static void json_escape_and_print(const char* s){
+    for(const unsigned char* p=(const unsigned char*)s; *p; ++p){
+        unsigned char c=*p;
+        switch(c){
+        case '\\': case '"': printf("\\%c", c); break;
+        case '\b': printf("\\b"); break;
+        case '\f': printf("\\f"); break;
+        case '\n': printf("\\n"); break;
+        case '\r': printf("\\r"); break;
+        case '\t': printf("\\t"); break;
+        default:
+            if(c < 0x20) printf("\\u%04x", c);
+            else putchar(c);
+        }
+    }
+}
+
+static void print_json_path(const char* dir, const char* name){
+    putchar('"');
+    json_escape_and_print(dir);
+    printf("\\\\");
+    json_escape_and_print(name);
+    putchar('"');
 }
 
 static void add_logic_token(TokenList* toks, const char* s){
@@ -642,14 +667,23 @@ int wmain(int argc, wchar_t** argv){
     char qcanon[4096]={0}; size_t qpos=0;
     for(int i=1;i<argc;i++){
         if(wcscmp(argv[i], L"--db")==0){ i++; continue; }
+        if(wcscmp(argv[i], L"--workers")==0){ i++; continue; }
+        if(wcscmp(argv[i], L"--json")==0){ continue; }
         char u8[512]; to_utf8(argv[i], u8, sizeof(u8));
         size_t ulen = strlen(u8);
         if(qpos + ulen + 2 < sizeof(qcanon)){ memcpy(qcanon+qpos,u8,ulen); qpos+=ulen; qcanon[qpos++]=' '; qcanon[qpos]=0; }
     }
     wchar_t dbPath[MAX_PATH];
     SearchQuery q; TokenList tokens;
-    int workers=1;
-    for(int ai=1; ai<argc; ++ai){ if(wcscmp(argv[ai], L"--workers")==0 && ai+1<argc){ workers = _wtoi(argv[++ai]); if(workers<1)workers=1; if(workers>4)workers=4; } }
+    int workers=1; bool json_output=false;
+    for(int ai=1; ai<argc; ++ai){
+        if(wcscmp(argv[ai], L"--workers")==0 && ai+1<argc){
+            workers = _wtoi(argv[++ai]);
+            if(workers<1)workers=1; if(workers>4)workers=4;
+        } else if(wcscmp(argv[ai], L"--json")==0){
+            json_output=true;
+        }
+    }
     parse_query(argc, argv, dbPath, &q, &tokens);
     if(!dbPath[0]){ usage(); return 1; }
 
@@ -723,6 +757,7 @@ int wmain(int argc, wchar_t** argv){
     // Open txn once to print resolved strings
     MDB_txn* txnprint; mdb_txn_begin(env,NULL,MDB_RDONLY,&txnprint);
     MDB_dbi dbi_stringsP, dbi_recordsP; mdb_dbi_open(txnprint,"strings",0,&dbi_stringsP); mdb_dbi_open(txnprint,"records",0,&dbi_recordsP);
+    if(json_output) printf("[\n");
     for(size_t i2=0;i2<show;i2++){
         uint64_t rid = all[i2].rec_id; MDB_val rk={.mv_data=&rid,.mv_size=sizeof(rid)}, rv;
         if(mdb_get(txnprint, dbi_recordsP, &rk, &rv)!=0 || rv.mv_size<sizeof(DbRecord)) continue;
@@ -732,12 +767,23 @@ int wmain(int argc, wchar_t** argv){
         const char *pstr="?", *nstr="?";
         if(mdb_get(txnprint, dbi_stringsP, &pk, &pv)==0) pstr=(const char*)pv.mv_data;
         if(mdb_get(txnprint, dbi_stringsP, &nk, &nv)==0) nstr=(const char*)nv.mv_data;
-        printf("%s\\%s  size=%llu  mtime=%llu  score=%.1f\n",
-               pstr, nstr,
-               (unsigned long long)r->file_size,
-               (unsigned long long)r->modified_time,
-               all[i2].score);
+        if(json_output){
+            printf("  {\"path\":");
+            print_json_path(pstr, nstr);
+            printf(",\"size\":%llu,\"mtime\":%llu,\"score\":%.1f}%s\n",
+                   (unsigned long long)r->file_size,
+                   (unsigned long long)r->modified_time,
+                   all[i2].score,
+                   (i2+1<show)?",":"");
+        } else {
+            printf("%s\\%s  size=%llu  mtime=%llu  score=%.1f\n",
+                   pstr, nstr,
+                   (unsigned long long)r->file_size,
+                   (unsigned long long)r->modified_time,
+                   all[i2].score);
+        }
     }
+    if(json_output) printf("]\n");
     mdb_txn_abort(txnprint);
     free(all);
 
