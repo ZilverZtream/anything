@@ -699,7 +699,7 @@ int wmain(int argc, wchar_t** argv){
 
     WriterCtx ctx = {0};
     ctx.db = db; ctx.batch_size = args.batch; ctx.done=FALSE; ctx.cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if(!MPMC_Init(&ctx.queue, 1<<16)){
+    if(!MPMC_Init(&ctx.queue, 1<<18)){
         fwprintf(stderr, L"MPMC_Init failed\n"); db_close(db); return 1;
     }
     PluginHost ph = { &ctx.queue, ctx.cancel_event };
