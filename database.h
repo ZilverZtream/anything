@@ -1,4 +1,3 @@
-
 #ifndef DATABASE_H
 #define DATABASE_H
 #include <windows.h>
@@ -8,15 +7,16 @@
 
 #ifdef __cplusplus
 extern "C" {
-
-
 #endif
 
 typedef struct Db Db;
 typedef struct DbRecord DbRecord;
 typedef struct DbHeader DbHeader;
 typedef struct IndexState {
-    uint64_t dummy; // placeholder for future incremental index metadata
+    uint64_t last_usn;
+    uint64_t last_scan_time;
+    uint64_t index_version;
+    uint8_t  drive_signatures[26][32];
 } IndexState;
 
 BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** out_db);
@@ -43,5 +43,3 @@ BOOL db_put_records(Db* db, const DbRecord* recs, size_t count);
 }
 #endif
 #endif
-
-
