@@ -604,20 +604,40 @@ static DWORD WINAPI DbWriterThread(void* p){
             free(wi->preview);
         }
         if(r.type == DB_REC_FILE){
-            if(wi->content){
+            BOOL need_content = TRUE;
+            if(!wi->content){
+                DbRecord existing;
+                if(db_get_record_by_path(ctx->db, wi->parent_path, wi->name, &existing)){
+                    if(existing.modified_time == wi->modified_time && existing.file_size == wi->file_size && existing.content_str_id){
+                        r.content_str_id = existing.content_str_id;
+                        r.author_str_id  = existing.author_str_id;
+                        r.title_str_id   = existing.title_str_id;
+                        r.camera_str_id  = existing.camera_str_id;
+                        r.lens_str_id    = existing.lens_str_id;
+                        r.artist_str_id  = existing.artist_str_id;
+                        r.album_str_id   = existing.album_str_id;
+                        r.hash_crc       = existing.hash_crc;
+                        need_content = FALSE;
+                    }
+                }
+                if(need_content){
+                    r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id, &r.title_str_id);
+                }
+            } else {
                 r.content_str_id = db_intern_wstring(ctx->db, wi->content);
                 free(wi->content);
-            } else {
-                r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id, &r.title_str_id);
+                need_content = FALSE;
             }
-            wchar_t fpath[MAX_LONG_PATH];
-            _snwprintf(fpath, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
-            extract_exif_metadata(ctx->db, fpath, &r);
-            extract_id3_metadata(ctx->db, fpath, &r);
-            if(is_archive_file(wi->name)){
-                index_archive(ctx->db, fpath);
+            if(need_content){
+                wchar_t fpath[MAX_LONG_PATH];
+                _snwprintf(fpath, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
+                extract_exif_metadata(ctx->db, fpath, &r);
+                extract_id3_metadata(ctx->db, fpath, &r);
+                if(is_archive_file(wi->name)){
+                    index_archive(ctx->db, fpath);
+                }
+                r.hash_crc = crc64_file(fpath);
             }
-            r.hash_crc = crc64_file(fpath);
         }
         _aligned_free(wi);
 
