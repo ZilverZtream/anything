@@ -16,10 +16,22 @@ It scans drives (via NTFS USN journal or generic directory walking), stores file
   - Trigram-based full-text search
   - Full content extraction for text and common document formats (TXT, source code, PDF, DOCX, etc.)
   - Optional content snippets and simple author metadata for text files
+- Archive content indexing (ZIP/RAR/7z) via libzip.
+- Pluggable scanners for cloud drives (OneDrive/Google Drive/Dropbox).
+- Experimental WSL filesystem indexing.
 - Bloom filters for quick name filtering.
 - Command-line tools:
   - `anything.exe index` — build or update the database
   - `search.exe` — query the database with filters (size, date, path, extension, content, author, regex, etc.)
+
+## Archive Content Indexing
+Anything can open common archives and index contained filenames so a search result can point directly to a file inside a ZIP, RAR, or 7z archive.
+
+## Cloud Drive Integration
+Stub scanners exist for OneDrive, Google Drive, and Dropbox. They will use official APIs to pull file listings and merge them into the local database.
+
+## Native WSL File System Indexing
+An experimental scanner illustrates how to traverse and index files stored under the Windows Subsystem for Linux.
 
 ## Build
 This project is written in **C** for Windows.
