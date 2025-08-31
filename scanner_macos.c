@@ -16,7 +16,10 @@
 
 struct FileScanner {
     FSEventStreamRef stream;
-    pthread_t thread;
+    pthread_t loop_thread;
+    pthread_t enum_thread;
+    CFRunLoopRef run_loop;
+    volatile BOOL stop;
     MPMCQueue* outq;
     char root[PATH_MAX];
     BOOL is_network;
@@ -101,13 +104,21 @@ static void fsevent_cb(ConstFSEventStreamRef streamRef,
     }
 }
 
-static void* runloop_thread(void* arg){
+static void* enum_thread(void* arg){
     FileScanner* s = (FileScanner*)arg;
     g_current = s;
     nftw(s->root, enum_cb, 16, FTW_PHYS);
-    FSEventStreamScheduleWithRunLoop(s->stream, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+    return NULL;
+}
+
+static void* loop_thread(void* arg){
+    FileScanner* s = (FileScanner*)arg;
+    s->run_loop = CFRunLoopGetCurrent();
+    FSEventStreamScheduleWithRunLoop(s->stream, s->run_loop, kCFRunLoopDefaultMode);
     FSEventStreamStart(s->stream);
-    CFRunLoopRun();
+    while(!s->stop){
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, TRUE);
+    }
     return NULL;
 }
 
@@ -139,14 +150,15 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
     CFRelease(path);
     CFRelease(paths);
     if(!s->stream){ free(s); return NULL; }
-    pthread_create(&s->thread, NULL, runloop_thread, s);
+    pthread_create(&s->loop_thread, NULL, loop_thread, s);
+    pthread_create(&s->enum_thread, NULL, enum_thread, s);
     return s;
 }
 
 void FileScanner_Wait(FileScanner* s){
     if(!s) return;
     if(s->is_network) NetworkScanner_Wait(s->net);
-    else pthread_join(s->thread, NULL);
+    else pthread_join(s->enum_thread, NULL);
 }
 
 void FileScanner_Free(FileScanner* s){
@@ -156,6 +168,9 @@ void FileScanner_Free(FileScanner* s){
         free(s);
         return;
     }
+    s->stop = TRUE;
+    CFRunLoopStop(s->run_loop);
+    pthread_join(s->loop_thread, NULL);
     FSEventStreamStop(s->stream);
     FSEventStreamInvalidate(s->stream);
     FSEventStreamRelease(s->stream);
