@@ -12,7 +12,7 @@ typedef enum {
     CLOUD_PCLOUD,
     CLOUD_DROPBOX
 } CloudProvider;
-BOOL CloudScanner_Start(CloudProvider provider, const char* auth_token, Db* db);
+BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue);
 
 #ifdef __cplusplus
 }
