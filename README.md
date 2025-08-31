@@ -19,7 +19,7 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
   - Optional content snippets and rich metadata extraction (author, photo EXIF camera/lens, music ID3 artist/album, document title)
 - Archive content indexing (ZIP/RAR/7z) via libzip.
 - Pluggable scanners for cloud drives (OneDrive/Google Drive/pCloud/Dropbox).
-- Experimental WSL filesystem indexing.
+- Native WSL filesystem indexing without wsl.exe overhead.
 - Extensible plugin system so third parties can add new scanners.
 - Bloom filters for quick name filtering.
 - Fuzzy filename and content search using Levenshtein distance.
@@ -34,7 +34,7 @@ Anything can open common archives and index contained filenames so a search resu
 Stub scanners exist for OneDrive, Google Drive, and Dropbox. They will use official APIs to pull file listings and merge them into the local database.
 
 ## Native WSL File System Indexing
-An experimental scanner illustrates how to traverse and index files stored under the Windows Subsystem for Linux.
+The WSL scanner reads the ext4.vhdx virtual disk directly to enumerate files and capture full metadata without shelling out to `wsl.exe` for every file.
 
 ## Plugin API
 Custom data source scanners can be implemented as DLLs. Place compiled plugins in a `plugins` folder next to the executable and they will be loaded at startup. The `plugin.h` header documents the API each DLL must expose.
