@@ -135,7 +135,9 @@ void NTFSScanner_Wait(NTFSScanner* s);
 void NTFSScanner_Free(NTFSScanner* s);
 
 // Change tailer via USN journal
+#ifdef _WIN32
 HANDLE StartUSNTailer(const wchar_t* volumeRoot, MPMCQueue* outQueue, HANDLE cancelEvent);
+#endif
 
 // ---- DB API (LMDB) ----
 BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** out_db);
