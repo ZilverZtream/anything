@@ -35,6 +35,7 @@ void db_abort_write(Db* db);
 
 BOOL db_get_index_state(Db* db, IndexState* out);
 BOOL db_set_index_state(Db* db, const IndexState* st);
+BOOL db_compress(Db* db, const wchar_t* out_path);
 
 uint64_t db_intern_wstring(Db* db, const wchar_t* s);
 BOOL db_put_records(Db* db, const DbRecord* recs, size_t count);

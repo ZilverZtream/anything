@@ -674,6 +674,7 @@ typedef struct {
 
 static void usage(void){
     wprintf(L"anything.exe index --db <path> (--root <folder> | --all-drives) [--threads N] [--batch N] [--ntfs] [--tail]\n");
+    wprintf(L"anything.exe compress --db <path> --out <dest>\n");
 }
 
 static BOOL parse_args(int argc, wchar_t** argv, Args* a){
@@ -709,6 +710,25 @@ static DWORD WINAPI scan_drive_thread(void* p){
 }
 
 int wmain(int argc, wchar_t** argv){
+    if(argc>1 && wcscmp(argv[1], L"compress")==0){
+        const wchar_t* dbPath=NULL; const wchar_t* outPath=NULL;
+        for(int i=2;i<argc;i++){
+            if(wcscmp(argv[i],L"--db")==0 && i+1<argc){ dbPath=argv[++i]; }
+            else if(wcscmp(argv[i],L"--out")==0 && i+1<argc){ outPath=argv[++i]; }
+            else { usage(); return 1; }
+        }
+        if(!dbPath || !outPath){ usage(); return 1; }
+        Db* cdb=NULL;
+        if(!db_open_readonly(dbPath, &cdb)){
+            fwprintf(stderr, L"Failed to open DB at %s\n", dbPath);
+            return 1;
+        }
+        BOOL ok = db_compress(cdb, outPath);
+        if(!ok){ fwprintf(stderr, L"Compression failed (err=%d)\n", db_last_error(cdb)); }
+        db_close(cdb);
+        return ok?0:1;
+    }
+
     Args args;
     live_updates_init();
     if(!parse_args(argc, argv, &args)) return 1;

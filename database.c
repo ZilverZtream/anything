@@ -257,6 +257,20 @@ void db_abort_write(Db* db_){
     if(d->wtxn){ mdb_txn_abort(d->wtxn); d->wtxn=NULL; }
 }
 
+BOOL db_compress(Db* db_, const wchar_t* out_path){
+    if(!db_ || !out_path) return FALSE;
+    DbImpl* d = (DbImpl*)db_;
+    if(d->wtxn){
+        if(!db_commit_write(db_)) return FALSE;
+    }
+    char u8[MAX_PATH*3];
+    int rc = WideCharToMultiByte(CP_UTF8,0,out_path,-1,u8,sizeof(u8),NULL,NULL);
+    if(rc<=0){ set_last_err(d, GetLastError()); return FALSE; }
+    rc = mdb_env_copy2(d->env, u8, MDB_CP_COMPACT);
+    set_last_err(d, rc);
+    return rc==0;
+}
+
 // String interning helpers
 static BOOL str_by_id(DbImpl* d, MDB_txn* txn, uint64_t id, MDB_val* out){
     MDB_val k; k.mv_data = &id; k.mv_size = sizeof(id);
