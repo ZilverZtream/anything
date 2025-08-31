@@ -229,6 +229,8 @@ typedef struct {
     float score;
 } RankedResult;
 
+typedef struct FilterArgs FilterArgs;
+
 
 static DWORD WINAPI filter_worker_thread(void* p){
     FilterArgs* a=(FilterArgs*)p;
@@ -257,7 +259,7 @@ static DWORD WINAPI filter_worker_thread(void* p){
             free(tmp); free(pat);
             if(!ok) continue;
         }
-        float score = calculate_relevance(r, parent, name, a->q);
+        float score = calculate_relevance(r, parent, name, a->q, a->total_docs, a->docs_with_term);
         AcquireSRWLockExclusive(a->lock);
         a->out[*a->outn].rec_id = rid; a->out[*a->outn].score = score; (*a->outn)++;
         ReleaseSRWLockExclusive(a->lock);
@@ -287,18 +289,31 @@ static BOOL is_executable_ext(const char* name){
     char ext[16]; size_t n=strlen(dot+1); if(n>15)n=15; memcpy(ext,dot+1,n); ext[n]=0; lowercase_ascii(ext,n);
     for(int i=0;i<6;i++){ if(strcmp(ext, exts[i])==0) return TRUE; } return FALSE;
 }
-static float calculate_relevance(const DbRecord* r, const char* parent_utf8, const char* name_utf8, const SearchQuery* q){
-    float score = 100.0f;
+
+static int count_term_occurrences(const char* text, const char* term){
+    int c=0; size_t tlen=strlen(term); const char* p=text;
+    while((p = StrStrIA(p, term))!=NULL){ c++; p+=tlen; }
+    return c;
+}
+
+static float calculate_relevance(const DbRecord* r, const char* parent_utf8, const char* name_utf8, const SearchQuery* q, size_t total_docs, size_t docs_with_term){
+    float score = 0.0f;
     if(q->name_pattern){
+        int tf = count_term_occurrences(name_utf8, q->name_pattern);
+        int dl = (int)strlen(name_utf8);
+        const float avgdl = 16.0f; // typical filename length
+        float bm = bm25_score(tf, dl, avgdl, (int)total_docs, (int)docs_with_term);
+        score += bm;
         BOOL ex=FALSE, pr=FALSE; name_exact_prefix(name_utf8, q->name_pattern, &ex, &pr);
         if(ex) score += 50.0f; else if(pr) score += 25.0f;
+    } else {
+        score += 100.0f;
     }
     int depth = count_slashes(parent_utf8);
     score -= (float)depth * 2.0f;
     uint64_t days_old = today_day() - filetime_days(r->modified_time);
     if(days_old < 7) score += 20.0f; else if(days_old < 30) score += 10.0f;
     if(is_executable_ext(name_utf8)) score += 15.0f;
-    // size heuristic
     if(r->file_size>0 && r->file_size < 4096) score -= 2.0f;
     return score;
 }
@@ -480,8 +495,12 @@ int wmain(int argc, wchar_t** argv){
     mdb_cursor_close(cix);
     sort_unique(&rec_ids);
 
+    MDB_stat st; mdb_stat(txn, dbi_records, &st);
+    size_t total_docs = st.ms_entries;
+    size_t docs_with_term = rec_ids.n;
+
     // Step 3: Apply filters, rank, and print (parallel)
-    typedef struct { 
+    typedef struct {
     MDB_env* env; 
     uint64_t* ids; 
     size_t start, end; 
@@ -490,6 +509,8 @@ int wmain(int argc, wchar_t** argv){
     size_t* outn;
     char db_path[MAX_PATH*3];
     SRWLOCK* lock;
+    size_t total_docs;
+    size_t docs_with_term;
 } FilterArgs;
     SRWLOCK outlock; InitializeSRWLock(&outlock);
     int tcount = workers;
@@ -500,6 +521,7 @@ int wmain(int argc, wchar_t** argv){
         size_t e = (rec_ids.n*(ti+1))/tcount;
         ZeroMemory(&fa[ti], sizeof(FilterArgs));
         fa[ti].ids = rec_ids.ids; fa[ti].start=s; fa[ti].end=e; fa[ti].q=&q; fa[ti].out=all; fa[ti].outn=&alln; fa[ti].lock=&outlock;
+        fa[ti].total_docs = total_docs; fa[ti].docs_with_term = docs_with_term;
         to_utf8(dbPath, fa[ti].db_path, sizeof(fa[ti].db_path));
         th[ti] = CreateThread(NULL,0,filter_worker_thread,&fa[ti],0,NULL);
     }
