@@ -570,24 +570,40 @@ static Node* parse_tokens(const TokenList* toks){
     return nodestack[0];
 }
 
-static void get_all_records(MDB_txn* txn, MDB_dbi dbi_date, IdVec* out){
+typedef void (*RecordCallback)(uint64_t id, void* ctx);
+
+// Iterate all record IDs and invoke the callback for each.  This avoids
+// materializing the full list of IDs in memory which can be several
+// gigabytes for large databases.
+static void stream_all_records(MDB_txn* txn, MDB_dbi dbi_date,
+                               RecordCallback cb, void* ctx){
     MDB_cursor* cd=NULL;
-    mdb_cursor_open(txn, dbi_date, &cd);
+    if(mdb_cursor_open(txn, dbi_date, &cd)!=0) return;
     MDB_val k,v; int rc=mdb_cursor_get(cd,&k,&v,MDB_FIRST);
     while(rc==0){
-        idvec_push(out, *(uint64_t*)v.mv_data);
+        cb(*(uint64_t*)v.mv_data, ctx);
         rc=mdb_cursor_get(cd,&k,&v,MDB_NEXT);
     }
     mdb_cursor_close(cd);
+}
+
+typedef struct { const IdVec* excl; IdVec* out; } DiffCtx;
+static void diff_collect(uint64_t id, void* p){
+    DiffCtx* c=(DiffCtx*)p;
+    if(!bsearch(&id, c->excl->ids, c->excl->n, sizeof(uint64_t), cmp_u64))
+        idvec_push(c->out, id);
+}
+
+static void collect_record(uint64_t id, void* ctx){
+    idvec_push((IdVec*)ctx, id);
 }
 
 static void records_for_range(MDB_txn* txn, MDB_dbi dbi, uint64_t minv, uint64_t maxv, IdVec* out){
     MDB_cursor* c=NULL; mdb_cursor_open(txn, dbi, &c);
     MDB_val k={.mv_data=&minv,.mv_size=sizeof(minv)}, v;
     int rc = mdb_cursor_get(c,&k,&v,MDB_SET_RANGE);
-    MDB_cmp_fn* cmp = mdb_cmp(txn, dbi);
     MDB_val maxk={.mv_data=&maxv,.mv_size=sizeof(maxv)};
-    while(rc==0 && cmp(&k,&maxk) <= 0){
+    while(rc==0 && mdb_cmp(txn, dbi, &k, &maxk) <= 0){
         idvec_push(out, *(uint64_t*)v.mv_data);
         rc = mdb_cursor_get(c,&k,&v,MDB_NEXT);
     }
@@ -747,8 +763,16 @@ static void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fn
         *out=L; return;
     }
     if(n->type==TOK_NOT){
-        IdVec B; idvec_init(&B); eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &B);
-        IdVec All; idvec_init(&All); get_all_records(txn, dbi_date, &All); sort_unique(&B); sort_unique(&All); difference_inplace(&All,&B); idvec_free(&B); *out=All; return;
+        IdVec B; idvec_init(&B);
+        eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta,
+                  dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist,
+                  dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &B);
+        sort_unique(&B);
+        IdVec All; idvec_init(&All);
+        DiffCtx ctx = { .excl=&B, .out=&All };
+        stream_all_records(txn, dbi_date, diff_collect, &ctx);
+        idvec_free(&B);
+        *out=All; return;
     }
 }
 
@@ -825,7 +849,7 @@ int wmain(int argc, wchar_t** argv){
         eval_node(root, txn, dbi_strings, dbi_fname_index, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &rec_ids);
         free_node(root);
     } else {
-        get_all_records(txn, dbi_date, &rec_ids);
+        stream_all_records(txn, dbi_date, collect_record, &rec_ids);
     }
     sort_unique(&rec_ids);
 
