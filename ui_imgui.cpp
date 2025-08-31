@@ -925,7 +925,9 @@ int run_ui(void){
                     ImGui::TableNextColumn();
                     ImGui::Text("Results:");
                     ImGui::Separator();
+                    bool results_focused = false;
                     ImGui::BeginChild("ResultsList", ImVec2(0, 0), false, ImGuiWindowFlags_None);
+                    results_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
                     ImGuiTableFlags tflags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_NoSavedSettings;
                     if (ImGui::BeginTable("ResultsTable", 6, tflags)) {
                         ImGui::TableSetupScrollFreeze(0,1);
@@ -982,6 +984,30 @@ int run_ui(void){
                         ImGui::EndTable();
                     }
                     ImGui::EndChild();
+
+                    if (results_focused) {
+                        ImGuiIO& io = ImGui::GetIO();
+                        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && selected > 0) selected--;
+                        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && selected + 1 < (int)filtered.size()) selected++;
+                        if (selected >= 0 && selected < (int)filtered.size()) {
+                            const Result& r = filtered[selected];
+                            std::string full = r.path + "\\" + r.filename;
+                            if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
+                                open_file_os(full);
+                            }
+                            if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) {
+                                if (io.KeyShift) open_folder_os(r.path);
+                                else open_file_os(full);
+                            }
+                            if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
+                                ImGui::SetClipboardText(full.c_str());
+                            }
+                            if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+                                delete_path_os(full);
+                                need_update = true;
+                            }
+                        }
+                    }
 
                     ImGui::TableNextColumn();
                     ImGui::BeginChild("QuickViewPane", ImVec2(0, 0), false, ImGuiWindowFlags_None);
