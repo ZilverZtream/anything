@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <wchar.h>
+#include "anything.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,10 +14,11 @@ typedef struct Db Db;
 typedef struct DbRecord DbRecord;
 typedef struct DbHeader DbHeader;
 typedef struct IndexState {
-    uint64_t last_usn;
-    uint64_t last_scan_time;
-    uint64_t index_version;
-    uint8_t  drive_signatures[26][32];
+    uint64_t     last_usn;
+    uint64_t     last_scan_time;
+    uint64_t     index_version;
+    uint8_t      drive_signatures[26][32];
+    IndexingLevel indexing_level;
 } IndexState;
 
 BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** out_db);

@@ -39,7 +39,14 @@ typedef enum {
     DB_REC_DIR  = 2
 } DbRecordType;
 
+typedef enum {
+    INDEX_NAMES_ONLY = 1,     // Everything-like speed
+    INDEX_METADATA_LIGHT,     // Basic file properties
+    INDEX_FULL_CONTENT        // Complete text extraction
+} IndexingLevel;
+
 typedef struct Db Db;
+typedef struct IndexState IndexState;
 
 typedef struct DbRecord {
     uint64_t  rec_id;
@@ -78,7 +85,7 @@ typedef struct DbWorkItem {
     uint64_t modified_time;
     uint64_t access_time;
     uint32_t attributes;
-    uint8_t  stage; // 1 = names, 2 = metadata, 3 = content
+    IndexingLevel stage; // INDEX_NAMES_ONLY, INDEX_METADATA_LIGHT, INDEX_FULL_CONTENT
     uint8_t  op; // 0 = add/update, 1 = delete
     wchar_t* content; // optional extracted text
     wchar_t* preview; // optional preview text or thumbnail path

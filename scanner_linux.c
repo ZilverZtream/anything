@@ -45,7 +45,7 @@ static void emit(FileScanner* s, const char* parent, const char* name, const str
     wi->modified_time = st->st_mtime;
     wi->access_time = st->st_atime;
     wi->attributes = S_ISDIR(st->st_mode) ? FILE_ATTRIBUTE_DIRECTORY : 0;
-    wi->stage = 2;
+    wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)) sched_yield();
 }
@@ -79,7 +79,7 @@ static void process_event(FileScanner* s, struct inotify_event* ev){
         mbstowcs(wi->name, ev->name, MAX_PATH);
         wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
         wi->attributes = 0;
-        wi->stage = 1;
+        wi->stage = INDEX_NAMES_ONLY;
         wi->op = WI_DELETE;
         while(!MPMC_Push(s->outq, wi)) sched_yield();
         return;

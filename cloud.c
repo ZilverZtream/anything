@@ -134,7 +134,7 @@ static void enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_u
     wi->modified_time = mtime;
     wi->access_time = mtime;
     wi->attributes = is_dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
-    wi->stage = 2;
+    wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
     while(!MPMC_Push(q, wi)) { SwitchToThread(); }
 }
@@ -362,6 +362,7 @@ BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
 
     IndexState st={0};
     db_get_index_state(db, &st);
+    if(st.indexing_level == 0) st.indexing_level = INDEX_FULL_CONTENT;
     FILETIME now; GetSystemTimeAsFileTime(&now);
     ULARGE_INTEGER uli; uli.LowPart = now.dwLowDateTime; uli.HighPart = now.dwHighDateTime;
     st.last_scan_time = uli.QuadPart;
