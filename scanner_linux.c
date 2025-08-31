@@ -4,6 +4,8 @@
 #include <pthread.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <linux/magic.h>
 #include <unistd.h>
 #include <ftw.h>
 #include <linux/limits.h>
@@ -23,6 +25,8 @@ struct FileScanner {
     MPMCQueue* outq;
     HANDLE cancel;
     char root[PATH_MAX];
+    BOOL is_network;
+    NetworkScanner* net;
 };
 
 static FileScanner* g_current;
@@ -100,6 +104,19 @@ static void* thread_proc(void* arg){
 
 FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent){
     (void)threads; (void)cancelEvent;
+    char tmp[PATH_MAX];
+    wcstombs(tmp, rootPath, PATH_MAX);
+    struct statfs sfs;
+    if(statfs(tmp, &sfs)==0){
+        if(sfs.f_type==NFS_SUPER_MAGIC || sfs.f_type==SMB_SUPER_MAGIC || sfs.f_type==CIFS_SUPER_MAGIC){
+            FileScanner* s = (FileScanner*)calloc(1, sizeof(FileScanner));
+            if(!s) return NULL;
+            s->is_network = TRUE;
+            s->net = NetworkScanner_Start(rootPath, threads, outQueue, cancelEvent);
+            if(!s->net){ free(s); return NULL; }
+            return s;
+        }
+    }
     FileScanner* s = (FileScanner*)calloc(1, sizeof(FileScanner));
     if(!s) return NULL;
     wcstombs(s->root, rootPath, PATH_MAX);
@@ -114,12 +131,17 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
 
 void FileScanner_Wait(FileScanner* s){
     if(!s) return;
-    pthread_join(s->thread, NULL);
+    if(s->is_network) NetworkScanner_Wait(s->net);
+    else pthread_join(s->thread, NULL);
 }
 
 void FileScanner_Free(FileScanner* s){
     if(!s) return;
-    close(s->inotify_fd);
+    if(s->is_network){
+        NetworkScanner_Free(s->net);
+    } else {
+        close(s->inotify_fd);
+    }
     free(s);
 }
 
