@@ -32,6 +32,16 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
   - `anything.exe index` — build or update the database
   - `search.exe` — query the database with filters (size, date, path, extension, content, author, camera, lens, artist, album, title, regex, etc.). Add `--json` to emit results as structured JSON
 
+### Enterprise Features (paywalled)
+The source tree contains placeholders for several enterprise-only capabilities.
+Define the `ENTERPRISE` macro at build time to enable the stubs:
+
+- Network share indexing
+- Permission-aware search results
+- Audit logging of search queries
+- Active Directory based authentication
+- Centralized deployment helpers
+
 ## Archive Content Indexing
 Anything can open common archives and index contained filenames so a search result can point directly to a file inside a ZIP, RAR, or 7z archive.
 
