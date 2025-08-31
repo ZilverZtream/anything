@@ -175,70 +175,126 @@ static BOOL obtain_token(CloudProvider p, char** out_token){
 }
 
 // ---- Provider specific scanners ----
-static void onedrive_walk(const char* token, const wchar_t* parent, const char* item_id, MPMCQueue* q){
+static void onedrive_walk(const char* token, const wchar_t* root, const char* root_id, MPMCQueue* q){
+    typedef struct ODriveNode {
+        struct ODriveNode* next;
+        wchar_t parent[MAX_LONG_PATH];
+        char id[256];
+    } ODriveNode;
+
+    ODriveNode *head=NULL, *tail=NULL;
+    ODriveNode* start=(ODriveNode*)malloc(sizeof(ODriveNode));
+    if(!start) return;
+    wcscpy_s(start->parent,MAX_LONG_PATH,root);
+    if(root_id) strcpy_s(start->id,sizeof(start->id),root_id); else start->id[0]=0;
+    start->next=NULL;
+    head=tail=start;
+
     wchar_t headers[512];
     swprintf(headers,512,L"Authorization: Bearer %S\r\n", token);
-    wchar_t path[512];
-    if(item_id)
-        swprintf(path,512,L"/v1.0/me/drive/items/%S/children?select=id,name,size,folder,fileSystemInfo", item_id);
-    else
-        wcscpy(path,L"/v1.0/me/drive/root/children?select=id,name,size,folder,fileSystemInfo");
-    char* resp=NULL; if(!http_request(L"graph.microsoft.com", path, L"GET", headers, NULL, &resp)) return;
-    const char* p=resp; const char* end=resp+strlen(resp);
-    while((p=strchr(p,'{'))){
-        const char* obj=p; int depth=1; p++;
-        while(depth>0 && p<end){ if(*p=='{') depth++; else if(*p=='}') depth--; p++; }
-        const char* obj_end=p;
-        char name[256], id[256]; uint64_t size=0; char ctime[64], mtime[64];
-        if(json_get_string(obj,obj_end,"name",name,sizeof(name)) && json_get_string(obj,obj_end,"id",id,sizeof(id))){
-            BOOL is_dir = find_in_range(obj,obj_end,"\"folder\"")!=NULL;
-            json_get_number(obj,obj_end,"size",&size);
-            json_get_string(obj,obj_end,"createdDateTime",ctime,sizeof(ctime));
-            json_get_string(obj,obj_end,"lastModifiedDateTime",mtime,sizeof(mtime));
-            uint64_t ct=parse_rfc3339(ctime), mt=parse_rfc3339(mtime);
-            enqueue_item(q,parent,name,size,ct,mt,is_dir);
-            if(is_dir){
-                wchar_t child_parent[MAX_LONG_PATH];
-                wchar_t wname[MAX_PATH]; to_wide(name,wname,MAX_PATH);
-                path_join(child_parent,MAX_LONG_PATH,parent,wname);
-                onedrive_walk(token,child_parent,id,q);
+
+    while(head){
+        ODriveNode* curr=head; head=head->next; if(!head) tail=NULL;
+
+        wchar_t path[512];
+        if(curr->id[0])
+            swprintf(path,512,L"/v1.0/me/drive/items/%S/children?select=id,name,size,folder,fileSystemInfo", curr->id);
+        else
+            wcscpy(path,L"/v1.0/me/drive/root/children?select=id,name,size,folder,fileSystemInfo");
+
+        char* resp=NULL;
+        if(http_request(L"graph.microsoft.com", path, L"GET", headers, NULL, &resp)){
+            const char* p=resp; const char* end=resp+strlen(resp);
+            while((p=strchr(p,'{'))){
+                const char* obj=p; int depth=1; p++;
+                while(depth>0 && p<end){ if(*p=='{') depth++; else if(*p=='}') depth--; p++; }
+                const char* obj_end=p;
+                char name[256], id[256]; uint64_t size=0; char ctime[64], mtime[64];
+                if(json_get_string(obj,obj_end,"name",name,sizeof(name)) && json_get_string(obj,obj_end,"id",id,sizeof(id))){
+                    BOOL is_dir = find_in_range(obj,obj_end,"\"folder\"")!=NULL;
+                    json_get_number(obj,obj_end,"size",&size);
+                    json_get_string(obj,obj_end,"createdDateTime",ctime,sizeof(ctime));
+                    json_get_string(obj,obj_end,"lastModifiedDateTime",mtime,sizeof(mtime));
+                    uint64_t ct=parse_rfc3339(ctime), mt=parse_rfc3339(mtime);
+                    enqueue_item(q,curr->parent,name,size,ct,mt,is_dir);
+                    if(is_dir){
+                        ODriveNode* child=(ODriveNode*)malloc(sizeof(ODriveNode));
+                        if(child){
+                            wchar_t wname[MAX_PATH]; to_wide(name,wname,MAX_PATH);
+                            path_join(child->parent,MAX_LONG_PATH,curr->parent,wname);
+                            strcpy_s(child->id,sizeof(child->id),id);
+                            child->next=NULL;
+                            if(tail) tail->next=child; else head=child;
+                            tail=child;
+                        }
+                    }
+                }
             }
+            free(resp);
         }
+        free(curr);
     }
-    free(resp);
 }
 
-static void google_drive_walk(const char* token, const wchar_t* parent, const char* folder_id, MPMCQueue* q){
+static void google_drive_walk(const char* token, const wchar_t* root, const char* root_id, MPMCQueue* q){
+    typedef struct GDriveNode {
+        struct GDriveNode* next;
+        wchar_t parent[MAX_LONG_PATH];
+        char id[256];
+    } GDriveNode;
+
+    GDriveNode *head=NULL, *tail=NULL;
+    GDriveNode* start=(GDriveNode*)malloc(sizeof(GDriveNode));
+    if(!start) return;
+    wcscpy_s(start->parent,MAX_LONG_PATH,root);
+    if(root_id) strcpy_s(start->id,sizeof(start->id),root_id); else start->id[0]=0;
+    start->next=NULL;
+    head=tail=start;
+
     wchar_t headers[512];
     swprintf(headers,512,L"Authorization: Bearer %S\r\n", token);
-    wchar_t path[1024];
-    if(folder_id)
-        swprintf(path,1024,L"/drive/v3/files?q='%S'+in+parents&fields=files(id,name,mimeType,modifiedTime,size)", folder_id);
-    else
-        wcscpy(path,L"/drive/v3/files?q='root'+in+parents&fields=files(id,name,mimeType,modifiedTime,size)");
-    char* resp=NULL; if(!http_request(L"www.googleapis.com", path, L"GET", headers,NULL,&resp)) return;
-    const char* p=resp; const char* end=resp+strlen(resp);
-    while((p=strchr(p,'{'))){
-        const char* obj=p; int depth=1; p++;
-        while(depth>0 && p<end){ if(*p=='{') depth++; else if(*p=='}') depth--; p++; }
-        const char* obj_end=p;
-        char name[256], id[256], mime[128], mtime[64]; uint64_t size=0;
-        if(json_get_string(obj,obj_end,"name",name,sizeof(name)) && json_get_string(obj,obj_end,"id",id,sizeof(id))){
-            json_get_string(obj,obj_end,"mimeType",mime,sizeof(mime));
-            BOOL is_dir = strstr(mime,"application/vnd.google-apps.folder")!=NULL;
-            json_get_number(obj,obj_end,"size",&size);
-            json_get_string(obj,obj_end,"modifiedTime",mtime,sizeof(mtime));
-            uint64_t mt=parse_rfc3339(mtime);
-            enqueue_item(q,parent,name,size,mt,mt,is_dir);
-            if(is_dir){
-                wchar_t child_parent[MAX_LONG_PATH];
-                wchar_t wname[MAX_PATH]; to_wide(name,wname,MAX_PATH);
-                path_join(child_parent,MAX_LONG_PATH,parent,wname);
-                google_drive_walk(token,child_parent,id,q);
+
+    while(head){
+        GDriveNode* curr=head; head=head->next; if(!head) tail=NULL;
+
+        wchar_t path[1024];
+        if(curr->id[0])
+            swprintf(path,1024,L"/drive/v3/files?q='%S'+in+parents&fields=files(id,name,mimeType,modifiedTime,size)", curr->id);
+        else
+            wcscpy(path,L"/drive/v3/files?q='root'+in+parents&fields=files(id,name,mimeType,modifiedTime,size)");
+
+        char* resp=NULL;
+        if(http_request(L"www.googleapis.com", path, L"GET", headers,NULL,&resp)){
+            const char* p=resp; const char* end=resp+strlen(resp);
+            while((p=strchr(p,'{'))){
+                const char* obj=p; int depth=1; p++;
+                while(depth>0 && p<end){ if(*p=='{') depth++; else if(*p=='}') depth--; p++; }
+                const char* obj_end=p;
+                char name[256], id[256], mime[128], mtime[64]; uint64_t size=0;
+                if(json_get_string(obj,obj_end,"name",name,sizeof(name)) && json_get_string(obj,obj_end,"id",id,sizeof(id))){
+                    json_get_string(obj,obj_end,"mimeType",mime,sizeof(mime));
+                    BOOL is_dir = strstr(mime,"application/vnd.google-apps.folder")!=NULL;
+                    json_get_number(obj,obj_end,"size",&size);
+                    json_get_string(obj,obj_end,"modifiedTime",mtime,sizeof(mtime));
+                    uint64_t mt=parse_rfc3339(mtime);
+                    enqueue_item(q,curr->parent,name,size,mt,mt,is_dir);
+                    if(is_dir){
+                        GDriveNode* child=(GDriveNode*)malloc(sizeof(GDriveNode));
+                        if(child){
+                            wchar_t wname[MAX_PATH]; to_wide(name,wname,MAX_PATH);
+                            path_join(child->parent,MAX_LONG_PATH,curr->parent,wname);
+                            strcpy_s(child->id,sizeof(child->id),id);
+                            child->next=NULL;
+                            if(tail) tail->next=child; else head=child;
+                            tail=child;
+                        }
+                    }
+                }
             }
+            free(resp);
         }
+        free(curr);
     }
-    free(resp);
 }
 
 static void pcloud_walk(const char* token, const wchar_t* parent, MPMCQueue* q){
