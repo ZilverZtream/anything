@@ -8,8 +8,12 @@
 #include <stdlib.h>
 #include <wchar.h>
 #include <intrin.h>
+#include <objbase.h>
+#include <filter.h>
 
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "query.lib")
 
 #include "anything.h"
 #include "database.h"
@@ -17,41 +21,106 @@
 #include "lmdb.h"
 
 // ---- MPMC queue implementation ----
-static BOOL should_index_content(const wchar_t* name){
+typedef enum { CONTENT_NONE, CONTENT_TEXT, CONTENT_IFILTER } ContentMode;
+
+static ContentMode get_content_mode(const wchar_t* name){
     const wchar_t* ext = wcsrchr(name, L'.');
-    if(!ext) return FALSE;
+    if(!ext) return CONTENT_NONE;
     ext++;
-    return _wcsicmp(ext,L"txt")==0 || _wcsicmp(ext,L"md")==0 ||
-           _wcsicmp(ext,L"c")==0   || _wcsicmp(ext,L"h")==0   ||
-           _wcsicmp(ext,L"cpp")==0 || _wcsicmp(ext,L"py")==0;
+    if(_wcsicmp(ext,L"txt")==0 || _wcsicmp(ext,L"md")==0 ||
+       _wcsicmp(ext,L"c")==0   || _wcsicmp(ext,L"h")==0   ||
+       _wcsicmp(ext,L"cpp")==0 || _wcsicmp(ext,L"hpp")==0 ||
+       _wcsicmp(ext,L"py")==0  || _wcsicmp(ext,L"js")==0  ||
+       _wcsicmp(ext,L"cs")==0  || _wcsicmp(ext,L"vb")==0  ||
+       _wcsicmp(ext,L"r")==0   || _wcsicmp(ext,L"java")==0)
+        return CONTENT_TEXT;
+
+    if(_wcsicmp(ext,L"pdf")==0  || _wcsicmp(ext,L"doc")==0  ||
+       _wcsicmp(ext,L"docx")==0 || _wcsicmp(ext,L"ppt")==0  ||
+       _wcsicmp(ext,L"pptx")==0 || _wcsicmp(ext,L"xls")==0  ||
+       _wcsicmp(ext,L"xlsx")==0)
+        return CONTENT_IFILTER;
+
+    return CONTENT_NONE;
+}
+
+#define MAX_INDEXED_CONTENT (1024*1024) // 1MB
+
+static wchar_t* extract_with_ifilter(const wchar_t* path){
+    if(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED)!=S_OK) return NULL;
+    IFilter* filter=NULL;
+    HRESULT hr = LoadIFilter(path, NULL, NULL, 0, 0, 0, &filter);
+    if(FAILED(hr)) { CoUninitialize(); return NULL; }
+    hr = filter->Init(IFILTER_INIT_APPLY_INDEX_ATTRIBUTES, 0, NULL, NULL);
+    if(FAILED(hr)) { filter->Release(); CoUninitialize(); return NULL; }
+    size_t cap=4096, len=0;
+    wchar_t* out = (wchar_t*)malloc(cap*sizeof(wchar_t));
+    if(!out){ filter->Release(); CoUninitialize(); return NULL; }
+    for(;;){
+        WCHAR buf[1024]; ULONG cch=1024;
+        hr = filter->GetText(&cch, buf);
+        if(hr!=S_OK || cch==0) break;
+        if(len + cch + 1 > cap){
+            cap = (cap + cch + 1)*2;
+            wchar_t* tmp = (wchar_t*)realloc(out, cap*sizeof(wchar_t));
+            if(!tmp){ free(out); out=NULL; break; }
+            out = tmp;
+        }
+        memcpy(out+len, buf, cch*sizeof(wchar_t));
+        len += cch;
+    }
+    if(out){
+        out[len]=0;
+    }
+    filter->Release();
+    CoUninitialize();
+    return out;
 }
 
 static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t* name, uint64_t* author_out){
     *author_out = 0;
-    if(!should_index_content(name)) return 0;
+    ContentMode mode = get_content_mode(name);
+    if(mode==CONTENT_NONE) return 0;
     wchar_t path[MAX_LONG_PATH];
     _snwprintf(path, MAX_LONG_PATH, L"%s\\%s", parent, name);
-    FILE* f = _wfopen(path, L"rb");
-    if(!f) return 0;
-    char buf[4096+1]; size_t n = fread(buf,1,4096,f); fclose(f);
-    if(n==0) return 0;
-    buf[n]=0;
-    // crude binary check
-    for(size_t i=0;i<n;i++){ if(buf[i]==0){ buf[0]=0; break; } }
-    if(buf[0]==0) return 0;
-    char* a = StrStrIA(buf, "author:");
-    if(a){
-        a += 7;
-        while(*a==' '||*a=='\t') a++;
-        char tmp[256]; size_t len=0;
-        while(a[len] && a[len]!='\r' && a[len]!='\n' && len<255) len++;
-        memcpy(tmp,a,len); tmp[len]=0;
-        wchar_t wa[256]; to_wide(tmp, wa, 256);
-        *author_out = db_intern_wstring(db, wa);
+
+    wchar_t* wbuf = NULL;
+    if(mode == CONTENT_TEXT){
+        FILE* f = _wfopen(path, L"rb");
+        if(!f) return 0;
+        if(fseek(f,0,SEEK_END)!=0){ fclose(f); return 0; }
+        long size = ftell(f);
+        if(size < 0){ fclose(f); return 0; }
+        if(size > MAX_INDEXED_CONTENT) size = MAX_INDEXED_CONTENT;
+        rewind(f);
+        char* buf = (char*)malloc((size_t)size + 1);
+        if(!buf){ fclose(f); return 0; }
+        size_t n = fread(buf,1,(size_t)size,f);
+        fclose(f);
+        buf[n]=0;
+        for(size_t i=0;i<n;i++){ if(buf[i]==0){ buf[0]=0; break; } }
+        if(buf[0]==0){ free(buf); return 0; }
+        char* a = StrStrIA(buf, "author:");
+        if(a){
+            a += 7;
+            while(*a==' '||*a=='\t') a++;
+            char tmp[256]; size_t len=0;
+            while(a[len] && a[len]!='\r' && a[len]!='\n' && len<255) len++;
+            memcpy(tmp,a,len); tmp[len]=0;
+            wchar_t wa[256]; to_wide(tmp, wa, 256);
+            *author_out = db_intern_wstring(db, wa);
+        }
+        int wlen = MultiByteToWideChar(CP_UTF8,0,buf,-1,NULL,0);
+        wbuf = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
+        if(wbuf) MultiByteToWideChar(CP_UTF8,0,buf,-1,wbuf,wlen);
+        free(buf);
+    } else if(mode == CONTENT_IFILTER){
+        wbuf = extract_with_ifilter(path);
     }
-    wchar_t wbuf[4096];
-    MultiByteToWideChar(CP_UTF8,0,buf,-1,wbuf,4096);
-    return db_intern_wstring(db, wbuf);
+    if(!wbuf) return 0;
+    uint64_t id = db_intern_wstring(db, wbuf);
+    free(wbuf);
+    return id;
 }
 BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size){
     if(!q) return FALSE;

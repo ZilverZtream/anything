@@ -14,7 +14,8 @@ It scans drives (via NTFS USN journal or generic directory walking), stores file
   - Extension
   - Path hierarchy
   - Trigram-based full-text search
-- Optional content snippets and simple author metadata for text files
+  - Full content extraction for text and common document formats (TXT, source code, PDF, DOCX, etc.)
+  - Optional content snippets and simple author metadata for text files
 - Bloom filters for quick name filtering.
 - Command-line tools:
   - `anything.exe index` — build or update the database
