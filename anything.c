@@ -337,6 +337,11 @@ static DWORD WINAPI DbWriterThread(void* p){
         }
         if(item == NULL) break; // sentinel
         DbWorkItem* wi = (DbWorkItem*)item;
+        if(wi->op == WI_DELETE){
+            db_delete_path(ctx->db, wi->parent_path, wi->name);
+            _aligned_free(wi);
+            continue;
+        }
         DbRecord r = {0};
         r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
         r.parent_str_id = db_intern_wstring(ctx->db, wi->parent_path);

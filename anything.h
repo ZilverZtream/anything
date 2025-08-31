@@ -76,7 +76,11 @@ typedef struct DbWorkItem {
     uint64_t modified_time;
     uint64_t access_time;
     uint32_t attributes;
+    uint8_t  op; // 0 = add/update, 1 = delete
 } DbWorkItem;
+
+#define WI_ADD    0
+#define WI_DELETE 1
 
 // ---- MPMC lock-free queue (Vyukov) ----
 typedef struct MPMCCell {

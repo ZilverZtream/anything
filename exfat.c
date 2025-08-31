@@ -33,6 +33,7 @@ static void emit(MPMCQueue* q, const wchar_t* parent, const WIN32_FIND_DATAW* f)
     wi->creation_time = ((ULARGE_INTEGER){.LowPart=f->ftCreationTime.dwLowDateTime,.HighPart=f->ftCreationTime.dwHighDateTime}).QuadPart;
     wi->modified_time = ((ULARGE_INTEGER){.LowPart=f->ftLastWriteTime.dwLowDateTime,.HighPart=f->ftLastWriteTime.dwHighDateTime}).QuadPart;
     wi->access_time   = ((ULARGE_INTEGER){.LowPart=f->ftLastAccessTime.dwLowDateTime,.HighPart=f->ftLastAccessTime.dwHighDateTime}).QuadPart;
+    wi->op = WI_ADD;
     while(!MPMC_Push(q, wi)) { SwitchToThread(); }
 }
 

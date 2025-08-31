@@ -177,6 +177,7 @@ static DWORD WINAPI usn_thread(void* p){
         wi->attributes = attrs?attrs:e->attrs;
         wi->file_size = sz;
         wi->creation_time=ct; wi->modified_time=mt; wi->access_time=at;
+        wi->op = WI_ADD;
         while(!MPMC_Push(s->outq, wi)) { SwitchToThread(); }
     }
     VirtualFree(buf,0,MEM_RELEASE);
@@ -244,28 +245,46 @@ static DWORD WINAPI tail_thread(void* p){
             // Build parent path best-effort: we don't maintain a full FRN map here; do a stat to reconstruct
             wchar_t name[MAX_PATH];
             wcsncpy_s(name, MAX_PATH, (const wchar_t*)((BYTE*)r + r->FileNameOffset), r->FileNameLength/2);
-            // We only have parent FRN, not path; fall back to enumerating full path via GetFinalPathNameByHandle on the file handle if possible
-            // Open by ID: requires FILE_ID_DESCRIPTOR
-            HANDLE hFile = INVALID_HANDLE_VALUE;
-            FILE_ID_DESCRIPTOR fid = {0}; fid.dwSize=sizeof(fid); fid.Type = FileIdType; fid.FileId.QuadPart = r->FileReferenceNumber;
-            hFile = OpenFileById(t->hVol, &fid, FILE_READ_ATTRIBUTES, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, 0);
-            if(hFile!=INVALID_HANDLE_VALUE){
-                wchar_t full[MAX_LONG_PATH]; DWORD got = GetFinalPathNameByHandleW(hFile, full, MAX_LONG_PATH, FILE_NAME_NORMALIZED);
-                CloseHandle(hFile);
-                if(got>0 && got<MAX_LONG_PATH){
-                    // full is \\?\C:\Dir\Name — split into parent/name
-                    wchar_t parent[MAX_LONG_PATH]; wcscpy_s(parent, MAX_LONG_PATH, full);
-                    if(wcsncmp(parent, L"\\\\?\\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
-                    wchar_t* p = wcsrchr(parent, L'\\'); if(p){ *p=0; }
-                    DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
-                    wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
-                    wcscpy_s(wi->name, MAX_PATH, name);
-                    uint32_t attrs=0; uint64_t sz=0, ct=0, mt=0, at=0;
-                    wchar_t fn[MAX_LONG_PATH]; swprintf(fn, MAX_LONG_PATH, L"%s\\%s", parent, name);
-                    get_file_info_basic(fn, &attrs, &sz, &ct, &mt, &at);
-                    wi->attributes = attrs?attrs: r->FileAttributes;
-                    wi->file_size = sz; wi->creation_time=ct; wi->modified_time=mt; wi->access_time=at;
-                    while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }
+            if(r->Reason & (USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME)){
+                FILE_ID_DESCRIPTOR pfid={0}; pfid.dwSize=sizeof(pfid); pfid.Type=FileIdType; pfid.FileId.QuadPart=r->ParentFileReferenceNumber;
+                HANDLE hPar = OpenFileById(t->hVol, &pfid, FILE_READ_ATTRIBUTES, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL,0);
+                if(hPar!=INVALID_HANDLE_VALUE){
+                    wchar_t parent[MAX_LONG_PATH]; DWORD got = GetFinalPathNameByHandleW(hPar, parent, MAX_LONG_PATH, FILE_NAME_NORMALIZED);
+                    CloseHandle(hPar);
+                    if(got>0 && got<MAX_LONG_PATH){
+                        if(wcsncmp(parent, L"\\?\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
+                        DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                        wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
+                        wcscpy_s(wi->name, MAX_PATH, name);
+                        wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
+                        wi->attributes = 0;
+                        wi->op = WI_DELETE;
+                        while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }
+                    }
+                }
+            } else {
+                HANDLE hFile = INVALID_HANDLE_VALUE;
+                FILE_ID_DESCRIPTOR fid = {0}; fid.dwSize=sizeof(fid); fid.Type = FileIdType; fid.FileId.QuadPart = r->FileReferenceNumber;
+                hFile = OpenFileById(t->hVol, &fid, FILE_READ_ATTRIBUTES, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL,0);
+                if(hFile!=INVALID_HANDLE_VALUE){
+                    wchar_t full[MAX_LONG_PATH]; DWORD got = GetFinalPathNameByHandleW(hFile, full, MAX_LONG_PATH, FILE_NAME_NORMALIZED);
+                    CloseHandle(hFile);
+                    if(got>0 && got<MAX_LONG_PATH){
+                        // full is \?\C:\Dir\Name — split into parent/name
+                        wchar_t parent[MAX_LONG_PATH]; wcscpy_s(parent, MAX_LONG_PATH, full);
+                        if(wcsncmp(parent, L"\\?\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
+                        wchar_t* p = wcsrchr(parent, L'\'); if(p){ *p=0; }
+                        DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                        wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
+                        wcscpy_s(wi->name, MAX_PATH, name);
+                        uint32_t attrs=0; uint64_t sz=0, ct=0, mt=0, at=0;
+                        wchar_t fn[MAX_LONG_PATH]; swprintf(fn, MAX_LONG_PATH, L"%s\%s", parent, name);
+                        get_file_info_basic(fn, &attrs, &sz, &ct, &mt, &at);
+                        wi->attributes = attrs?attrs: r->FileAttributes;
+                        wi->file_size = sz; wi->creation_time=ct; wi->modified_time=mt; wi->access_time=at;
+                        wi->op = WI_ADD;
+                        while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }
+                    }
                 }
             }
             pRec += r->RecordLength;
