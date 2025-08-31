@@ -107,6 +107,51 @@ void draw_highlighted(const std::string& text, const std::string& q) {
     }
 }
 
+enum ResultColumn { COL_NAME, COL_PATH, COL_SIZE, COL_MOD, COL_SCORE };
+
+static void open_file_os(const std::string& p){
+#ifdef _WIN32
+    ShellExecuteA(NULL, "open", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#else
+    std::string cmd = std::string("xdg-open \"") + p + "\"";
+    system(cmd.c_str());
+#endif
+}
+
+static void open_folder_os(const std::string& p){
+#ifdef _WIN32
+    ShellExecuteA(NULL, "open", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#else
+    std::string cmd = std::string("xdg-open \"") + p + "\"";
+    system(cmd.c_str());
+#endif
+}
+
+static void delete_path_os(const std::string& p){
+#ifdef _WIN32
+    DeleteFileA(p.c_str());
+#else
+    remove(p.c_str());
+#endif
+}
+
+static void apply_sort(std::vector<Result>& items, const ImGuiTableSortSpecs* specs){
+    if(!specs || specs->SpecsCount==0) return;
+    const ImGuiTableColumnSortSpecs& spec = specs->Specs[0];
+    int col = spec.ColumnUserID;
+    bool asc = spec.SortDirection == ImGuiSortDirection_Ascending;
+    auto cmp = [col,asc](const Result& a, const Result& b){
+        switch(col){
+        case COL_NAME: return asc ? a.filename < b.filename : a.filename > b.filename;
+        case COL_PATH: return asc ? a.path < b.path : a.path > b.path;
+        case COL_SIZE: return asc ? a.size < b.size : a.size > b.size;
+        case COL_MOD:  return asc ? a.modified < b.modified : a.modified > b.modified;
+        case COL_SCORE: default: return asc ? a.score < b.score : a.score > b.score;
+        }
+    };
+    std::stable_sort(items.begin(), items.end(), cmp);
+}
+
 struct IdVec {
     uint64_t* ids;
     size_t n, cap;
@@ -646,6 +691,7 @@ int run_ui(void){
     bool show_advanced = false;
     Filters filters;
     bool need_update = true;
+    bool need_sort = true;
     Db* db = nullptr;
     const DbHeader* header = db_open_readonly(L"anything.mdb", &db); // Assume DB path
     if (!header) {
@@ -669,6 +715,8 @@ int run_ui(void){
 
     std::vector<Result> all_items; // Dummy if needed
 
+    live_updates_init();
+
     auto update_results = [&]() {
         if (search_th) {
             WaitForSingleObject(search_th, INFINITE);
@@ -679,11 +727,14 @@ int run_ui(void){
         sta.query = query_str;
         sta.filters = filters;
         search_th = CreateThread(NULL, 0, search_thread, &sta, 0, NULL);
+        need_sort = true;
     };
 
     static const char* months[] = { "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
 
     while(!glfwWindowShouldClose(window)){
+        LiveUpdate lu;
+        while(live_updates_poll(&lu)) { need_update = true; }
         glfwPollEvents();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -702,31 +753,71 @@ int run_ui(void){
             ImGui::Text("Results:");
             ImGui::Separator();
             ImGui::BeginChild("ResultsList", ImVec2(0, 0), false, ImGuiWindowFlags_None);
-            for (size_t i = 0; i < filtered.size(); ++i) {
-                char label[512];
-                snprintf(label, sizeof(label), "%s (score: %.1f)", filtered[i].filename.c_str(), filtered[i].score);
-                if (ImGui::Selectable(label, selected == static_cast<int>(i))) {
-                    selected = static_cast<int>(i);
+            ImGuiTableFlags tflags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_NoSavedSettings;
+            if (ImGui::BeginTable("ResultsTable", 5, tflags)) {
+                ImGui::TableSetupScrollFreeze(0,1);
+                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort, 0.0f, COL_NAME);
+                ImGui::TableSetupColumn("Path", 0, 0.0f, COL_PATH);
+                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_SIZE);
+                ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_MOD);
+                ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_SCORE);
+                ImGui::TableHeadersRow();
+                ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
+                if (sort_specs && (sort_specs->SpecsDirty || need_sort)) {
+                    apply_sort(filtered, sort_specs);
+                    sort_specs->SpecsDirty = false;
+                    need_sort = false;
+                }
+                for (size_t i = 0; i < filtered.size(); ++i) {
                     Result& r = filtered[i];
-                    if (r.type == "image") {
-                        std::string full_path = r.path + "\\" + r.filename;
-                        int channels;
-                        unsigned char* data = stbi_load(full_path.c_str(), &r.width, &r.height, &channels, 0);
-                        if (data) {
-                            glGenTextures(1, &r.texture);
-                            glBindTexture(GL_TEXTURE_2D, r.texture);
-                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                            GLenum internal_format = (channels == 4) ? GL_RGBA : (channels == 3) ? GL_RGB : GL_RED;
-                            GLenum format = internal_format;
-                            glTexImage2D(GL_TEXTURE_2D, 0, internal_format, r.width, r.height, 0, format, GL_UNSIGNED_BYTE, data);
-                            glBindTexture(GL_TEXTURE_2D, 0);
-                            stbi_image_free(data);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::PushID((int)i);
+                    bool is_selected = (selected == (int)i);
+                    if (ImGui::Selectable("##row", is_selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                        selected = (int)i;
+                        if (r.type == "image") {
+                            std::string full_path = r.path + "\\" + r.filename;
+                            int channels;
+                            unsigned char* data = stbi_load(full_path.c_str(), &r.width, &r.height, &channels, 0);
+                            if (data) {
+                                glGenTextures(1, &r.texture);
+                                glBindTexture(GL_TEXTURE_2D, r.texture);
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                                GLenum internal_format = (channels == 4) ? GL_RGBA : (channels == 3) ? GL_RGB : GL_RED;
+                                GLenum format = internal_format;
+                                glTexImage2D(GL_TEXTURE_2D, 0, internal_format, r.width, r.height, 0, format, GL_UNSIGNED_BYTE, data);
+                                glBindTexture(GL_TEXTURE_2D, 0);
+                                stbi_image_free(data);
+                            }
                         }
                     }
+                    if (ImGui::BeginPopupContextItem()) {
+                        std::string full = r.path + "\\" + r.filename;
+                        if (ImGui::MenuItem("Open")) open_file_os(full);
+                        if (ImGui::MenuItem("Open Folder")) open_folder_os(r.path);
+                        if (ImGui::MenuItem("Copy Path")) ImGui::SetClipboardText(full.c_str());
+                        if (ImGui::MenuItem("Delete")) { delete_path_os(full); need_update = true; }
+                        ImGui::EndPopup();
+                    }
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(r.filename.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(r.path.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%lld", (long long)r.size);
+                    ImGui::TableSetColumnIndex(3);
+                    char dstr[64];
+                    std::strftime(dstr, sizeof(dstr), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
+                    ImGui::Text("%s", dstr);
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::Text("%.1f", r.score);
+                    ImGui::PopID();
                 }
+                ImGui::EndTable();
             }
             ImGui::EndChild();
 
@@ -797,6 +888,7 @@ int run_ui(void){
             WaitForSingleObject(search_th, INFINITE);
             CloseHandle(search_th);
             search_th = NULL;
+            need_sort = true;
             search_done = true;
         }
 

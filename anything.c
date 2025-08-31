@@ -23,6 +23,39 @@
 #include "plugin.h"
 #include "scanner.h"
 
+#include <stdbool.h>
+
+static MPMCQueue g_live_updates;
+static BOOL g_live_inited = FALSE;
+
+void live_updates_init(void){
+    if(!g_live_inited){
+        MPMC_Init(&g_live_updates, 1<<12);
+        g_live_inited = TRUE;
+    }
+}
+
+BOOL live_updates_poll(LiveUpdate* out){
+    if(!g_live_inited) return FALSE;
+    void* p = NULL;
+    if(!MPMC_Pop(&g_live_updates, &p)) return FALSE;
+    if(!p) return FALSE;
+    LiveUpdate* lu = (LiveUpdate*)p;
+    *out = *lu;
+    _aligned_free(lu);
+    return TRUE;
+}
+
+static void push_live_update(const DbWorkItem* wi){
+    if(!g_live_inited) return;
+    LiveUpdate* lu = (LiveUpdate*)_aligned_malloc(sizeof(LiveUpdate), CACHE_LINE_SIZE);
+    if(!lu) return;
+    wcscpy_s(lu->parent_path, MAX_LONG_PATH, wi->parent_path);
+    wcscpy_s(lu->name, MAX_PATH, wi->name);
+    lu->op = wi->op;
+    while(!MPMC_Push(&g_live_updates, lu)) Sleep(0);
+}
+
 #ifdef HAS_LIBEXIF
 #include <libexif/exif-data.h>
 #endif
@@ -337,6 +370,7 @@ static DWORD WINAPI DbWriterThread(void* p){
         }
         if(item == NULL) break; // sentinel
         DbWorkItem* wi = (DbWorkItem*)item;
+        push_live_update(wi);
         if(wi->op == WI_DELETE){
             db_delete_path(ctx->db, wi->parent_path, wi->name);
             _aligned_free(wi);
@@ -430,6 +464,7 @@ static DWORD WINAPI scan_drive_thread(void* p){
 
 int wmain(int argc, wchar_t** argv){
     Args args;
+    live_updates_init();
     if(!parse_args(argc, argv, &args)) return 1;
 
     Db* db=NULL;
