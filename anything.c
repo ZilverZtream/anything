@@ -584,66 +584,84 @@ static DWORD WINAPI DbWriterThread(void* p){
         }
         if(item == NULL) break; // sentinel
         DbWorkItem* wi = (DbWorkItem*)item;
-        push_live_update(wi);
+        if(wi->stage == 1 || wi->op == WI_DELETE) push_live_update(wi);
         if(wi->op == WI_DELETE){
             db_delete_path(ctx->db, wi->parent_path, wi->name);
             _aligned_free(wi);
             continue;
         }
-        DbRecord r = {0};
-        r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
-        r.parent_str_id = db_intern_wstring(ctx->db, wi->parent_path);
-        r.name_str_id   = db_intern_wstring(ctx->db, wi->name);
-        r.file_size     = wi->file_size;
-        r.creation_time = wi->creation_time;
-        r.modified_time = wi->modified_time;
-        r.access_time   = wi->access_time;
-        r.attributes    = wi->attributes;
-        if(wi->preview){
-            r.preview_str_id = db_intern_wstring(ctx->db, wi->preview);
-            free(wi->preview);
-        }
-        if(r.type == DB_REC_FILE){
-            BOOL need_content = TRUE;
-            if(!wi->content){
-                DbRecord existing;
-                if(db_get_record_by_path(ctx->db, wi->parent_path, wi->name, &existing)){
-                    // If the file hasn't changed since the last index run, reuse the
-                    // previously stored metadata and avoid re-scanning its contents.
-                    if(existing.modified_time == wi->modified_time && existing.file_size == wi->file_size){
-                        r.content_str_id = existing.content_str_id;
-                        r.author_str_id  = existing.author_str_id;
-                        r.title_str_id   = existing.title_str_id;
-                        r.camera_str_id  = existing.camera_str_id;
-                        r.lens_str_id    = existing.lens_str_id;
-                        r.artist_str_id  = existing.artist_str_id;
-                        r.album_str_id   = existing.album_str_id;
-                        r.hash_crc       = existing.hash_crc;
-                        need_content = FALSE;
+        if(wi->stage == 1){
+            DbRecord r = {0};
+            r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
+            r.parent_str_id = db_intern_wstring(ctx->db, wi->parent_path);
+            r.name_str_id   = db_intern_wstring(ctx->db, wi->name);
+            r.attributes    = wi->attributes;
+            buf[in_batch++] = r;
+            DbWorkItem* next = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+            if(next){
+                next->content = NULL; next->preview = NULL;
+                wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
+                wcscpy_s(next->name, MAX_PATH, wi->name);
+                next->file_size = next->creation_time = next->modified_time = next->access_time = 0;
+                next->attributes = wi->attributes;
+                next->stage = 2; next->op = WI_ADD;
+                while(!MPMC_Push(&ctx->queue, next)) Sleep(0);
+            }
+            _aligned_free(wi);
+        } else if(wi->stage == 2){
+            DbRecord r = {0};
+            r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
+            r.parent_str_id = db_intern_wstring(ctx->db, wi->parent_path);
+            r.name_str_id   = db_intern_wstring(ctx->db, wi->name);
+            wchar_t full[MAX_LONG_PATH];
+            _snwprintf(full, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
+            uint32_t attrs=0; uint64_t sz=0, ct=0, mt=0, at=0;
+            get_file_info_basic(full, &attrs, &sz, &ct, &mt, &at);
+            r.attributes = attrs;
+            r.file_size = sz;
+            r.creation_time = ct;
+            r.modified_time = mt;
+            r.access_time   = at;
+            buf[in_batch++] = r;
+            if(!(attrs & FILE_ATTRIBUTE_DIRECTORY)){
+                DbWorkItem* next = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                if(next){
+                    next->content = NULL; next->preview = NULL;
+                    wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
+                    wcscpy_s(next->name, MAX_PATH, wi->name);
+                    next->file_size = sz; next->creation_time=ct; next->modified_time=mt; next->access_time=at;
+                    next->attributes = attrs;
+                    next->stage = 3; next->op = WI_ADD;
+                    while(!MPMC_Push(&ctx->queue, next)) Sleep(0);
+                }
+            }
+            _aligned_free(wi);
+        } else { // stage 3 content
+            DbRecord existing;
+            if(db_get_record_by_path(ctx->db, wi->parent_path, wi->name, &existing)){
+                if(existing.type == DB_REC_FILE){
+                    DbRecord r = existing;
+                    wchar_t fpath[MAX_LONG_PATH];
+                    _snwprintf(fpath, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
+                    if(wi->content){
+                        r.content_str_id = db_intern_wstring(ctx->db, wi->content);
+                        free(wi->content);
+                    } else {
+                        r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id, &r.title_str_id);
                     }
+                    if(wi->preview){
+                        r.preview_str_id = db_intern_wstring(ctx->db, wi->preview);
+                        free(wi->preview);
+                    }
+                    extract_exif_metadata(ctx->db, fpath, &r);
+                    extract_id3_metadata(ctx->db, fpath, &r);
+                    if(is_archive_file(wi->name)){ index_archive(ctx->db, fpath); }
+                    r.hash_crc = crc64_file(fpath);
+                    buf[in_batch++] = r;
                 }
-                if(need_content){
-                    r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id, &r.title_str_id);
-                }
-            } else {
-                r.content_str_id = db_intern_wstring(ctx->db, wi->content);
-                free(wi->content);
-                need_content = FALSE;
             }
-            if(need_content){
-                wchar_t fpath[MAX_LONG_PATH];
-                _snwprintf(fpath, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
-                extract_exif_metadata(ctx->db, fpath, &r);
-                extract_id3_metadata(ctx->db, fpath, &r);
-                if(is_archive_file(wi->name)){
-                    index_archive(ctx->db, fpath);
-                }
-                r.hash_crc = crc64_file(fpath);
-            }
+            _aligned_free(wi);
         }
-        _aligned_free(wi);
-
-        buf[in_batch++] = r;
         if(in_batch >= (size_t)ctx->batch_size){
             if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); return 1; }
             if(!db_commit_write(ctx->db)) { free(buf); return 1; }

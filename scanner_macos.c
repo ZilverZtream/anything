@@ -50,6 +50,7 @@ static void emit(FileScanner* s, const char* path){
     wi->modified_time = st.st_mtime;
     wi->access_time = st.st_atime;
     wi->attributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : 0;
+    wi->stage = 2;
     wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)) sched_yield();
 }
@@ -87,6 +88,7 @@ static void fsevent_cb(ConstFSEventStreamRef streamRef,
             }
             wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
             wi->attributes = 0;
+            wi->stage = 1;
             wi->op = WI_DELETE;
             while(!MPMC_Push(s->outq, wi)) sched_yield();
         } else {

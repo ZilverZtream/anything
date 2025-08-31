@@ -69,6 +69,7 @@ static void emit_net(struct NetworkScanner* s, const char* parent, const char* n
     wi->modified_time = st->st_mtime;
     wi->access_time = st->st_atime;
     wi->attributes = S_ISDIR(st->st_mode) ? FILE_ATTRIBUTE_DIRECTORY : 0;
+    wi->stage = 2;
     wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)) sched_yield();
 }
