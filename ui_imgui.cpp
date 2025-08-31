@@ -858,7 +858,8 @@ int run_ui(void){
         ImGui::Begin("Anything Search", nullptr, ImGuiWindowFlags_None);
         if (ImGui::BeginTabBar("MainTabs")) {
             if (ImGui::BeginTabItem("Search")) {
-                bool query_edited = ImGui::InputText("Query", &query_str);
+                ImGui::InputText("Query", &query_str);
+                bool query_edited = ImGui::IsItemEdited();
                 ImGui::SameLine();
                 if (ImGui::Button("Advanced")) show_advanced = !show_advanced;
                 if (query_edited) need_update = true;
