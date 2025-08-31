@@ -21,6 +21,7 @@
 #include "lmdb.h"
 #include "archive.h"
 #include "plugin.h"
+#include "scanner.h"
 
 // ---- MPMC queue implementation ----
 typedef enum { CONTENT_NONE, CONTENT_TEXT, CONTENT_IFILTER } ContentMode;
@@ -318,16 +319,12 @@ static BOOL parse_args(int argc, wchar_t** argv, Args* a){
 
 static DWORD WINAPI scan_drive_thread(void* p){
     struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = p;
-    NTFSScanner* nts = NULL;
-    GenericScanner* gen = NULL;
-    if(in->use_ntfs){
-        nts = NTFSScanner_Start(in->root, in->threads, &in->ctx->queue, in->ctx->cancel_event);
+    (void)in->use_ntfs; // selection now handled internally
+    FileScanner* fs = FileScanner_Start(in->root, in->threads, &in->ctx->queue, in->ctx->cancel_event);
+    if(fs){
+        FileScanner_Wait(fs);
+        FileScanner_Free(fs);
     }
-    if(!nts){
-        gen = GenericScanner_Start(in->root, in->threads, &in->ctx->queue, in->ctx->cancel_event);
-    }
-    if(nts){ NTFSScanner_Wait(nts); NTFSScanner_Free(nts); }
-    if(gen){ GenericScanner_Wait(gen); GenericScanner_Free(gen); }
     free(in);
     return 0;
 }

@@ -2,10 +2,27 @@
 #ifndef ANYTHING_H
 #define ANYTHING_H
 #define _CRT_SECURE_NO_WARNINGS
-#include <windows.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <wchar.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <sys/types.h>
+typedef void* HANDLE;
+typedef int BOOL;
+#include <stdint.h>
+typedef int32_t LONG;
+typedef int64_t LONG64;
+#ifndef TRUE
+#define TRUE 1
+#define FALSE 0
+#endif
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
+#endif
 
 #ifndef CACHE_LINE_SIZE
 #define CACHE_LINE_SIZE 64
