@@ -14,19 +14,37 @@
 #include "anything.h"
 #include "database.h"
 #include "util.h"
+#include "lmdb.h"
 
 // ---- MPMC queue implementation ----
+static BOOL should_index_content(const wchar_t* name){
+    const wchar_t* ext = wcsrchr(name, L'.');
+    if(!ext) return FALSE;
+    ext++;
+    return _wcsicmp(ext,L"txt")==0 || _wcsicmp(ext,L"md")==0 ||
+           _wcsicmp(ext,L"c")==0   || _wcsicmp(ext,L"h")==0   ||
+           _wcsicmp(ext,L"cpp")==0 || _wcsicmp(ext,L"py")==0;
+}
+
 static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t* name, uint64_t* author_out){
     *author_out = 0;
+    if(!should_index_content(name)) return 0;
     wchar_t path[MAX_LONG_PATH];
     _snwprintf(path, MAX_LONG_PATH, L"%s\\%s", parent, name);
     FILE* f = _wfopen(path, L"rb");
     if(!f) return 0;
-    char buf[8192+1]; size_t n = fread(buf,1,8192,f); buf[n]=0; fclose(f);
+    char buf[4096+1]; size_t n = fread(buf,1,4096,f); fclose(f);
+    if(n==0) return 0;
+    buf[n]=0;
+    // crude binary check
+    for(size_t i=0;i<n;i++){ if(buf[i]==0){ buf[0]=0; break; } }
+    if(buf[0]==0) return 0;
     char* a = StrStrIA(buf, "author:");
     if(a){
-        a+=7; while(*a==' '||*a=='\t') a++;
-        char tmp[256]; size_t len=0; while(a[len] && a[len]!='\r' && a[len]!='\n' && len<255) len++;
+        a += 7;
+        while(*a==' '||*a=='\t') a++;
+        char tmp[256]; size_t len=0;
+        while(a[len] && a[len]!='\r' && a[len]!='\n' && len<255) len++;
         memcpy(tmp,a,len); tmp[len]=0;
         wchar_t wa[256]; to_wide(tmp, wa, 256);
         *author_out = db_intern_wstring(db, wa);

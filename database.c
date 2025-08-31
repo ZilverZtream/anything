@@ -299,23 +299,6 @@ static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     }
     _freea(tmp);
 }
-        if(dup) continue;
-        if(seen_n<256) seen[seen_n++]=key;
-        MDB_val k={.mv_data=&key,.mv_size=3}, v={.mv_data=&name_id,.mv_size=sizeof(name_id)};
-        int rc = mdb_put(d->wtxn, d->dbi_trigram_index, &k, &v, MDB_NODUPDATA);
-        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d, rc); }
-    }
-    _freea(tmp);
-}
-
-        if(dup) continue;
-        if(seen_n<256) seen[seen_n++]=key;
-        MDB_val k={.mv_data=&key,.mv_size=3}, v={.mv_data=&name_id,.mv_size=sizeof(name_id)};
-        int rc = mdb_put(d->wtxn, d->dbi_trigram_index, &k, &v, MDB_NODUPDATA);
-        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d, rc); }
-    }
-    _freea(tmp);
-}
 
 
 
@@ -388,22 +371,22 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
             emit_trigrams(d, (const char*)namev.mv_data, r->name_str_id);
         }
         if(r->content_str_id){
-            MDB_val cv;
-            if(str_by_id(d, d->wtxn, r->content_str_id, &cv)){
+            MDB_val ck, cv; to_mdb_val(&r->content_str_id, sizeof(r->content_str_id), &ck); to_mdb_val(&id, sizeof(id), &cv);
+            rc = mdb_put(d->wtxn, d->dbi_content_index, &ck, &cv, MDB_NODUPDATA);
+            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+            MDB_val cvstr;
+            if(str_by_id(d, d->wtxn, r->content_str_id, &cvstr)){
                 MDB_val mk={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, mv;
                 if(mdb_get(d->wtxn, d->dbi_string_meta, &mk, &mv)!=0){
-                    StringMeta sm; build_bloom_for_name((const char*)cv.mv_data, &sm);
+                    StringMeta sm; build_bloom_for_name((const char*)cvstr.mv_data, &sm);
                     MDB_val smv={.mv_data=&sm,.mv_size=sizeof(sm)};
                     mdb_put(d->wtxn, d->dbi_string_meta, &mk, &smv, 0);
                 }
-                emit_trigrams(d, (const char*)cv.mv_data, r->content_str_id);
+                emit_trigrams(d, (const char*)cvstr.mv_data, r->content_str_id);
             }
-            MDB_val ck={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, cvv={.mv_data=&id,.mv_size=sizeof(id)};
-            rc = mdb_put(d->wtxn, d->dbi_content_index, &ck, &cvv, MDB_NODUPDATA);
-            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
         }
         if(r->author_str_id){
-            MDB_val ak={.mv_data=&r->author_str_id,.mv_size=sizeof(r->author_str_id)}, av={.mv_data=&id,.mv_size=sizeof(id)};
+            MDB_val ak,av; to_mdb_val(&r->author_str_id, sizeof(r->author_str_id), &ak); to_mdb_val(&id, sizeof(id), &av);
             rc = mdb_put(d->wtxn, d->dbi_author_index, &ak, &av, MDB_NODUPDATA);
             if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
         }

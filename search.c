@@ -253,7 +253,6 @@ static DWORD WINAPI filter_worker_thread(void* p){
         if(r->file_size < a->q->size_min || r->file_size > a->q->size_max) continue;
         uint64_t day = filetime_days(r->modified_time);
         if(day < a->q->date_min_day || day > a->q->date_max_day) continue;
-        if(a->q->author_str_id && r->author_str_id != a->q->author_str_id) continue;
         MDB_val pk={.mv_data=&r->parent_str_id,.mv_size=sizeof(r->parent_str_id)}, pv;
         MDB_val nk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, nv;
         if(mdb_get(txn, dbi_strings, &pk, &pv)!=0) continue;
@@ -264,6 +263,16 @@ static DWORD WINAPI filter_worker_thread(void* p){
         if(a->q->path_filter){ if(strncmp(parent,a->q->path_filter,strlen(a->q->path_filter))!=0) continue; }
         if(a->q->name_pattern){ char* tmp=_strdup(name); lowercase_ascii(tmp,strlen(tmp)); char* pat=_strdup(a->q->name_pattern);
             BOOL ok = (is_avx2_supported() ? avx2_contains(tmp, strlen(tmp), pat, strlen(pat)) : (StrStrIA(tmp, pat)!=NULL));
+            free(tmp); free(pat);
+            if(!ok) continue;
+        }
+        if(a->q->content_pattern){
+            if(r->content_str_id==0) continue;
+            MDB_val ck={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, cv;
+            if(mdb_get(txn, dbi_strings, &ck, &cv)!=0) continue;
+            char* content = (char*)cv.mv_data;
+            char* tmp=_strdup(content); lowercase_ascii(tmp,strlen(tmp)); char* pat=_strdup(a->q->content_pattern);
+            BOOL ok = StrStrIA(tmp, pat)!=NULL;
             free(tmp); free(pat);
             if(!ok) continue;
         }
@@ -422,7 +431,7 @@ int wmain(int argc, wchar_t** argv){
        mdb_dbi_open(txn,"content_index",0,&dbi_content)!=0 ||
        mdb_dbi_open(txn,"author_index",0,&dbi_author)!=0 ||
        mdb_dbi_open(txn,"strrev",0,&dbi_strrev)!=0){
-        fwprintf(stderr,L"dbi_open failed\n"); mdb_txn_abort(txn); mdb_env_close(env); return 1;
+       fwprintf(stderr,L"dbi_open failed\n"); mdb_txn_abort(txn); mdb_env_close(env); return 1;
     }
 
     if(q.author){
@@ -475,47 +484,50 @@ int wmain(int argc, wchar_t** argv){
         name_ids.n=keep;
         _freea(tl);
     }
-    }
     if(q.content_pattern){
         collect_trigram_candidates(txn, dbi_trigram, q.content_pattern, &content_ids);
         sort_unique(&content_ids);
     }
 
-    // Step 2: expand to record ids via indices
+    // Step 2: expand to record ids via filename_index
     IdVec rec_ids; idvec_init(&rec_ids);
-    if(name_ids.n>0 || q.name_pattern){
-        MDB_cursor* cix=NULL; mdb_cursor_open(txn, dbi_fname_index, &cix);
-        if(name_ids.n>0){
-            for(size_t i=0;i<name_ids.n;i++){
-                MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
+    MDB_cursor* cix=NULL; mdb_cursor_open(txn, dbi_fname_index, &cix);
+    if(name_ids.n>0){
+        for(size_t i=0;i<name_ids.n;i++){
+            MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
+            if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY)==0){
+                do{ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP)==0);
+            }
+        }
+    } else if(q.name_pattern){
+        // No trigram narrowing (too short): fallback to full scan of strings to find matching names, then map via filename_index
+        MDB_cursor* cs=NULL; mdb_cursor_open(txn, dbi_strings, &cs);
+        MDB_val sk, sv; int rc = mdb_cursor_get(cs, &sk, &sv, MDB_FIRST);
+        char* npat = _strdup(q.name_pattern); lowercase_ascii(npat, strlen(npat));
+        while(rc==0){
+            uint64_t sid = *(uint64_t*)sk.mv_data;
+            char* name = (char*)sv.mv_data; size_t nlen = sv.mv_size;
+            char* tmp = (char*)_malloca(nlen+1); memcpy(tmp,name,nlen); tmp[nlen]=0; lowercase_ascii(tmp,nlen);
+            if(strstr(tmp, npat)){
+                MDB_val k={.mv_data=&sid,.mv_size=sizeof(sid)}, v;
                 if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY)==0){
                     do{ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP)==0);
                 }
             }
-        } else {
-            // No trigram narrowing (too short): fallback to full scan of strings to find matching names
-            MDB_cursor* cs=NULL; mdb_cursor_open(txn, dbi_strings, &cs);
-            MDB_val sk, sv; int rc = mdb_cursor_get(cs, &sk, &sv, MDB_FIRST);
-            char* npat = _strdup(q.name_pattern); lowercase_ascii(npat, strlen(npat));
-            while(rc==0){
-                uint64_t sid = *(uint64_t*)sk.mv_data;
-                char* name = (char*)sv.mv_data; size_t nlen = sv.mv_size;
-                char* tmp = (char*)_malloca(nlen+1); memcpy(tmp,name,nlen); tmp[nlen]=0; lowercase_ascii(tmp,nlen);
-                if(strstr(tmp, npat)){
-                    MDB_val k={.mv_data=&sid,.mv_size=sizeof(sid)}, v;
-                    if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY)==0){
-                        do{ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP)==0);
-                    }
-                }
-                _freea(tmp);
-                rc = mdb_cursor_get(cs, &sk, &sv, MDB_NEXT);
-            }
-            mdb_cursor_close(cs);
-            free(npat);
+            _freea(tmp);
+            rc = mdb_cursor_get(cs, &sk, &sv, MDB_NEXT);
         }
-        mdb_cursor_close(cix);
+        mdb_cursor_close(cs);
+        free(npat);
+    } else {
+        // No name term: user may only filter by size/date/ext/path; start from all records by iterating size_index or date_index; choose smaller range
+        // We'll just iterate date_index today
+        MDB_cursor* cd=NULL; mdb_cursor_open(txn, dbi_date, &cd);
+        MDB_val k,v; int rc = mdb_cursor_get(cd, &k, &v, MDB_FIRST);
+        while(rc==0){ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); rc = mdb_cursor_get(cd, &k, &v, MDB_NEXT); }
+        mdb_cursor_close(cd);
     }
-
+    mdb_cursor_close(cix);
     if(q.content_pattern){
         IdVec crec; idvec_init(&crec);
         MDB_cursor* cc=NULL; mdb_cursor_open(txn, dbi_content, &cc);
@@ -530,12 +542,17 @@ int wmain(int argc, wchar_t** argv){
         if(rec_ids.n>0){ intersect_inplace(&rec_ids, &crec); idvec_free(&crec); }
         else { rec_ids = crec; }
     }
-
-    if(rec_ids.n==0 && !q.name_pattern && !q.content_pattern){
-        MDB_cursor* cd=NULL; mdb_cursor_open(txn, dbi_date, &cd);
-        MDB_val k,v; int rc = mdb_cursor_get(cd, &k, &v, MDB_FIRST);
-        while(rc==0){ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); rc = mdb_cursor_get(cd, &k, &v, MDB_NEXT); }
-        mdb_cursor_close(cd);
+    if(q.author_str_id){
+        IdVec arec; idvec_init(&arec);
+        MDB_cursor* ca=NULL; mdb_cursor_open(txn, dbi_author, &ca);
+        MDB_val k={.mv_data=&q.author_str_id,.mv_size=sizeof(uint64_t)}, v;
+        if(mdb_cursor_get(ca,&k,&v,MDB_SET_KEY)==0){
+            do{ idvec_push(&arec, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(ca,&k,&v,MDB_NEXT_DUP)==0);
+        }
+        mdb_cursor_close(ca);
+        sort_unique(&arec);
+        if(rec_ids.n>0){ intersect_inplace(&rec_ids, &arec); idvec_free(&arec); }
+        else { rec_ids = arec; }
     }
     sort_unique(&rec_ids);
 
@@ -604,7 +621,10 @@ int wmain(int argc, wchar_t** argv){
     if(q.name_pattern) free(q.name_pattern);
     if(q.path_filter) free(q.path_filter);
     if(q.ext) free(q.ext);
+    if(q.content_pattern) free(q.content_pattern);
+    if(q.author) free(q.author);
     idvec_free(&name_ids);
+    idvec_free(&content_ids);
     idvec_free(&rec_ids);
     return 0;
 
