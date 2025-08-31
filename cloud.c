@@ -339,7 +339,7 @@ static void dropbox_walk(const char* token, const wchar_t* parent, MPMCQueue* q)
 }
 
 BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
-    (void)db; // database integration stub for now
+    if(!db || !out_queue) return FALSE;
     char* token=NULL; if(!obtain_token(provider,&token)) return FALSE;
     wchar_t root[MAX_LONG_PATH]; root[0]=0;
     switch(provider){
@@ -359,6 +359,17 @@ BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
         free(token); return FALSE;
     }
     free(token);
+
+    IndexState st={0};
+    db_get_index_state(db, &st);
+    FILETIME now; GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER uli; uli.LowPart = now.dwLowDateTime; uli.HighPart = now.dwHighDateTime;
+    st.last_scan_time = uli.QuadPart;
+    if(db_begin_write(db)){
+        db_set_index_state(db, &st);
+        db_commit_write(db);
+    }
+
     return TRUE;
 }
 

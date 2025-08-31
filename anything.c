@@ -773,27 +773,42 @@ int wmain(int argc, wchar_t** argv){
     HANDLE drive_threads[26]; int drive_count=0;
     // Incremental index state
     IndexState st={0}; BOOL has_state = db_get_index_state(db, &st);
-    // TODO: compute drive signatures; for now, always scan (production: compare st.drive_signatures)
+    uint8_t current_sigs[26][32];
+    ZeroMemory(current_sigs, sizeof(current_sigs));
+    for(int i=0;i<26;i++){
+        wchar_t root[8];
+        swprintf(root,8,L"%c:\\", L'A'+i);
+        compute_drive_signature(root, current_sigs[i]);
+    }
 
     if(args.all_drives){
         DWORD mask = GetLogicalDrives();
         for(int i=0;i<26;i++){
-            if(mask & (1u<<i)){
-                wchar_t root[8]; swprintf(root, 8, L"%c:\\", L'A'+i);
-                UINT type = GetDriveTypeW(root);
-                if(type==DRIVE_FIXED || type==DRIVE_REMOVABLE){
-                    struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = (struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; }*)malloc(sizeof(*in));
-                    wcscpy_s(in->root, 8, root);
-                    in->ctx=&ctx; in->use_ntfs=args.use_ntfs; in->threads=args.threads;
-                    drive_threads[drive_count++] = CreateThread(NULL,0,scan_drive_thread,in,0,NULL);
-                }
+            if(!(mask & (1u<<i))) continue;
+            if(has_state && memcmp(current_sigs[i], st.drive_signatures[i], 32) == 0) continue;
+            wchar_t root[8]; swprintf(root, 8, L"%c:\\", L'A'+i);
+            UINT type = GetDriveTypeW(root);
+            if(type==DRIVE_FIXED || type==DRIVE_REMOVABLE){
+                struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = (struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; }*)malloc(sizeof(*in));
+                wcscpy_s(in->root, 8, root);
+                in->ctx=&ctx; in->use_ntfs=args.use_ntfs; in->threads=args.threads;
+                drive_threads[drive_count++] = CreateThread(NULL,0,scan_drive_thread,in,0,NULL);
             }
         }
     } else {
-        struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = (struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; }*)malloc(sizeof(*in));
-        wcscpy_s(in->root, 8, args.rootPath);
-        in->ctx=&ctx; in->use_ntfs=args.use_ntfs; in->threads=args.threads;
-        drive_threads[drive_count++] = CreateThread(NULL,0,scan_drive_thread,in,0,NULL);
+        int di=-1;
+        if(args.rootPath[0] >= L'A' && args.rootPath[0] <= L'Z') di = args.rootPath[0]-L'A';
+        else if(args.rootPath[0] >= L'a' && args.rootPath[0] <= L'z') di = args.rootPath[0]-L'a';
+        BOOL need_scan = TRUE;
+        if(di>=0 && di<26 && has_state){
+            if(memcmp(current_sigs[di], st.drive_signatures[di], 32) == 0) need_scan = FALSE;
+        }
+        if(need_scan){
+            struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = (struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; }*)malloc(sizeof(*in));
+            wcscpy_s(in->root, 8, args.rootPath);
+            in->ctx=&ctx; in->use_ntfs=args.use_ntfs; in->threads=args.threads;
+            drive_threads[drive_count++] = CreateThread(NULL,0,scan_drive_thread,in,0,NULL);
+        }
     }
 
     WaitForMultipleObjects(drive_count, drive_threads, TRUE, INFINITE);
@@ -813,6 +828,15 @@ int wmain(int argc, wchar_t** argv){
     MPMC_Push(&ctx.queue, NULL); // sentinel
     WaitForSingleObject(writer, INFINITE);
     CloseHandle(writer);
+
+    memcpy(st.drive_signatures, current_sigs, sizeof(current_sigs));
+    FILETIME now; GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER uli; uli.LowPart = now.dwLowDateTime; uli.HighPart = now.dwHighDateTime;
+    st.last_scan_time = uli.QuadPart;
+    if(db_begin_write(db)){
+        db_set_index_state(db, &st);
+        db_commit_write(db);
+    }
 
     const DbHeader* header = db_header(db);
     if(header){
