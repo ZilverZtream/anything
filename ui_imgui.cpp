@@ -4,14 +4,17 @@
  #include <imgui_impl_opengl3.h>
  #include <GLFW/glfw3.h>
  #include "stb_image.h"
- #ifdef _WIN32
- #include <windows.h>
- #include <intrin.h>
- #include <shlwapi.h>
- #pragma comment(lib, "shlwapi.lib")
- #else
- #include <unistd.h>
- #endif
+#ifdef _WIN32
+#include <windows.h>
+#include <intrin.h>
+#include <shlwapi.h>
+#pragma comment(lib, "shlwapi.lib")
+#else
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#endif
  #include <wchar.h>
  #include <algorithm>
  #include <vector>
@@ -39,11 +42,45 @@
  #ifndef MAX_PATH
  #define MAX_PATH 260
  #endif
- #ifndef MAX_LONG_PATH
- #define MAX_LONG_PATH 32767
- #endif
+#ifndef MAX_LONG_PATH
+#define MAX_LONG_PATH 32767
+#endif
 
 #ifdef HAS_IMGUI
+struct StringMeta { uint32_t trigram_count; uint64_t bloom_offset; };
+static const uint8_t* g_bloom_base = nullptr;
+static size_t g_bloom_size = 0;
+static bool open_bloom(const wchar_t* dbPath){
+#ifdef _WIN32
+    wchar_t bp[MAX_PATH]; swprintf(bp, MAX_PATH, L"%s\\bloom.dat", dbPath);
+    HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if(f==INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz; GetFileSizeEx(f,&sz); g_bloom_size = sz.QuadPart;
+    HANDLE m = CreateFileMappingW(f,NULL,PAGE_READONLY,0,0,NULL); CloseHandle(f);
+    if(!m) return false;
+    g_bloom_base = (const uint8_t*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0); CloseHandle(m);
+    return g_bloom_base != nullptr;
+#else
+    char bp[MAX_PATH]; wcstombs(bp, dbPath, MAX_PATH);
+    strncat(bp, "/bloom.dat", MAX_PATH - strlen(bp) - 1);
+    int fd = open(bp, O_RDONLY);
+    if(fd<0) return false;
+    struct stat st; if(fstat(fd,&st)!=0){ close(fd); return false; }
+    g_bloom_size = st.st_size;
+    g_bloom_base = (const uint8_t*)mmap(NULL, g_bloom_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    return g_bloom_base != MAP_FAILED;
+#endif
+}
+static void close_bloom(){
+    if(!g_bloom_base) return;
+#ifdef _WIN32
+    UnmapViewOfFile(g_bloom_base);
+#else
+    munmap((void*)g_bloom_base, g_bloom_size);
+#endif
+    g_bloom_base = nullptr;
+}
 struct Result {
     std::string filename;
     std::string path;
@@ -441,8 +478,10 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
         for (size_t i = 0; i < name_ids.n; i++) {
             MDB_val k = {.mv_data = &name_ids.ids[i], .mv_size = sizeof(uint64_t)};
             MDB_val v;
-            if (mdb_get(txn, dbi_smeta, &k, &v) != 0 || v.mv_size < 8196) continue;
-            const uint8_t* bloom = (const uint8_t*)v.mv_data + 4;
+            if (mdb_get(txn, dbi_smeta, &k, &v) != 0 || v.mv_size < sizeof(StringMeta)) continue;
+            const StringMeta* sm = (const StringMeta*)v.mv_data;
+            if (sm->bloom_offset + 8192 > g_bloom_size) continue;
+            const uint8_t* bloom = g_bloom_base + sm->bloom_offset;
             bool ok = true;
             for (size_t j = 0; j < hn; j++) {
                 uint32_t bit = hbuf[j];
@@ -766,12 +805,14 @@ int run_ui(void){
     header = db_open_readonly(L"anything.mdb", &db);
     char u8db[MAX_PATH*3];
     to_utf8(L"anything.mdb", u8db, sizeof(u8db));
+    open_bloom(L"anything.mdb");
 #else
     wchar_t wdb[MAX_PATH];
     mbstowcs(wdb, "anything.mdb", MAX_PATH);
     header = db_open_readonly(wdb, &db);
     char u8db[MAX_PATH*3];
     strncpy(u8db, "anything.mdb", sizeof(u8db));
+    open_bloom(wdb);
 #endif
     if (!header) {
         fprintf(stderr, "Failed to open DB\n");
@@ -1018,6 +1059,7 @@ int run_ui(void){
 
     db_close(db);
     mdb_env_close(env);
+    close_bloom();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
