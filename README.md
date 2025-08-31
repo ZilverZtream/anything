@@ -20,6 +20,7 @@ It scans drives (via NTFS USN journal or generic directory walking), stores file
 - Archive content indexing (ZIP/RAR/7z) via libzip.
 - Pluggable scanners for cloud drives (OneDrive/Google Drive/pCloud/Dropbox).
 - Experimental WSL filesystem indexing.
+- Extensible plugin system so third parties can add new scanners.
 - Bloom filters for quick name filtering.
 - Fuzzy filename and content search using Levenshtein distance.
 - Command-line tools:
@@ -35,6 +36,9 @@ Stub scanners exist for OneDrive, Google Drive, and Dropbox. They will use offic
 ## Native WSL File System Indexing
 An experimental scanner illustrates how to traverse and index files stored under the Windows Subsystem for Linux.
 
+## Plugin API
+Custom data source scanners can be implemented as DLLs. Place compiled plugins in a `plugins` folder next to the executable and they will be loaded at startup. The `plugin.h` header documents the API each DLL must expose.
+
 ## Build
 This project is written in **C** for Windows.
 
@@ -44,4 +48,5 @@ This project is written in **C** for Windows.
 
 ### Example Build Command (Visual Studio Developer Command Prompt)
 ```bat
-cl /O2 /MD anything.c database.c exfat.c ntfs.c search.c util.c lmdb.lib shlwapi.lib
+cl /O2 /MD anything.c database.c exfat.c ntfs.c search.c util.c plugin.c lmdb.lib shlwapi.lib
+```

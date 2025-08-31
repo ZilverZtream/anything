@@ -20,6 +20,7 @@
 #include "util.h"
 #include "lmdb.h"
 #include "archive.h"
+#include "plugin.h"
 
 // ---- MPMC queue implementation ----
 typedef enum { CONTENT_NONE, CONTENT_TEXT, CONTENT_IFILTER } ContentMode;
@@ -346,6 +347,8 @@ int wmain(int argc, wchar_t** argv){
     if(!MPMC_Init(&ctx.queue, 1<<16)){
         fwprintf(stderr, L"MPMC_Init failed\n"); db_close(db); return 1;
     }
+    PluginHost ph = { &ctx.queue, ctx.cancel_event };
+    Plugin_LoadAll(L"plugins", &ph);
     HANDLE writer = CreateThread(NULL,0,DbWriterThread,&ctx,0,NULL);
 
     HANDLE drive_threads[26]; int drive_count=0;
@@ -377,6 +380,8 @@ int wmain(int argc, wchar_t** argv){
     WaitForMultipleObjects(drive_count, drive_threads, TRUE, INFINITE);
     for(int i=0;i<drive_count;i++) CloseHandle(drive_threads[i]);
 
+    Plugin_ScanAll();
+
     if(args.tail_changes && !args.all_drives){
         HANDLE tailer = StartUSNTailer(args.rootPath, &ctx.queue, ctx.cancel_event);
         if(tailer){
@@ -397,6 +402,7 @@ int wmain(int argc, wchar_t** argv){
             (unsigned long long)header->string_count,
             (unsigned long long)(header->map_size_bytes/1024/1024));
     }
+    Plugin_UnloadAll();
     db_close(db);
     MPMC_Destroy(&ctx.queue);
     CloseHandle(ctx.cancel_event);
