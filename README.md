@@ -1,10 +1,10 @@
 # Anything Project
 
-**Anything** is a high-performance Windows file system indexer and search engine.  
-It scans drives (via NTFS USN journal or generic directory walking), stores file metadata in an LMDB database, and allows fast full-text search using trigram indices and filters.
+**Anything** is a high-performance file system indexer and search engine.
+It scans drives (via NTFS USN journal, generic directory walking, or native Linux/macOS watchers), stores file metadata in an LMDB database, and allows fast full-text search using trigram indices and filters.
 
 ## Features
-- Multi-threaded file system scanning (NTFS and generic).
+- Multi-threaded file system scanning (NTFS, generic, and POSIX inotify/FSEvents).
 - Lock-free MPMC queue for fast inter-thread communication.
 - Efficient LMDB storage with multiple indices:
   - Filename
