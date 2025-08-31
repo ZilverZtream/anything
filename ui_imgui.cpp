@@ -1068,7 +1068,16 @@ int run_ui(void){
                     ImGui::EndTable();
                 }
                 if (ImGui::Button("Delete Selected")) {
-                    // TODO: delete selected files
+                    g_duplicates.erase(
+                        std::remove_if(g_duplicates.begin(), g_duplicates.end(),
+                            [](const DuplicateItem& d){
+                                if(d.selected){
+                                    delete_path_os(d.path);
+                                    return true;
+                                }
+                                return false;
+                            }),
+                        g_duplicates.end());
                 }
                 ImGui::EndTabItem();
             }
