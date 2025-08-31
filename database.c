@@ -94,6 +94,7 @@ typedef struct {
     HANDLE   bloom_file;
     uint64_t bloom_offset;
     DbHeader header_cache;
+    IndexLoadState load_state;
 } DbImpl;
 
 static void set_last_err(DbImpl* d, int err) { d->last_err = err; }
@@ -119,12 +120,24 @@ static int open_core_dbs(MDB_txn* txn, DbImpl* d, BOOL create){
     if((rc = mdb_dbi_open(txn, "records", flags, &d->dbi_records))) return rc;
     if((rc = mdb_dbi_open(txn, "filename_index", flags|MDB_DUPSORT, &d->dbi_fname_index))) return rc;
     if((rc = mdb_dbi_open(txn, "parent_index", flags|MDB_DUPSORT, &d->dbi_parent_index))) return rc;
+    return 0;
+}
+
+static int open_metadata_dbs(MDB_txn* txn, DbImpl* d, BOOL create){
+    unsigned int flags = create? MDB_CREATE:0;
+    int rc;
     if((rc = mdb_dbi_open(txn, "size_index", flags|MDB_DUPSORT|MDB_INTEGERKEY, &d->dbi_size_index))) return rc;
     if((rc = mdb_dbi_open(txn, "date_index", flags|MDB_DUPSORT|MDB_INTEGERKEY, &d->dbi_date_index))) return rc;
     if((rc = mdb_dbi_open(txn, "mtime_index", flags|MDB_DUPSORT|MDB_INTEGERKEY, &d->dbi_mtime_index))) return rc;
     if((rc = mdb_dbi_open(txn, "attr_index", flags|MDB_DUPSORT|MDB_INTEGERKEY, &d->dbi_attr_index))) return rc;
     if((rc = mdb_dbi_open(txn, "extension_index", flags|MDB_DUPSORT, &d->dbi_extension_index))) return rc;
     if((rc = mdb_dbi_open(txn, "path_hierarchy", flags|MDB_DUPSORT, &d->dbi_path_hierarchy))) return rc;
+    return 0;
+}
+
+static int open_content_dbs(MDB_txn* txn, DbImpl* d, BOOL create){
+    unsigned int flags = create? MDB_CREATE:0;
+    int rc;
     if((rc = mdb_dbi_open(txn, "trigram_index", flags|MDB_DUPSORT, &d->dbi_trigram_index))) return rc;
     if((rc = mdb_dbi_open(txn, "string_meta", flags|MDB_CREATE, &d->dbi_string_meta))) return rc;
     if((rc = mdb_dbi_open(txn, "content_index", flags|MDB_DUPSORT, &d->dbi_content_index))) return rc;
@@ -134,6 +147,25 @@ static int open_core_dbs(MDB_txn* txn, DbImpl* d, BOOL create){
     if((rc = mdb_dbi_open(txn, "artist_index", flags|MDB_DUPSORT, &d->dbi_artist_index))) return rc;
     if((rc = mdb_dbi_open(txn, "album_index", flags|MDB_DUPSORT, &d->dbi_album_index))) return rc;
     if((rc = mdb_dbi_open(txn, "title_index", flags|MDB_DUPSORT, &d->dbi_title_index))) return rc;
+    return 0;
+}
+
+static int ensure_indices(DbImpl* d, IndexLoadState desired){
+    if(d->load_state >= desired) return 0;
+    MDB_txn* txn;
+    int rc = mdb_txn_begin(d->env, NULL, MDB_RDONLY, &txn);
+    if(rc) return rc;
+    if(d->load_state < INDEX_METADATA_LOADED && desired >= INDEX_METADATA_LOADED){
+        rc = open_metadata_dbs(txn, d, FALSE);
+        if(rc){ mdb_txn_abort(txn); return rc; }
+        d->load_state = INDEX_METADATA_LOADED;
+    }
+    if(d->load_state < INDEX_CONTENT_LOADED && desired >= INDEX_CONTENT_LOADED){
+        rc = open_content_dbs(txn, d, FALSE);
+        if(rc){ mdb_txn_abort(txn); return rc; }
+        d->load_state = INDEX_CONTENT_LOADED;
+    }
+    mdb_txn_abort(txn);
     return 0;
 }
 
@@ -161,6 +193,8 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
     MDB_txn* txn;
     if((rc = mdb_txn_begin(d->env, NULL, 0, &txn))){ set_last_err(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
     if((rc = open_core_dbs(txn, d, TRUE))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
+    if((rc = open_metadata_dbs(txn, d, TRUE))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
+    if((rc = open_content_dbs(txn, d, TRUE))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
     // initialize header
     DbHeader hdr = {0};
     hdr.created_time = hdr.updated_time = now_filetime();
@@ -169,6 +203,7 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
     if((rc = mdb_put(txn, d->dbi_meta, &k, &v, 0))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
     if((rc = mdb_txn_commit(txn))){ set_last_err(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
     d->header_cache = hdr;
+    d->load_state = INDEX_CONTENT_LOADED;
     *out_db = (Db*)d;
     return TRUE;
 }
@@ -192,6 +227,7 @@ const DbHeader* db_open_readonly(const wchar_t* path, Db** out_db){
     if(v.mv_size < sizeof(DbHeader)){ mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return NULL; }
     memcpy(&d->header_cache, v.mv_data, sizeof(DbHeader));
     mdb_txn_abort(txn);
+    d->load_state = INDEX_CORE_LOADED;
     *out_db = (Db*)d;
     return &d->header_cache;
 }
@@ -232,10 +268,19 @@ int db_last_error(Db* db_){
     return d->last_err;
 }
 
+BOOL db_ensure_loaded(Db* db_, IndexLoadState state){
+    DbImpl* d = (DbImpl*)db_;
+    int rc = ensure_indices(d, state);
+    set_last_err(d, rc);
+    return rc==0;
+}
+
 BOOL db_begin_write(Db* db_){
     DbImpl* d = (DbImpl*)db_;
     if(d->wtxn) return TRUE;
-    int rc = mdb_txn_begin(d->env, NULL, 0, &d->wtxn);
+    int rc = ensure_indices(d, INDEX_CONTENT_LOADED);
+    if(rc){ set_last_err(d, rc); return FALSE; }
+    rc = mdb_txn_begin(d->env, NULL, 0, &d->wtxn);
     set_last_err(d, rc);
     return rc==0;
 }
@@ -409,6 +454,7 @@ static void remove_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
 BOOL db_get_compressed_trigram(Db* db_, uint32_t trigram, CompressedTrigram* out){
     if(!db_ || !out) return FALSE;
     DbImpl* d = (DbImpl*)db_;
+    if(!db_ensure_loaded(db_, INDEX_CONTENT_LOADED)) return FALSE;
     MDB_txn* txn; if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &txn)!=0) return FALSE;
     MDB_cursor* c=NULL; if(mdb_cursor_open(txn, d->dbi_trigram_index, &c)!=0){ mdb_txn_abort(txn); return FALSE; }
     uint8_t key_bytes[3]={ (uint8_t)(trigram>>16), (uint8_t)(trigram>>8), (uint8_t)trigram };

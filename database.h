@@ -21,6 +21,12 @@ typedef struct IndexState {
     IndexingLevel indexing_level;
 } IndexState;
 
+typedef enum {
+    INDEX_CORE_LOADED,     // Names only
+    INDEX_METADATA_LOADED, // + file attributes
+    INDEX_CONTENT_LOADED   // + full text
+} IndexLoadState;
+
 typedef struct {
     uint8_t bytes[3];
 } uint24_t;
@@ -40,6 +46,8 @@ size_t db_current_mapsize(Db* db);
 size_t db_max_mapsize(Db* db);
 BOOL   db_set_mapsize(Db* db, size_t new_size_bytes);
 int    db_last_error(Db* db);
+
+BOOL db_ensure_loaded(Db* db, IndexLoadState state);
 
 BOOL db_begin_write(Db* db);
 BOOL db_commit_write(Db* db);
