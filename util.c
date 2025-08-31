@@ -329,7 +329,7 @@ BOOL fuzzy_match(const char* text, const char* pattern, int max_dist){
     if(!text || !pattern || max_dist < 0) return FALSE;
     size_t n = strlen(text), m = strlen(pattern);
     if(m == 0) return TRUE;
-    if(n > 1024 || m > 1024) return FALSE;
+    if(n > 1024 || m > 1024 || max_dist > 1024) return FALSE; // Cap to prevent abuse
     if(n <= m){
         if((int)(m - n) > max_dist) return FALSE;
         return levenshtein_distance(text, n, pattern, m) <= max_dist;
