@@ -11,6 +11,55 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "bcrypt.lib")
 
+// default sort buffer size: 256MB
+size_t g_sort_buffer_size = 256 * 1024 * 1024;
+
+// helper to clamp work memory based on available physical memory
+size_t dynamic_work_mem(void){
+    MEMORYSTATUSEX ms; ms.dwLength = sizeof(ms);
+    if(!GlobalMemoryStatusEx(&ms)) return g_sort_buffer_size;
+    size_t avail = (size_t)(ms.ullAvailPhys / 4); // use 25% of free RAM
+    if(avail > g_sort_buffer_size) return g_sort_buffer_size;
+    if(avail < (1<<20)) return (1<<20);
+    return avail;
+}
+
+static BOOL sb_reserve(SortBuffer* sb, size_t add){
+    size_t need = sb->len + add;
+    if(need > sb->cap){
+        size_t newcap = sb->cap ? sb->cap * 2 : 256;
+        while(newcap < need) newcap *= 2;
+        uint8_t* p = (uint8_t*)realloc(sb->data, newcap);
+        if(!p) return FALSE;
+        sb->data = p; sb->cap = newcap;
+    }
+    return TRUE;
+}
+
+void sb_init(SortBuffer* sb){
+    if(!sb) return; sb->data=NULL; sb->len=sb->cap=0;
+}
+
+void sb_free(SortBuffer* sb){
+    if(!sb) return; if(sb->data) free(sb->data); sb->data=NULL; sb->len=sb->cap=0;
+}
+
+BOOL sb_pack_str(SortBuffer* sb, const char* s){
+    size_t n = s ? strlen(s) : 0;
+    if(!sb_reserve(sb, sizeof(uint32_t)+n)) return FALSE;
+    uint32_t len=(uint32_t)n;
+    memcpy(sb->data+sb->len, &len, sizeof(len));
+    sb->len += sizeof(len);
+    if(n){ memcpy(sb->data+sb->len, s, n); sb->len += n; }
+    return TRUE;
+}
+
+BOOL sb_pack_u64(SortBuffer* sb, uint64_t v){
+    if(!sb_reserve(sb, sizeof(v))) return FALSE;
+    memcpy(sb->data+sb->len, &v, sizeof(v));
+    sb->len += sizeof(v);
+    return TRUE;
+}
 void lowercase_ascii(char* s, size_t n){
     for(size_t i=0;i<n && s[i];++i){
         if(s[i]>='A' && s[i]<='Z') s[i] = (char)(s[i]-'A'+'a');
@@ -100,6 +149,21 @@ uint64_t hash64(const void* data, size_t len){
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+// extend an existing hash with more data
+uint64_t hash64_add(uint64_t h, const void* data, size_t len){
+    const uint8_t* p = (const uint8_t*)data;
+    for(size_t i=0;i<len;i++){
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+uint64_t hash64_sort_key(const SortBuffer* sb){
+    if(!sb || !sb->data) return 0;
+    return hash64_add(1469598103934665603ULL, sb->data, sb->len);
 }
 
 uint64_t crc64_update(uint64_t crc, const void* data, size_t len){
@@ -282,4 +346,96 @@ void normalize_filename_utf8(const char* name_utf8, char* out, size_t outcap){
         out[o++]=c;
     }
     out[o]=0;
+}
+
+typedef struct {
+    HANDLE h;
+    size_t remaining;
+    uint8_t* item;
+    BOOL loaded;
+} SortChunk;
+
+BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
+                   int (*cmp)(const void*, const void*)){
+    if(!base || !cmp || size==0) return FALSE;
+    size_t max_items = g_sort_buffer_size / size;
+    if(max_items==0) return FALSE;
+    if(n <= max_items){ qsort(base, n, size, cmp); return TRUE; }
+
+    wchar_t tmpbuf[MAX_PATH];
+    if(!tmpdir){ GetTempPathW(MAX_PATH, tmpbuf); tmpdir = tmpbuf; }
+
+    size_t offset=0, chunks_n=0;
+    SortChunk* chunks=NULL;
+    while(offset < n){
+        size_t m = n - offset; if(m > max_items) m = max_items;
+        qsort((uint8_t*)base + offset*size, m, size, cmp);
+        wchar_t file[MAX_PATH];
+        if(!GetTempFileNameW(tmpdir, L"srt", 0, file)) goto fail;
+        HANDLE h = CreateFileW(file, GENERIC_READ|GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,
+                               NULL);
+        if(h==INVALID_HANDLE_VALUE) goto fail;
+        DWORD written=0;
+        if(!WriteFile(h, (uint8_t*)base + offset*size, (DWORD)(m*size), &written, NULL) || written!=(DWORD)(m*size)){
+            CloseHandle(h); goto fail;
+        }
+        SetFilePointer(h,0,NULL,FILE_BEGIN);
+        SortChunk* tmp=(SortChunk*)realloc(chunks, (chunks_n+1)*sizeof(SortChunk));
+        if(!tmp){ CloseHandle(h); goto fail; }
+        chunks=tmp;
+        chunks[chunks_n].h=h;
+        chunks[chunks_n].remaining=m;
+        chunks[chunks_n].item=(uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        chunks[chunks_n].loaded=FALSE;
+        chunks_n++;
+        offset += m;
+    }
+
+    for(size_t i=0;i<chunks_n;i++){
+        DWORD rd=0;
+        if(chunks[i].remaining>0 && ReadFile(chunks[i].h, chunks[i].item, (DWORD)size, &rd, NULL) && rd==size){
+            chunks[i].remaining--; chunks[i].loaded=TRUE;
+        }
+    }
+
+    size_t out_idx=0;
+    while(TRUE){
+        int best=-1;
+        for(size_t i=0;i<chunks_n;i++){
+            if(chunks[i].loaded){
+                if(best==-1 || cmp(chunks[i].item, chunks[best].item)<0) best=(int)i;
+            }
+        }
+        if(best==-1) break;
+        memcpy((uint8_t*)base + out_idx*size, chunks[best].item, size);
+        out_idx++;
+        if(chunks[best].remaining>0){
+            DWORD rd=0;
+            if(ReadFile(chunks[best].h, chunks[best].item, (DWORD)size, &rd, NULL) && rd==size){
+                chunks[best].remaining--; chunks[best].loaded=TRUE;
+            } else {
+                chunks[best].loaded=FALSE;
+            }
+        } else {
+            chunks[best].loaded=FALSE;
+        }
+    }
+
+    for(size_t i=0;i<chunks_n;i++){
+        if(chunks[i].item) VirtualFree(chunks[i].item,0,MEM_RELEASE);
+        CloseHandle(chunks[i].h);
+    }
+    free(chunks);
+    return TRUE;
+fail:
+    if(chunks){
+        for(size_t i=0;i<chunks_n;i++){
+            if(chunks[i].item) VirtualFree(chunks[i].item,0,MEM_RELEASE);
+            if(chunks[i].h!=INVALID_HANDLE_VALUE) CloseHandle(chunks[i].h);
+        }
+    }
+    free(chunks);
+    return FALSE;
 }
