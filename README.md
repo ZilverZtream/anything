@@ -27,6 +27,7 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
 - Bloom filters for quick name filtering.
 - Fuzzy filename and content search using Levenshtein distance.
 - Optional Windows taskbar search integration (enable in the Settings tab to register an `anything:` URL protocol and launch searches from the taskbar).
+- Switchable dark and light themes in the graphical interface.
 - Command-line tools:
   - `anything.exe index` — build or update the database
   - `search.exe` — query the database with filters (size, date, path, extension, content, author, camera, lens, artist, album, title, regex, etc.). Add `--json` to emit results as structured JSON

@@ -852,6 +852,7 @@ int run_ui(void){
     bool show_advanced = false;
     Filters filters;
     bool taskbar_integration = taskbar_search_is_enabled();
+    int theme_idx = 0; // 0 = Dark, 1 = Light
     bool need_update = true;
     bool need_sort = true;
     Db* db = nullptr;
@@ -1072,12 +1073,15 @@ int run_ui(void){
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Settings")) {
+                const char* themes[] = { "Dark", "Light" };
+                if (ImGui::Combo("Theme", &theme_idx, themes, IM_ARRAYSIZE(themes))) {
+                    if (theme_idx == 0) ImGui::StyleColorsDark();
+                    else ImGui::StyleColorsLight();
+                }
 #ifdef _WIN32
                 if (ImGui::Checkbox("Enable Taskbar Search integration", &taskbar_integration)) {
                     set_taskbar_search(taskbar_integration);
                 }
-#else
-                ImGui::Text("No settings available");
 #endif
                 ImGui::EndTabItem();
             }
