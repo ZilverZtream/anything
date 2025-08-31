@@ -39,6 +39,8 @@ The WSL scanner reads the ext4.vhdx virtual disk directly to enumerate files and
 ## Plugin API
 Custom data source scanners can be implemented as DLLs. Place compiled plugins in a `plugins` folder next to the executable and they will be loaded at startup. The `plugin.h` header documents the API each DLL must expose.
 
+An example `ocr_plugin.c` is provided which uses Tesseract OCR to extract and index text from images and scanned PDFs.
+
 ## Build
 This project is written in **C** for Windows.
 

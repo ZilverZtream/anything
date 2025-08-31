@@ -386,7 +386,12 @@ static DWORD WINAPI DbWriterThread(void* p){
         r.access_time   = wi->access_time;
         r.attributes    = wi->attributes;
         if(r.type == DB_REC_FILE){
-            r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id, &r.title_str_id);
+            if(wi->content){
+                r.content_str_id = db_intern_wstring(ctx->db, wi->content);
+                free(wi->content);
+            } else {
+                r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id, &r.title_str_id);
+            }
             wchar_t fpath[MAX_LONG_PATH];
             _snwprintf(fpath, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
             extract_exif_metadata(ctx->db, fpath, &r);
