@@ -374,3 +374,38 @@ BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
     return TRUE;
 }
 
+BOOL CloudSync_CreateSharedIndex(SharedIndex* idx, uint64_t team_id, uint8_t permissions){
+    if(!idx) return FALSE;
+    idx->team_id = team_id;
+    idx->access_permissions = permissions;
+    for(int i=0;i<31;i++){
+        int r = rand() % 36;
+        if(r < 10) idx->shared_secret[i] = '0' + r;
+        else idx->shared_secret[i] = 'A' + (r-10);
+    }
+    idx->shared_secret[31] = '\0';
+    return TRUE;
+}
+
+BOOL CloudSync_Upload(Db* db, CloudProvider provider, const SharedIndex* idx){
+    (void)provider;
+    if(!db || !idx) return FALSE;
+#ifdef _WIN32
+    wchar_t tmp[MAX_PATH];
+    if(GetTempFileNameW(L".", L"cs", 0, tmp)==0) return FALSE;
+    BOOL ok = db_compress(db, tmp);
+    DeleteFileW(tmp);
+    return ok;
+#else
+    (void)db;
+    return TRUE;
+#endif
+}
+
+BOOL CloudSync_Download(Db* db, CloudProvider provider, const SharedIndex* idx){
+    (void)provider;
+    if(!db || !idx) return FALSE;
+    // Real implementation would download and merge the index. Stub returns success.
+    return TRUE;
+}
+
