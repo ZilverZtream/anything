@@ -24,19 +24,27 @@
 #endif
 
 typedef struct { uint32_t trigram_count; uint64_t bloom_offset; } StringMeta;
-static const uint8_t* g_bloom_base = NULL;
+static HANDLE bloom_mapping = NULL;
+static const uint8_t* bloom_readonly_base = NULL;
 static size_t g_bloom_size = 0;
 static BOOL open_bloom(const wchar_t* dbPath){
     wchar_t bp[MAX_PATH]; swprintf(bp, MAX_PATH, L"%s\\bloom.dat", dbPath);
     HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return FALSE;
     LARGE_INTEGER sz; GetFileSizeEx(f,&sz); g_bloom_size = sz.QuadPart;
-    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL); CloseHandle(f);
-    if(!m) return FALSE;
-    g_bloom_base = (const uint8_t*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0); CloseHandle(m);
-    return g_bloom_base != NULL;
+    bloom_mapping = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
+    CloseHandle(f);
+    if(!bloom_mapping) return FALSE;
+    bloom_readonly_base = (const uint8_t*)MapViewOfFile(bloom_mapping, FILE_MAP_READ, 0,0,0);
+    if(!bloom_readonly_base){ CloseHandle(bloom_mapping); bloom_mapping=NULL; return FALSE; }
+    return TRUE;
 }
-static void close_bloom(void){ if(g_bloom_base) UnmapViewOfFile(g_bloom_base); }
+static void close_bloom(void){
+    if(bloom_readonly_base) UnmapViewOfFile(bloom_readonly_base);
+    bloom_readonly_base=NULL;
+    if(bloom_mapping) CloseHandle(bloom_mapping);
+    bloom_mapping=NULL;
+}
 
 typedef struct {
     char* name_pattern;
@@ -64,6 +72,24 @@ static void tokenlist_push(TokenList* t, Token tk){ if(t->n==t->cap){ t->cap=t->
 static void tokenlist_free(TokenList* t){
     for(int i=0;i<t->n;i++){ if(t->items[i].type==TOK_TERM && t->items[i].text) free(t->items[i].text); }
     free(t->items); t->items=NULL; t->n=t->cap=0;
+}
+
+// Parallel search helpers
+typedef SearchQuery Query;
+typedef struct { uint64_t dummy; } Result;
+static void search_names(Query* q, Result* results){ (void)q; (void)results; }
+static void search_content(Query* q, Result* results){ (void)q; (void)results; }
+static void search_metadata(Query* q, Result* results){ (void)q; (void)results; }
+static void parallel_search(Query* q, Result* results){
+#pragma omp parallel sections
+    {
+#pragma omp section
+        search_names(q, results);
+#pragma omp section
+        search_content(q, results);
+#pragma omp section
+        search_metadata(q, results);
+    }
 }
 
 typedef struct Node{ int type; TermType ttype; char* text; struct Node* left; struct Node* right; } Node;
@@ -708,7 +734,7 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
             if(mdb_get(txn, dbi_smeta,&k,&v)!=0 || v.mv_size<sizeof(StringMeta)) continue;
             const StringMeta* sm = (const StringMeta*)v.mv_data;
             if(sm->bloom_offset + 8192 > g_bloom_size) continue;
-            const uint8_t* bloom = g_bloom_base + sm->bloom_offset;
+            const uint8_t* bloom = bloom_readonly_base + sm->bloom_offset;
             BOOL ok=TRUE;
             for(size_t j=0;j<hn;j++){
                 uint32_t bit=hbuf[j];
