@@ -60,6 +60,15 @@ struct Result {
     uint64_t content_str_id = 0;
 };
 
+struct DuplicateItem {
+    std::string path;
+    uint64_t size = 0;
+    uint64_t hash = 0;
+    bool selected = false;
+};
+
+static std::vector<DuplicateItem> g_duplicates;
+
 struct Date {
     int year = 2020;
     int month = 0;
@@ -788,109 +797,141 @@ int run_ui(void){
         ImGui::NewFrame();
 
         ImGui::Begin("Anything Search", nullptr, ImGuiWindowFlags_None);
-        bool query_edited = ImGui::InputText("Query", &query_str);
-        ImGui::SameLine();
-        if (ImGui::Button("Advanced")) show_advanced = !show_advanced;
-        if (query_edited) need_update = true;
+        if (ImGui::BeginTabBar("MainTabs")) {
+            if (ImGui::BeginTabItem("Search")) {
+                bool query_edited = ImGui::InputText("Query", &query_str);
+                ImGui::SameLine();
+                if (ImGui::Button("Advanced")) show_advanced = !show_advanced;
+                if (query_edited) need_update = true;
 
-        ImGui::BeginChild("ResultsAndPreview", ImVec2(0, 0), false);
-        if (ImGui::BeginTable("split", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_NoSavedSettings)) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::Text("Results:");
-            ImGui::Separator();
-            ImGui::BeginChild("ResultsList", ImVec2(0, 0), false, ImGuiWindowFlags_None);
-            ImGuiTableFlags tflags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_NoSavedSettings;
-            if (ImGui::BeginTable("ResultsTable", 6, tflags)) {
-                ImGui::TableSetupScrollFreeze(0,1);
-                ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthFixed, 60.0f);
-                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort, 0.0f, COL_NAME);
-                ImGui::TableSetupColumn("Path", 0, 0.0f, COL_PATH);
-                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_SIZE);
-                ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_MOD);
-                ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_SCORE);
-                ImGui::TableHeadersRow();
-                ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
-                if (sort_specs && (sort_specs->SpecsDirty || need_sort)) {
-                    apply_sort(filtered, sort_specs);
-                    sort_specs->SpecsDirty = false;
-                    need_sort = false;
-                }
-                for (size_t i = 0; i < filtered.size(); ++i) {
-                    Result& r = filtered[i];
+                ImGui::BeginChild("ResultsAndPreview", ImVec2(0, 0), false);
+                if (ImGui::BeginTable("split", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_NoSavedSettings)) {
                     ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(1);
-                    ImGui::PushID((int)i);
-                    bool is_selected = (selected == (int)i);
-                    if (ImGui::Selectable(r.filename.c_str(), is_selected, ImGuiSelectableFlags_SpanAllColumns)) {
-                        selected = (int)i;
-                    }
-                    bool hovered = ImGui::IsItemHovered();
-                    if ((hovered || is_selected) && r.type == "image" && r.texture == 0) {
-                        load_result_texture(r);
-                    }
-                    if (ImGui::BeginPopupContextItem()) {
-                        std::string full = r.path + "\\" + r.filename;
-                        if (ImGui::MenuItem("Open")) open_file_os(full);
-                        if (ImGui::MenuItem("Open Folder")) open_folder_os(r.path);
-                        if (ImGui::MenuItem("Copy Path")) ImGui::SetClipboardText(full.c_str());
-                        if (ImGui::MenuItem("Delete")) { delete_path_os(full); need_update = true; }
-                        ImGui::EndPopup();
-                    }
-                    ImGui::TableSetColumnIndex(0);
-                    if (r.type == "image" && r.texture != 0) {
-                        ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(48, 48));
-                    }
-                    ImGui::TableSetColumnIndex(2);
-                    ImGui::TextUnformatted(r.path.c_str());
-                    ImGui::TableSetColumnIndex(3);
-                    ImGui::Text("%lld", (long long)r.size);
-                    ImGui::TableSetColumnIndex(4);
-                    char dstr[64];
-                    std::strftime(dstr, sizeof(dstr), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
-                    ImGui::Text("%s", dstr);
-                    ImGui::TableSetColumnIndex(5);
-                    ImGui::Text("%.1f", r.score);
-                    ImGui::PopID();
-                }
-                ImGui::EndTable();
-            }
-            ImGui::EndChild();
-
-            ImGui::TableNextColumn();
-            ImGui::BeginChild("QuickViewPane", ImVec2(0, 0), false, ImGuiWindowFlags_None);
-            if (selected >= 0 && selected < static_cast<int>(filtered.size())) {
-                const Result& r = filtered[selected];
-                if (ImGui::BeginTabBar("QuickViewTabs")) {
-                    if (ImGui::BeginTabItem("Info")) {
-                        ImGui::Text("Path: %s", r.path.c_str());
-                        ImGui::Text("Size: %lld bytes", r.size);
-                        char date_str[64];
-                        std::strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
-                        ImGui::Text("Modified: %s", date_str);
-                        ImGui::EndTabItem();
-                    }
-                    if (ImGui::BeginTabItem("Preview")) {
-                        if (r.type == "text" || r.type == "pdf") {
-                            draw_highlighted(r.snippet, query_str);
-                        } else if (r.type == "image") {
-                            if (r.texture != 0) {
-                                float aspect = static_cast<float>(r.height) / static_cast<float>(r.width);
-                                float preview_width = ImGui::GetContentRegionAvail().x;
-                                ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(preview_width, preview_width * aspect));
-                            } else {
-                                ImGui::Text("No thumbnail loaded.");
-                            }
+                    ImGui::TableNextColumn();
+                    ImGui::Text("Results:");
+                    ImGui::Separator();
+                    ImGui::BeginChild("ResultsList", ImVec2(0, 0), false, ImGuiWindowFlags_None);
+                    ImGuiTableFlags tflags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_NoSavedSettings;
+                    if (ImGui::BeginTable("ResultsTable", 6, tflags)) {
+                        ImGui::TableSetupScrollFreeze(0,1);
+                        ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort, 0.0f, COL_NAME);
+                        ImGui::TableSetupColumn("Path", 0, 0.0f, COL_PATH);
+                        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_SIZE);
+                        ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_MOD);
+                        ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_SCORE);
+                        ImGui::TableHeadersRow();
+                        ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
+                        if (sort_specs && (sort_specs->SpecsDirty || need_sort)) {
+                            apply_sort(filtered, sort_specs);
+                            sort_specs->SpecsDirty = false;
+                            need_sort = false;
                         }
-                        ImGui::EndTabItem();
+                        for (size_t i = 0; i < filtered.size(); ++i) {
+                            Result& r = filtered[i];
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::PushID((int)i);
+                            bool is_selected = (selected == (int)i);
+                            if (ImGui::Selectable(r.filename.c_str(), is_selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                                selected = (int)i;
+                            }
+                            bool hovered = ImGui::IsItemHovered();
+                            if ((hovered || is_selected) && r.type == "image" && r.texture == 0) {
+                                load_result_texture(r);
+                            }
+                            if (ImGui::BeginPopupContextItem()) {
+                                std::string full = r.path + "\\" + r.filename;
+                                if (ImGui::MenuItem("Open")) open_file_os(full);
+                                if (ImGui::MenuItem("Open Folder")) open_folder_os(r.path);
+                                if (ImGui::MenuItem("Copy Path")) ImGui::SetClipboardText(full.c_str());
+                                if (ImGui::MenuItem("Delete")) { delete_path_os(full); need_update = true; }
+                                ImGui::EndPopup();
+                            }
+                            ImGui::TableSetColumnIndex(0);
+                            if (r.type == "image" && r.texture != 0) {
+                                ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(48, 48));
+                            }
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::TextUnformatted(r.path.c_str());
+                            ImGui::TableSetColumnIndex(3);
+                            ImGui::Text("%lld", (long long)r.size);
+                            ImGui::TableSetColumnIndex(4);
+                            char dstr[64];
+                            std::strftime(dstr, sizeof(dstr), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
+                            ImGui::Text("%s", dstr);
+                            ImGui::TableSetColumnIndex(5);
+                            ImGui::Text("%.1f", r.score);
+                            ImGui::PopID();
+                        }
+                        ImGui::EndTable();
                     }
-                    ImGui::EndTabBar();
+                    ImGui::EndChild();
+
+                    ImGui::TableNextColumn();
+                    ImGui::BeginChild("QuickViewPane", ImVec2(0, 0), false, ImGuiWindowFlags_None);
+                    if (selected >= 0 && selected < static_cast<int>(filtered.size())) {
+                        const Result& r = filtered[selected];
+                        if (ImGui::BeginTabBar("QuickViewTabs")) {
+                            if (ImGui::BeginTabItem("Info")) {
+                                ImGui::Text("Path: %s", r.path.c_str());
+                                ImGui::Text("Size: %lld bytes", r.size);
+                                char date_str[64];
+                                std::strftime(date_str, sizeof(date_str), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
+                                ImGui::Text("Modified: %s", date_str);
+                                ImGui::EndTabItem();
+                            }
+                            if (ImGui::BeginTabItem("Preview")) {
+                                if (r.type == "text" || r.type == "pdf") {
+                                    draw_highlighted(r.snippet, query_str);
+                                } else if (r.type == "image") {
+                                    if (r.texture != 0) {
+                                        float aspect = static_cast<float>(r.height) / static_cast<float>(r.width);
+                                        float preview_width = ImGui::GetContentRegionAvail().x;
+                                        ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(preview_width, preview_width * aspect));
+                                    } else {
+                                        ImGui::Text("No thumbnail loaded.");
+                                    }
+                                }
+                                ImGui::EndTabItem();
+                            }
+                            ImGui::EndTabBar();
+                        }
+                    }
+                    ImGui::EndChild();
+                    ImGui::EndTable();
                 }
+                ImGui::EndChild();
+                ImGui::EndTabItem();
             }
-            ImGui::EndChild();
-            ImGui::EndTable();
+            if (ImGui::BeginTabItem("Duplicates")) {
+                ImGuiTableFlags dflags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable | ImGuiTableFlags_NoSavedSettings;
+                if (ImGui::BeginTable("DupTable", 4, dflags)) {
+                    ImGui::TableSetupColumn("Path");
+                    ImGui::TableSetupColumn("Size");
+                    ImGui::TableSetupColumn("Hash");
+                    ImGui::TableSetupColumn("Diff Preview");
+                    ImGui::TableHeadersRow();
+                    for (auto& d : g_duplicates) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Selectable(d.path.c_str(), &d.selected, ImGuiSelectableFlags_SpanAllColumns);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%llu", (unsigned long long)d.size);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%016llX", (unsigned long long)d.hash);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("(preview)");
+                    }
+                    ImGui::EndTable();
+                }
+                if (ImGui::Button("Delete Selected")) {
+                    // TODO: delete selected files
+                }
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
         }
-        ImGui::EndChild();
         ImGui::End();
 
         if (show_advanced) {
