@@ -17,7 +17,7 @@ It scans drives (via NTFS USN journal or generic directory walking), stores file
   - Full content extraction for text and common document formats (TXT, source code, PDF, DOCX, etc.)
   - Optional content snippets and simple author metadata for text files
 - Archive content indexing (ZIP/RAR/7z) via libzip.
-- Pluggable scanners for cloud drives (OneDrive/Google Drive/Dropbox).
+- Pluggable scanners for cloud drives (OneDrive/Google Drive/pCloud/Dropbox).
 - Experimental WSL filesystem indexing.
 - Bloom filters for quick name filtering.
 - Command-line tools:
