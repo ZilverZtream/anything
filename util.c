@@ -297,31 +297,43 @@ float bm25_score(int tf, int doc_len, float avg_doc_len, int docs_total, int doc
 int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen){
     if(!a) return (int)blen;
     if(!b) return (int)alen;
+    if(alen > 1024 || blen > 1024){
+        return (int)(alen > blen ? alen : blen);
+    }
+
+    if(blen > alen){
+        const char* tmp = a; a = b; b = tmp;
+        size_t tmp_len = alen; alen = blen; blen = tmp_len;
+    }
+
     size_t cols = blen + 1;
     size_t buf_size = cols * sizeof(int);
     BOOL heap = buf_size > 4096;
-    int* prev = heap ? (int*)malloc(buf_size)  : (int*)_malloca(buf_size);
-    int* curr = heap ? (int*)malloc(buf_size)  : (int*)_malloca(buf_size);
-    if(!prev || !curr){
-        if(heap){ free(prev); free(curr); } else { if(prev) _freea(prev); if(curr) _freea(curr); }
+    int* col = heap ? (int*)malloc(buf_size) : (int*)_malloca(buf_size);
+    if(!col){
+        if(heap){ free(col); } else { /* _malloca failed, nothing to free */ }
         return (int)(alen>blen?alen:blen);
     }
-    for(size_t j=0;j<cols;j++) prev[j]=(int)j;
-    for(size_t i=0;i<alen;i++){
-        curr[0]=(int)(i+1);
-        for(size_t j=0;j<blen;j++){
-            int cost=(a[i]==b[j])?0:1;
-            int del=prev[j+1]+1;
-            int ins=curr[j]+1;
-            int sub=prev[j]+cost;
-            int m=del<ins?del:ins;
-            if(sub<m) m=sub;
-            curr[j+1]=m;
+
+    for(size_t j=0; j<cols; j++) col[j] = (int)j;
+    for(size_t i=0; i<alen; i++){
+        col[0] = (int)(i + 1);
+        int last_diag = (int)i;
+        for(size_t j=0; j<blen; j++){
+            int old_diag = col[j + 1];
+            int cost = (a[i] == b[j]) ? 0 : 1;
+            int del = col[j + 1] + 1;
+            int ins = col[j] + 1;
+            int sub = last_diag + cost;
+            int m = del < ins ? del : ins;
+            if(sub < m) m = sub;
+            col[j + 1] = m;
+            last_diag = old_diag;
         }
-        int* tmp=prev; prev=curr; curr=tmp;
     }
-    int dist=prev[blen];
-    if(heap){ free(prev); free(curr); } else { _freea(prev); _freea(curr); }
+
+    int dist = col[blen];
+    if(heap){ free(col); } else { _freea(col); }
     return dist;
 }
 
