@@ -210,14 +210,10 @@ static DWORD WINAPI usn_thread(void* p){
         wi->preview = NULL;
         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
         wcscpy_s(wi->name, MAX_PATH, e->name);
-        // stat for times/size/attrs
-        wchar_t full[MAX_LONG_PATH];
-        path_join(full, MAX_LONG_PATH, parent, e->name);
-        uint32_t attrs=0; uint64_t sz=0, ct=0, mt=0, at=0;
-        get_file_info_basic(full, &attrs, &sz, &ct, &mt, &at);
-        wi->attributes = attrs?attrs:e->attrs;
-        wi->file_size = sz;
-        wi->creation_time=ct; wi->modified_time=mt; wi->access_time=at;
+        wi->file_size = 0;
+        wi->creation_time = wi->modified_time = wi->access_time = 0;
+        wi->attributes = e->attrs;
+        wi->stage = 1;
         wi->op = WI_ADD;
         while(!MPMC_Push(s->outq, wi)) { SwitchToThread(); }
     }
@@ -301,6 +297,7 @@ static DWORD WINAPI tail_thread(void* p){
                         wcscpy_s(wi->name, MAX_PATH, name);
                         wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
                         wi->attributes = 0;
+                        wi->stage = 1;
                         wi->op = WI_DELETE;
                         while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }
                     }
@@ -327,6 +324,7 @@ static DWORD WINAPI tail_thread(void* p){
                         get_file_info_basic(fn, &attrs, &sz, &ct, &mt, &at);
                         wi->attributes = attrs?attrs: r->FileAttributes;
                         wi->file_size = sz; wi->creation_time=ct; wi->modified_time=mt; wi->access_time=at;
+                        wi->stage = 2;
                         wi->op = WI_ADD;
                         while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }
                     }

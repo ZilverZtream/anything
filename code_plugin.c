@@ -197,6 +197,7 @@ static void scan(void){
         wi->modified_time = ((ULARGE_INTEGER){fd.ftLastWriteTime.dwLowDateTime, fd.ftLastWriteTime.dwHighDateTime}).QuadPart;
         wi->access_time   = ((ULARGE_INTEGER){fd.ftLastAccessTime.dwLowDateTime, fd.ftLastAccessTime.dwHighDateTime}).QuadPart;
         wi->attributes = fd.dwFileAttributes;
+        wi->stage = 3;
         wi->op = WI_ADD;
         int tries = 0;
         while(!MPMC_Push(g_host.queue, wi)){
