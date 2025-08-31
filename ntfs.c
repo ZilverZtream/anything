@@ -167,6 +167,7 @@ static DWORD WINAPI usn_thread(void* p){
         wchar_t parent[MAX_LONG_PATH];
         swprintf(parent, MAX_LONG_PATH, L"%c:%s", s->volRoot[0], rel);
         DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+        wi->content = NULL;
         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
         wcscpy_s(wi->name, MAX_PATH, e->name);
         // stat for times/size/attrs
@@ -254,6 +255,7 @@ static DWORD WINAPI tail_thread(void* p){
                     if(got>0 && got<MAX_LONG_PATH){
                         if(wcsncmp(parent, L"\\?\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
                         DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                        wi->content = NULL;
                         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
                         wcscpy_s(wi->name, MAX_PATH, name);
                         wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
@@ -275,6 +277,7 @@ static DWORD WINAPI tail_thread(void* p){
                         if(wcsncmp(parent, L"\\?\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
                         wchar_t* p = wcsrchr(parent, L'\'); if(p){ *p=0; }
                         DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                        wi->content = NULL;
                         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
                         wcscpy_s(wi->name, MAX_PATH, name);
                         uint32_t attrs=0; uint64_t sz=0, ct=0, mt=0, at=0;
