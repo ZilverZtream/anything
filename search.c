@@ -10,6 +10,7 @@
 #include <inttypes.h>
 #include <ctype.h>
 #include <string.h>
+#include <stdlib.h>
 #pragma comment(lib, "shlwapi.lib")
 
 #include "database.h"
@@ -23,16 +24,26 @@
 
 typedef struct {
     char* name_pattern;
-    char* content_pattern;
-    char* author;
     uint64_t size_min, size_max;
     uint64_t date_min_day, date_max_day;
     char* path_filter;   // utf8
-    char* ext;           // utf8
     bool regex_mode;
     bool whole_word;
-    uint64_t author_str_id;
 } SearchQuery;
+
+typedef enum { TOK_TERM, TOK_AND, TOK_OR, TOK_NOT, TOK_LPAREN, TOK_RPAREN } TokType;
+typedef enum { TERM_NAME, TERM_AUTHOR, TERM_EXT, TERM_CONTENT } TermType;
+typedef struct { TokType type; TermType ttype; char* text; } Token;
+typedef struct { Token* items; int n, cap; } TokenList;
+static void tokenlist_init(TokenList* t){ t->items=NULL; t->n=t->cap=0; }
+static void tokenlist_push(TokenList* t, Token tk){ if(t->n==t->cap){ t->cap=t->cap?t->cap*2:64; t->items=(Token*)realloc(t->items,t->cap*sizeof(Token)); } t->items[t->n++]=tk; }
+static void tokenlist_free(TokenList* t){
+    for(int i=0;i<t->n;i++){ if(t->items[i].type==TOK_TERM && t->items[i].text) free(t->items[i].text); }
+    free(t->items); t->items=NULL; t->n=t->cap=0;
+}
+
+typedef struct Node{ int type; TermType ttype; char* text; struct Node* left; struct Node* right; } Node;
+static void free_node(Node* n){ if(!n)return; free_node(n->left); free_node(n->right); if(n->type==TOK_TERM && n->text) free(n->text); free(n); }
 
 static void usage(void){
     wprintf(L"search.exe --db <path> [--workers N] <terms and filters>\n");
@@ -78,74 +89,66 @@ static BOOL parse_date(const char* s, uint64_t* out_day){
     return FALSE;
 }
 
-static void parse_query(int argc, wchar_t** argv, wchar_t* dbPath, SearchQuery* q, char** text_term_out){
-    dbPath[0]=0;
-    ZeroMemory(q, sizeof(*q));
+static void add_logic_token(TokenList* toks, const char* s){
+    if(!*s) return;
+    if(_stricmp(s,"AND")==0){ tokenlist_push(toks,(Token){.type=TOK_AND}); return; }
+    if(_stricmp(s,"OR")==0){ tokenlist_push(toks,(Token){.type=TOK_OR}); return; }
+    if(_stricmp(s,"NOT")==0){ tokenlist_push(toks,(Token){.type=TOK_NOT}); return; }
+    if(_strnicmp(s,"author:",7)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_AUTHOR,.text=_strdup(s+7)}); return; }
+    if(_strnicmp(s,"ext:",4)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_EXT,.text=_strdup(s+4)}); return; }
+    if(_strnicmp(s,"content:",8)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_CONTENT,.text=_strdup(s+8)}); return; }
+    tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_NAME,.text=_strdup(s)});
+}
+
+static void parse_query(int argc, wchar_t** argv, wchar_t* dbPath, SearchQuery* q, TokenList* tokens){
+    dbPath[0]=0; ZeroMemory(q,sizeof(*q));
     q->size_min=0; q->size_max=~0ULL;
     q->date_min_day=0; q->date_max_day=~0ULL;
-    *text_term_out=NULL;
+    tokenlist_init(tokens);
     for(int i=1;i<argc;i++){
         if(wcscmp(argv[i], L"--db")==0 && i+1<argc){ wcscpy_s(dbPath, MAX_PATH, argv[++i]); continue; }
-        // convert token to utf8
         char u8[1024]; to_utf8(argv[i], u8, sizeof(u8));
         if(_strnicmp(u8,"size:",5)==0){
-            const char* s = u8+5;
+            const char* s=u8+5;
             if(s[0]=='>'||s[0]=='<'){
-                BOOL gt = (s[0]=='>'); s++;
-                uint64_t val = parse_size(s);
-                if(gt){ q->size_min = val+1; } else { q->size_max = val-1; }
+                BOOL gt=(s[0]=='>'); s++; uint64_t val=parse_size(s);
+                if(gt){ q->size_min=val+1; } else { q->size_max=val-1; }
             } else {
-                const char* dots = strstr(s,"..");
-                if(dots){
-                    char a[64]={0}, b[64]={0};
-                    strncpy(a,s,(size_t)(dots-s)); strcpy(b,dots+2);
-                    q->size_min = parse_size(a);
-                    q->size_max = parse_size(b);
-                } else {
-                    q->size_min = q->size_max = parse_size(s);
-                }
+                const char* dots=strstr(s,"..");
+                if(dots){ char a[64]={0},b[64]={0}; strncpy(a,s,(size_t)(dots-s)); strcpy(b,dots+2); q->size_min=parse_size(a); q->size_max=parse_size(b); }
+                else { q->size_min=q->size_max=parse_size(s); }
             }
         } else if(_strnicmp(u8,"dm:",3)==0){
             const char* s=u8+3;
             if(s[0]=='>'||s[0]=='<'){
-                BOOL gt = (s[0]=='>'); s++;
-                uint64_t day; if(parse_date(s,&day)){
-                    if(gt){ q->date_min_day=day+1; } else { q->date_max_day=day-1; }
-                }
+                BOOL gt=(s[0]=='>'); s++; uint64_t day; if(parse_date(s,&day)){ if(gt){ q->date_min_day=day+1; } else { q->date_max_day=day-1; } }
             } else {
-                const char* dots = strstr(s,"..");
-                if(dots){
-                    char a[64]={0}, b[64]={0};
-                    strncpy(a,s,(size_t)(dots-s)); strcpy(b,dots+2);
-                    uint64_t da,db; if(parse_date(a,&da)&&parse_date(b,&db)){ q->date_min_day=da; q->date_max_day=db; }
-                } else {
-                    uint64_t d; if(parse_date(s,&d)){ q->date_min_day=d; q->date_max_day=d; }
-                }
+                const char* dots=strstr(s,"..");
+                if(dots){ char a[64]={0},b[64]={0}; strncpy(a,s,(size_t)(dots-s)); strcpy(b,dots+2); uint64_t da,db; if(parse_date(a,&da)&&parse_date(b,&db)){ q->date_min_day=da; q->date_max_day=db; } }
+                else { uint64_t d; if(parse_date(s,&d)){ q->date_min_day=d; q->date_max_day=d; } }
             }
         } else if(_strnicmp(u8,"path:",5)==0){
-            q->path_filter = _strdup(u8+5);
-            lowercase_ascii(q->path_filter, strlen(q->path_filter));
-        } else if(_strnicmp(u8,"ext:",4)==0){
-            q->ext = _strdup(u8+4);
-            lowercase_ascii(q->ext, strlen(q->ext));
-        } else if(_strnicmp(u8,"content:",8)==0){
-            q->content_pattern = _strdup(u8+8);
-        } else if(_strnicmp(u8,"author:",7)==0){
-            q->author = _strdup(u8+7);
+            q->path_filter=_strdup(u8+5); lowercase_ascii(q->path_filter,strlen(q->path_filter));
         } else if(_strnicmp(u8,"regex:",6)==0){
-            q->regex_mode = true;
-            q->name_pattern = _strdup(u8+6);
+            q->regex_mode=true; q->name_pattern=_strdup(u8+6);
         } else if(_strnicmp(u8,"whole:",6)==0){
-            q->whole_word = (_stricmp(u8+6,"yes")==0||_stricmp(u8+6,"true")==0);
+            q->whole_word=(_stricmp(u8+6,"yes")==0||_stricmp(u8+6,"true")==0);
         } else {
-            // treat as free text (take the first non-filter token as the primary term)
-            if(!*text_term_out){
-                *text_term_out = _strdup(u8);
+            // break possible parentheses
+            char buf[1024]; int bi=0; for(size_t j=0; u8[j]; ++j){
+                if(u8[j]=='(' || u8[j]==')'){
+                    if(bi>0){ buf[bi]=0; add_logic_token(tokens, buf); bi=0; }
+                    Token t={.type=(u8[j]=='(')?TOK_LPAREN:TOK_RPAREN}; tokenlist_push(tokens,t);
+                } else {
+                    buf[bi++]=u8[j];
+                }
             }
+            if(bi>0){ buf[bi]=0; add_logic_token(tokens, buf); }
         }
     }
-    if(!q->name_pattern && *text_term_out){
-        q->name_pattern = _strdup(*text_term_out);
+    // choose first plain term for scoring
+    for(int i=0;i<tokens->n;i++){
+        if(tokens->items[i].type==TOK_TERM && tokens->items[i].ttype==TERM_NAME){ q->name_pattern=_strdup(tokens->items[i].text); break; }
     }
 }
 
@@ -283,7 +286,6 @@ static DWORD WINAPI filter_worker_thread(void* p){
         if(mdb_get(txn, dbi_strings, &nk, &nv)!=0) continue;
         char* parent = (char*)pv.mv_data;
         char* name = (char*)nv.mv_data;
-        if(a->q->ext){ char ext[32]; split_extension_utf8(name, ext, sizeof(ext)); if(_stricmp(ext, a->q->ext)!=0) continue; }
         if(a->q->path_filter){ if(strncmp(parent,a->q->path_filter,strlen(a->q->path_filter))!=0) continue; }
         if(a->q->name_pattern){
             char norm[512];
@@ -293,20 +295,6 @@ static DWORD WINAPI filter_worker_thread(void* p){
             int maxd = (int)((strlen(pat)+4)/5);
             BOOL ok = fuzzy_match(norm, pat, maxd);
             free(pat);
-            if(!ok) continue;
-        }
-        if(a->q->content_pattern){
-            if(r->content_str_id==0) continue;
-            MDB_val ck={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, cv;
-            if(mdb_get(txn, dbi_strings, &ck, &cv)!=0) continue;
-            char* content = (char*)cv.mv_data;
-            char* tmp=_strdup(content); lowercase_ascii(tmp,strlen(tmp));
-            for(size_t j=0;tmp[j];++j){ if(tmp[j]=='_'||tmp[j]=='-') tmp[j]=' '; }
-            char* pat=_strdup(a->q->content_pattern); lowercase_ascii(pat,strlen(pat));
-            for(size_t j=0;pat[j];++j){ if(pat[j]=='_'||pat[j]=='-') pat[j]=' '; }
-            int maxd = (int)((strlen(pat)+4)/5);
-            BOOL ok = fuzzy_match(tmp, pat, maxd);
-            free(tmp); free(pat);
             if(!ok) continue;
         }
         float score = calculate_relevance(r, parent, name, a->q, a->total_docs, a->docs_with_term);
@@ -378,6 +366,22 @@ static void intersect_inplace(IdVec* a, const IdVec* b){
     a->n=w;
 }
 
+static void union_inplace(IdVec* a, const IdVec* b){
+    for(size_t i=0;i<b->n;i++){ idvec_push(a, b->ids[i]); }
+}
+
+static void difference_inplace(IdVec* a, const IdVec* b){
+    size_t i=0,j=0,w=0;
+    while(i<a->n && j<b->n){
+        uint64_t x=a->ids[i], y=b->ids[j];
+        if(x==y){ i++; j++; }
+        else if(x<y){ a->ids[w++]=x; i++; }
+        else { j++; }
+    }
+    while(i<a->n){ a->ids[w++]=a->ids[i++]; }
+    a->n=w;
+}
+
 // Collect candidate name string_ids via trigram intersection
 static void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const char* term, IdVec* out){
     size_t len = strlen(term);
@@ -410,6 +414,213 @@ static void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const 
     _freea(tmp);
 }
 
+static int precedence(Token t){
+    if(t.type==TOK_NOT) return 3;
+    if(t.type==TOK_AND) return 2;
+    if(t.type==TOK_OR)  return 1;
+    return 0;
+}
+
+static Node* make_leaf(Token t){
+    Node* n=(Node*)calloc(1,sizeof(Node));
+    n->type=TOK_TERM;
+    n->ttype=t.ttype;
+    n->text=t.text?_strdup(t.text):NULL;
+    n->left=n->right=NULL;
+    return n;
+}
+
+static void apply_op(Token op, Node** stack, int* sp){
+    Node* n=(Node*)calloc(1,sizeof(Node));
+    if(op.type==TOK_NOT){
+        if(*sp<1){ free(n); return; }
+        n->type=TOK_NOT;
+        n->left=stack[--(*sp)];
+        n->right=NULL;
+    } else {
+        if(*sp<2){ free(n); return; }
+        Node* r=stack[--(*sp)];
+        Node* l=stack[--(*sp)];
+        n->type=op.type;
+        n->left=l;
+        n->right=r;
+    }
+    stack[(*sp)++]=n;
+}
+
+static Node* parse_tokens(const TokenList* toks){
+    Token opstack[256]; int os=0;
+    Node* nodestack[256]; int ns=0;
+    for(int i=0;i<toks->n;i++){
+        Token tk=toks->items[i];
+        if(tk.type==TOK_TERM){
+            nodestack[ns++]=make_leaf(tk);
+        } else if(tk.type==TOK_AND || tk.type==TOK_OR || tk.type==TOK_NOT){
+            while(os>0 && opstack[os-1].type!=TOK_LPAREN &&
+                  precedence(opstack[os-1])>=precedence(tk)){
+                apply_op(opstack[--os], nodestack, &ns);
+            }
+            opstack[os++]=tk;
+        } else if(tk.type==TOK_LPAREN){
+            opstack[os++]=tk;
+        } else if(tk.type==TOK_RPAREN){
+            while(os>0 && opstack[os-1].type!=TOK_LPAREN){
+                apply_op(opstack[--os], nodestack, &ns);
+            }
+            if(os>0 && opstack[os-1].type==TOK_LPAREN) os--;
+        }
+    }
+    while(os>0){ apply_op(opstack[--os], nodestack, &ns); }
+    if(ns!=1) return NULL;
+    return nodestack[0];
+}
+
+static void get_all_records(MDB_txn* txn, MDB_dbi dbi_date, IdVec* out){
+    MDB_cursor* cd=NULL;
+    mdb_cursor_open(txn, dbi_date, &cd);
+    MDB_val k,v; int rc=mdb_cursor_get(cd,&k,&v,MDB_FIRST);
+    while(rc==0){
+        idvec_push(out, *(uint64_t*)v.mv_data);
+        rc=mdb_cursor_get(cd,&k,&v,MDB_NEXT);
+    }
+    mdb_cursor_close(cd);
+}
+
+static void records_for_author(MDB_txn* txn, MDB_dbi dbi_author, MDB_dbi dbi_strrev, const char* author, IdVec* out){
+    MDB_val k={.mv_data=(void*)author,.mv_size=strlen(author)}, v;
+    if(mdb_get(txn, dbi_strrev,&k,&v)==0){
+        uint64_t sid=*(uint64_t*)v.mv_data;
+        MDB_cursor* ca=NULL; mdb_cursor_open(txn, dbi_author,&ca);
+        MDB_val ak={.mv_data=&sid,.mv_size=sizeof(sid)}, av;
+        if(mdb_cursor_get(ca,&ak,&av,MDB_SET_KEY)==0){
+            do{ idvec_push(out, *(uint64_t*)av.mv_data); }
+            while(mdb_cursor_get(ca,&ak,&av,MDB_NEXT_DUP)==0);
+        }
+        mdb_cursor_close(ca);
+    }
+}
+
+static void records_for_ext(MDB_txn* txn, MDB_dbi dbi_ext, const char* ext, IdVec* out){
+    char buf[32];
+    strncpy(buf, ext, 31);
+    buf[31]=0;
+    lowercase_ascii(buf, strlen(buf));
+    MDB_cursor* ce=NULL; mdb_cursor_open(txn, dbi_ext, &ce);
+    MDB_val k={.mv_data=buf,.mv_size=strlen(buf)}, v;
+    if(mdb_cursor_get(ce,&k,&v,MDB_SET_KEY)==0){
+        do{ idvec_push(out, *(uint64_t*)v.mv_data); }
+        while(mdb_cursor_get(ce,&k,&v,MDB_NEXT_DUP)==0);
+    }
+    mdb_cursor_close(ce);
+}
+
+static void records_for_content(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_content, const char* term, IdVec* out){
+    IdVec ids; idvec_init(&ids);
+    collect_trigram_candidates(txn, dbi_trigram, term, &ids);
+    sort_unique(&ids);
+    MDB_cursor* cc=NULL; mdb_cursor_open(txn, dbi_content, &cc);
+    for(size_t i=0;i<ids.n;i++){
+        MDB_val k={.mv_data=&ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
+        if(mdb_cursor_get(cc,&k,&v,MDB_SET_KEY)==0){
+            do{ idvec_push(out, *(uint64_t*)v.mv_data); }
+            while(mdb_cursor_get(cc,&k,&v,MDB_NEXT_DUP)==0);
+        }
+    }
+    mdb_cursor_close(cc);
+    idvec_free(&ids);
+}
+
+static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_dbi dbi_strings, MDB_dbi dbi_smeta, const char* term, IdVec* out){
+    IdVec name_ids; idvec_init(&name_ids);
+    collect_trigram_candidates(txn, dbi_trigram, term, &name_ids);
+    sort_unique(&name_ids);
+    if(name_ids.n>0){
+        size_t keep=0;
+        size_t tlen=strlen(term);
+        char* tl=_strdup(term); lowercase_ascii(tl,tlen);
+        uint32_t hbuf[4096]; size_t hn=0;
+        for(size_t i=0;i+3<=tlen && hn<4096;i++){
+            uint32_t h=2166136261u ^ 0xA5A5A5A5u; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
+            h=2166136261u ^ 0x3C3C3C3Cu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
+            h=2166136261u ^ 0x5A5A5A5Au; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
+            h=2166136261u ^ 0x1F1F1F1Fu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
+        }
+        for(size_t i=0;i<name_ids.n;i++){
+            MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
+            if(mdb_get(txn, dbi_smeta,&k,&v)!=0 || v.mv_size<8196) continue;
+            const uint8_t* bloom=(const uint8_t*)v.mv_data+4;
+            BOOL ok=TRUE;
+            for(size_t j=0;j<hn;j++){
+                uint32_t bit=hbuf[j];
+                if((bloom[bit>>3] & (1u<<(bit&7)))==0){ ok=FALSE; break; }
+            }
+            if(ok){ name_ids.ids[keep++]=name_ids.ids[i]; }
+        }
+        name_ids.n=keep; free(tl);
+    }
+    MDB_cursor* cix=NULL; mdb_cursor_open(txn, dbi_fname, &cix);
+    if(name_ids.n>0){
+        for(size_t i=0;i<name_ids.n;i++){
+            MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
+            if(mdb_cursor_get(cix,&k,&v,MDB_SET_KEY)==0){
+                do{ idvec_push(out, *(uint64_t*)v.mv_data); }
+                while(mdb_cursor_get(cix,&k,&v,MDB_NEXT_DUP)==0);
+            }
+        }
+    } else {
+        MDB_cursor* cs=NULL; mdb_cursor_open(txn, dbi_strings,&cs);
+        MDB_val sk,sv; int rc=mdb_cursor_get(cs,&sk,&sv,MDB_FIRST);
+        char* npat=_strdup(term); lowercase_ascii(npat,strlen(npat));
+        for(size_t j=0;npat[j];++j){ if(npat[j]=='_'||npat[j]=='-') npat[j]=' '; }
+        int maxd=(int)((strlen(npat)+4)/5);
+        while(rc==0){
+            uint64_t sid=*(uint64_t*)sk.mv_data;
+            char* name=(char*)sv.mv_data; size_t nlen=sv.mv_size;
+            char* tmp=(char*)_malloca(nlen+1); memcpy(tmp,name,nlen); tmp[nlen]=0;
+            normalize_filename_utf8(tmp,tmp,nlen+1);
+            if(fuzzy_match(tmp,npat,maxd)){
+                MDB_val k={.mv_data=&sid,.mv_size=sizeof(sid)}, v;
+                if(mdb_cursor_get(cix,&k,&v,MDB_SET_KEY)==0){
+                    do{ idvec_push(out, *(uint64_t*)v.mv_data); }
+                    while(mdb_cursor_get(cix,&k,&v,MDB_NEXT_DUP)==0);
+                }
+            }
+            _freea(tmp);
+            rc=mdb_cursor_get(cs,&sk,&sv,MDB_NEXT);
+        }
+        mdb_cursor_close(cs); free(npat);
+    }
+    mdb_cursor_close(cix);
+    idvec_free(&name_ids);
+}
+
+static void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MDB_dbi dbi_trigram, MDB_dbi dbi_smeta, MDB_dbi dbi_content, MDB_dbi dbi_author, MDB_dbi dbi_ext, MDB_dbi dbi_strrev, MDB_dbi dbi_date, IdVec* out){
+    if(!n) return;
+    if(n->type==TOK_TERM){
+        switch(n->ttype){
+            case TERM_NAME: records_for_name(txn, dbi_trigram, dbi_fname, dbi_strings, dbi_smeta, n->text, out); break;
+            case TERM_CONTENT: records_for_content(txn, dbi_trigram, dbi_content, n->text, out); break;
+            case TERM_AUTHOR: records_for_author(txn, dbi_author, dbi_strrev, n->text, out); break;
+            case TERM_EXT: records_for_ext(txn, dbi_ext, n->text, out); break;
+        }
+        sort_unique(out);
+        return;
+    }
+    if(n->type==TOK_AND || n->type==TOK_OR){
+        IdVec L; idvec_init(&L); IdVec R; idvec_init(&R);
+        eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &L);
+        eval_node(n->right, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &R);
+        sort_unique(&L); sort_unique(&R);
+        if(n->type==TOK_AND){ intersect_inplace(&L,&R); } else { union_inplace(&L,&R); sort_unique(&L); }
+        idvec_free(&R);
+        *out=L; return;
+    }
+    if(n->type==TOK_NOT){
+        IdVec B; idvec_init(&B); eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &B);
+        IdVec All; idvec_init(&All); get_all_records(txn, dbi_date, &All); sort_unique(&B); sort_unique(&All); difference_inplace(&All,&B); idvec_free(&B); *out=All; return;
+    }
+}
+
 // Main search
 int wmain(int argc, wchar_t** argv){
     // Build canonical query string (all args except --db <path>)
@@ -421,19 +632,21 @@ int wmain(int argc, wchar_t** argv){
         if(qpos + ulen + 2 < sizeof(qcanon)){ memcpy(qcanon+qpos,u8,ulen); qpos+=ulen; qcanon[qpos++]=' '; qcanon[qpos]=0; }
     }
     wchar_t dbPath[MAX_PATH];
-    SearchQuery q; char* primary=NULL;
+    SearchQuery q; TokenList tokens;
     int workers=1;
     for(int ai=1; ai<argc; ++ai){ if(wcscmp(argv[ai], L"--workers")==0 && ai+1<argc){ workers = _wtoi(argv[++ai]); if(workers<1)workers=1; if(workers>4)workers=4; } }
-    parse_query(argc, argv, dbPath, &q, &primary);
+    parse_query(argc, argv, dbPath, &q, &tokens);
     if(!dbPath[0]){ usage(); return 1; }
 
     // Try cache
     if(q.name_pattern){
         IdVec cached; idvec_init(&cached);
         if(try_load_cache(dbPath, q.name_pattern, &cached)){
-            // open env to resolve and print
+            tokenlist_free(&tokens);
+            idvec_free(&cached);
             goto do_search_with_ids;
         }
+        idvec_free(&cached);
     }
 
     // Open env and dbis
@@ -458,129 +671,14 @@ int wmain(int argc, wchar_t** argv){
        fwprintf(stderr,L"dbi_open failed\n"); mdb_txn_abort(txn); mdb_env_close(env); return 1;
     }
 
-    if(q.author){
-        wchar_t wtmp[256]; to_wide(q.author, wtmp, 256);
-        int need = WideCharToMultiByte(CP_UTF8,0,wtmp,-1,NULL,0,NULL,NULL);
-        if(need>0){
-            char* u8 = (char*)_malloca(need);
-            WideCharToMultiByte(CP_UTF8,0,wtmp,-1,u8,need,NULL,NULL);
-            MDB_val k={.mv_data=u8,.mv_size=(size_t)(need-1)}, v;
-            if(mdb_get(txn, dbi_strrev, &k, &v)==0){ q.author_str_id = *(uint64_t*)v.mv_data; }
-            _freea(u8);
-        }
-    }
 
-    // Step 1: candidate string_ids via trigram
-    IdVec name_ids; idvec_init(&name_ids);
-    IdVec content_ids; idvec_init(&content_ids);
-    if(q.name_pattern){
-        collect_trigram_candidates(txn, dbi_trigram, q.name_pattern, &name_ids);
-        sort_unique(&name_ids);
-    // Bloom filter tighten
-    if(name_ids.n>0){
-        size_t keep=0;
-        // Precompute term trigrams hash positions
-        const char* term = q.name_pattern?q.name_pattern:"";
-        size_t tlen = strlen(term);
-        char* tl=(char*)_malloca(tlen+1); memcpy(tl,term,tlen+1); lowercase_ascii(tl,tlen);
-        uint32_t hbuf[4096]; size_t hn=0;
-        for(size_t i=0;i+3<=tlen && hn<4096;i++){
-            // same seeds as DB
-            uint32_t h1 = 0; // we'll compute via util hash? reuse in-db formula here simplified
-            // replicate the database hash32_seed inline (same constants)
-            uint32_t seed1=0xA5A5A5A5u, seed2=0x3C3C3C3Cu, seed3=0x5A5A5A5Au, seed4=0x1F1F1F1Fu;
-            uint32_t h=2166136261u ^ seed1; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
-            h=2166136261u ^ seed2; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
-            h=2166136261u ^ seed3; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
-            h=2166136261u ^ seed4; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
-        }
-        for(size_t i=0;i<name_ids.n;i++){
-            MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
-            if(mdb_get(txn, dbi_smeta, &k, &v)!=0 || v.mv_size<8196){ continue; }
-            const uint8_t* bloom = (const uint8_t*)v.mv_data + 4; // skip trigram_count
-            BOOL ok=TRUE;
-            for(size_t j=0;j<hn;j++){
-                uint32_t bit = hbuf[j];
-                if( (bloom[bit>>3] & (1u << (bit&7))) == 0 ){ ok=FALSE; break; }
-            }
-            if(ok){ name_ids.ids[keep++]=name_ids.ids[i]; }
-        }
-    name_ids.n=keep;
-    _freea(tl);
-}
-    }
-    if(q.content_pattern){
-        collect_trigram_candidates(txn, dbi_trigram, q.content_pattern, &content_ids);
-        sort_unique(&content_ids);
-    }
-
-    // Step 2: expand to record ids via filename_index
     IdVec rec_ids; idvec_init(&rec_ids);
-    MDB_cursor* cix=NULL; mdb_cursor_open(txn, dbi_fname_index, &cix);
-    if(name_ids.n>0){
-        for(size_t i=0;i<name_ids.n;i++){
-            MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
-            if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY)==0){
-                do{ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP)==0);
-            }
-        }
-    } else if(q.name_pattern){
-        // No trigram narrowing (too short): fallback to full scan of strings to find matching names, then map via filename_index
-        MDB_cursor* cs=NULL; mdb_cursor_open(txn, dbi_strings, &cs);
-        MDB_val sk, sv; int rc = mdb_cursor_get(cs, &sk, &sv, MDB_FIRST);
-        char* npat = _strdup(q.name_pattern); lowercase_ascii(npat, strlen(npat));
-        for(size_t j=0;npat[j];++j){ if(npat[j]=='_'||npat[j]=='-') npat[j]=' '; }
-        int maxd = (int)((strlen(npat)+4)/5);
-        while(rc==0){
-            uint64_t sid = *(uint64_t*)sk.mv_data;
-            char* name = (char*)sv.mv_data; size_t nlen = sv.mv_size;
-            char* tmp = (char*)_malloca(nlen+1); memcpy(tmp,name,nlen); tmp[nlen]=0;
-            normalize_filename_utf8(tmp,tmp,nlen+1);
-            if(fuzzy_match(tmp, npat, maxd)){
-                MDB_val k={.mv_data=&sid,.mv_size=sizeof(sid)}, v;
-                if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY)==0){
-                    do{ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP)==0);
-                }
-            }
-            _freea(tmp);
-            rc = mdb_cursor_get(cs, &sk, &sv, MDB_NEXT);
-        }
-        mdb_cursor_close(cs);
-        free(npat);
+    Node* root = parse_tokens(&tokens);
+    if(root){
+        eval_node(root, txn, dbi_strings, dbi_fname_index, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &rec_ids);
+        free_node(root);
     } else {
-        // No name term: user may only filter by size/date/ext/path; start from all records by iterating size_index or date_index; choose smaller range
-        // We'll just iterate date_index today
-        MDB_cursor* cd=NULL; mdb_cursor_open(txn, dbi_date, &cd);
-        MDB_val k,v; int rc = mdb_cursor_get(cd, &k, &v, MDB_FIRST);
-        while(rc==0){ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); rc = mdb_cursor_get(cd, &k, &v, MDB_NEXT); }
-        mdb_cursor_close(cd);
-    }
-    mdb_cursor_close(cix);
-    if(q.content_pattern){
-        IdVec crec; idvec_init(&crec);
-        MDB_cursor* cc=NULL; mdb_cursor_open(txn, dbi_content, &cc);
-        for(size_t i=0;i<content_ids.n;i++){
-            MDB_val k={.mv_data=&content_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
-            if(mdb_cursor_get(cc,&k,&v,MDB_SET_KEY)==0){
-                do{ idvec_push(&crec, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cc,&k,&v,MDB_NEXT_DUP)==0);
-            }
-        }
-        mdb_cursor_close(cc);
-        sort_unique(&crec);
-        if(rec_ids.n>0){ intersect_inplace(&rec_ids, &crec); idvec_free(&crec); }
-        else { rec_ids = crec; }
-    }
-    if(q.author_str_id){
-        IdVec arec; idvec_init(&arec);
-        MDB_cursor* ca=NULL; mdb_cursor_open(txn, dbi_author, &ca);
-        MDB_val k={.mv_data=&q.author_str_id,.mv_size=sizeof(uint64_t)}, v;
-        if(mdb_cursor_get(ca,&k,&v,MDB_SET_KEY)==0){
-            do{ idvec_push(&arec, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(ca,&k,&v,MDB_NEXT_DUP)==0);
-        }
-        mdb_cursor_close(ca);
-        sort_unique(&arec);
-        if(rec_ids.n>0){ intersect_inplace(&rec_ids, &arec); idvec_free(&arec); }
-        else { rec_ids = arec; }
+        get_all_records(txn, dbi_date, &rec_ids);
     }
     sort_unique(&rec_ids);
 
@@ -636,15 +734,10 @@ int wmain(int argc, wchar_t** argv){
     mdb_txn_abort(txn); mdb_env_close(env);
 
     // cleanup
-    if(primary) free(primary);
     if(q.name_pattern) free(q.name_pattern);
     if(q.path_filter) free(q.path_filter);
-    if(q.ext) free(q.ext);
-    if(q.content_pattern) free(q.content_pattern);
-    if(q.author) free(q.author);
-    idvec_free(&name_ids);
-    idvec_free(&content_ids);
     idvec_free(&rec_ids);
+    tokenlist_free(&tokens);
     return 0;
 
 do_search_with_ids: ;
