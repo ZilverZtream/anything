@@ -25,7 +25,7 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
 - Fuzzy filename and content search using Levenshtein distance.
 - Command-line tools:
   - `anything.exe index` — build or update the database
-  - `search.exe` — query the database with filters (size, date, path, extension, content, author, regex, etc.)
+  - `search.exe` — query the database with filters (size, date, path, extension, content, author, regex, etc.). Add `--json` to emit results as structured JSON
 
 ## Archive Content Indexing
 Anything can open common archives and index contained filenames so a search result can point directly to a file inside a ZIP, RAR, or 7z archive.
