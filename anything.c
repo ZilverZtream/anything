@@ -19,6 +19,7 @@
 #include "database.h"
 #include "util.h"
 #include "lmdb.h"
+#include "archive.h"
 
 // ---- MPMC queue implementation ----
 typedef enum { CONTENT_NONE, CONTENT_TEXT, CONTENT_IFILTER } ContentMode;
@@ -42,6 +43,13 @@ static ContentMode get_content_mode(const wchar_t* name){
         return CONTENT_IFILTER;
 
     return CONTENT_NONE;
+}
+
+static BOOL is_archive_file(const wchar_t* name){
+    const wchar_t* ext = wcsrchr(name, L'.');
+    if(!ext) return FALSE;
+    ext++;
+    return _wcsicmp(ext, L"zip")==0 || _wcsicmp(ext,L"rar")==0 || _wcsicmp(ext,L"7z")==0;
 }
 
 #define MAX_INDEXED_CONTENT (1024*1024) // 1MB
@@ -246,6 +254,11 @@ static DWORD WINAPI DbWriterThread(void* p){
         r.attributes    = wi->attributes;
         if(r.type == DB_REC_FILE){
             r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id);
+            if(is_archive_file(wi->name)){
+                wchar_t apath[MAX_LONG_PATH];
+                _snwprintf(apath, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
+                index_archive(ctx->db, apath);
+            }
         }
         _aligned_free(wi);
 
