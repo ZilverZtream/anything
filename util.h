@@ -24,6 +24,10 @@ uint64_t hash64(const void* data, size_t len);
 void compute_drive_signature(const wchar_t* drive, uint8_t sig[32]);
 float bm25_score(int tf, int doc_len, float avg_doc_len, int docs_total, int docs_with_term);
 
+int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen);
+BOOL fuzzy_match(const char* text, const char* pattern, int max_dist);
+void normalize_filename_utf8(const char* name_utf8, char* out, size_t outcap);
+
 // SIMD search
 BOOL is_avx2_supported(void);
 BOOL avx2_contains(const char* haystack, size_t hlen, const char* needle, size_t nlen);

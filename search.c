@@ -9,6 +9,7 @@
 #include <shlwapi.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <string.h>
 #pragma comment(lib, "shlwapi.lib")
 
 #include "database.h"
@@ -284,9 +285,14 @@ static DWORD WINAPI filter_worker_thread(void* p){
         char* name = (char*)nv.mv_data;
         if(a->q->ext){ char ext[32]; split_extension_utf8(name, ext, sizeof(ext)); if(_stricmp(ext, a->q->ext)!=0) continue; }
         if(a->q->path_filter){ if(strncmp(parent,a->q->path_filter,strlen(a->q->path_filter))!=0) continue; }
-        if(a->q->name_pattern){ char* tmp=_strdup(name); lowercase_ascii(tmp,strlen(tmp)); char* pat=_strdup(a->q->name_pattern);
-            BOOL ok = (is_avx2_supported() ? avx2_contains(tmp, strlen(tmp), pat, strlen(pat)) : (StrStrIA(tmp, pat)!=NULL));
-            free(tmp); free(pat);
+        if(a->q->name_pattern){
+            char norm[512];
+            normalize_filename_utf8(name, norm, sizeof(norm));
+            char* pat=_strdup(a->q->name_pattern); lowercase_ascii(pat,strlen(pat));
+            for(size_t j=0;pat[j];++j){ if(pat[j]=='_'||pat[j]=='-') pat[j]=' '; }
+            int maxd = (int)((strlen(pat)+4)/5);
+            BOOL ok = fuzzy_match(norm, pat, maxd);
+            free(pat);
             if(!ok) continue;
         }
         if(a->q->content_pattern){
@@ -294,8 +300,12 @@ static DWORD WINAPI filter_worker_thread(void* p){
             MDB_val ck={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, cv;
             if(mdb_get(txn, dbi_strings, &ck, &cv)!=0) continue;
             char* content = (char*)cv.mv_data;
-            char* tmp=_strdup(content); lowercase_ascii(tmp,strlen(tmp)); char* pat=_strdup(a->q->content_pattern);
-            BOOL ok = StrStrIA(tmp, pat)!=NULL;
+            char* tmp=_strdup(content); lowercase_ascii(tmp,strlen(tmp));
+            for(size_t j=0;tmp[j];++j){ if(tmp[j]=='_'||tmp[j]=='-') tmp[j]=' '; }
+            char* pat=_strdup(a->q->content_pattern); lowercase_ascii(pat,strlen(pat));
+            for(size_t j=0;pat[j];++j){ if(pat[j]=='_'||pat[j]=='-') pat[j]=' '; }
+            int maxd = (int)((strlen(pat)+4)/5);
+            BOOL ok = fuzzy_match(tmp, pat, maxd);
             free(tmp); free(pat);
             if(!ok) continue;
         }
@@ -519,11 +529,14 @@ int wmain(int argc, wchar_t** argv){
         MDB_cursor* cs=NULL; mdb_cursor_open(txn, dbi_strings, &cs);
         MDB_val sk, sv; int rc = mdb_cursor_get(cs, &sk, &sv, MDB_FIRST);
         char* npat = _strdup(q.name_pattern); lowercase_ascii(npat, strlen(npat));
+        for(size_t j=0;npat[j];++j){ if(npat[j]=='_'||npat[j]=='-') npat[j]=' '; }
+        int maxd = (int)((strlen(npat)+4)/5);
         while(rc==0){
             uint64_t sid = *(uint64_t*)sk.mv_data;
             char* name = (char*)sv.mv_data; size_t nlen = sv.mv_size;
-            char* tmp = (char*)_malloca(nlen+1); memcpy(tmp,name,nlen); tmp[nlen]=0; lowercase_ascii(tmp,nlen);
-            if(strstr(tmp, npat)){
+            char* tmp = (char*)_malloca(nlen+1); memcpy(tmp,name,nlen); tmp[nlen]=0;
+            normalize_filename_utf8(tmp,tmp,nlen+1);
+            if(fuzzy_match(tmp, npat, maxd)){
                 MDB_val k={.mv_data=&sid,.mv_size=sizeof(sid)}, v;
                 if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY)==0){
                     do{ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP)==0);
