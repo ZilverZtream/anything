@@ -3,6 +3,7 @@
 #include <shlwapi.h>
 #include <string.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <immintrin.h>
 #include <stdio.h>
 #include <math.h>
@@ -296,10 +297,16 @@ float bm25_score(int tf, int doc_len, float avg_doc_len, int docs_total, int doc
 int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen){
     if(!a) return (int)blen;
     if(!b) return (int)alen;
-    int* prev=(int*)malloc((blen+1)*sizeof(int));
-    int* curr=(int*)malloc((blen+1)*sizeof(int));
-    if(!prev || !curr){ free(prev); free(curr); return (int)(alen>blen?alen:blen); }
-    for(size_t j=0;j<=blen;j++) prev[j]=(int)j;
+    size_t cols = blen + 1;
+    size_t buf_size = cols * sizeof(int);
+    BOOL heap = buf_size > 4096;
+    int* prev = heap ? (int*)malloc(buf_size)  : (int*)_malloca(buf_size);
+    int* curr = heap ? (int*)malloc(buf_size)  : (int*)_malloca(buf_size);
+    if(!prev || !curr){
+        if(heap){ free(prev); free(curr); } else { if(prev) _freea(prev); if(curr) _freea(curr); }
+        return (int)(alen>blen?alen:blen);
+    }
+    for(size_t j=0;j<cols;j++) prev[j]=(int)j;
     for(size_t i=0;i<alen;i++){
         curr[0]=(int)(i+1);
         for(size_t j=0;j<blen;j++){
@@ -314,22 +321,25 @@ int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen)
         int* tmp=prev; prev=curr; curr=tmp;
     }
     int dist=prev[blen];
-    free(prev); free(curr);
+    if(heap){ free(prev); free(curr); } else { _freea(prev); _freea(curr); }
     return dist;
 }
 
 BOOL fuzzy_match(const char* text, const char* pattern, int max_dist){
-    if(!text || !pattern) return FALSE;
-    size_t n=strlen(text), m=strlen(pattern);
-    if(m==0) return TRUE;
-    if(n<=m){
+    if(!text || !pattern || max_dist < 0) return FALSE;
+    size_t n = strlen(text), m = strlen(pattern);
+    if(m == 0) return TRUE;
+    if(n > 1024 || m > 1024) return FALSE;
+    if(n <= m){
+        if((int)(m - n) > max_dist) return FALSE;
         return levenshtein_distance(text, n, pattern, m) <= max_dist;
     }
-    for(size_t i=0;i<=n-m;i++){
-        size_t win=m + (size_t)max_dist;
-        if(i+win>n) win=n-i;
-        int d=levenshtein_distance(text+i, win, pattern, m);
-        if(d<=max_dist) return TRUE;
+    for(size_t i = 0; i <= n - m; i++){
+        size_t win = m + (size_t)max_dist;
+        if(i + win > n) win = n - i;
+        int d = levenshtein_distance(text + i, win, pattern, m);
+        if(d <= max_dist) return TRUE;
+        if(i > 0 && abs((int)(text[i] - pattern[0])) > max_dist) i += m / 2;
     }
     return FALSE;
 }
