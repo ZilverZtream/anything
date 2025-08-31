@@ -1,5 +1,6 @@
 #ifdef __APPLE__
 #include "scanner.h"
+#include "apfs.h"
 #include <CoreServices/CoreServices.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -7,6 +8,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <sched.h>
 #include <ftw.h>
 
@@ -57,6 +59,13 @@ static void emit(FileScanner* s, const char* path){
     wi->modified_time = st.st_mtime;
     wi->access_time = st.st_atime;
     wi->attributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : 0;
+    uint64_t cid;
+    if(apfs_cloneid(path, &cid)){
+        wi->clone_id = cid;
+        wi->attributes |= FILE_ATTRIBUTE_CLONE;
+    } else {
+        wi->clone_id = 0;
+    }
     wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)) sched_yield();
@@ -66,6 +75,13 @@ static int enum_cb(const char* fpath, const struct stat* sb, int typeflag, struc
     (void)sb; (void)typeflag; (void)ftwbuf;
     emit(g_current, fpath);
     return 0;
+}
+
+static void snapshot_cb(const char* name, void* ctx){
+    FileScanner* s = (FileScanner*)ctx;
+    char snap_path[PATH_MAX];
+    snprintf(snap_path, sizeof(snap_path), "%s/.snapshots/%s", s->root, name);
+    nftw(snap_path, enum_cb, 16, FTW_PHYS);
 }
 
 static void fsevent_cb(ConstFSEventStreamRef streamRef,
@@ -95,6 +111,7 @@ static void fsevent_cb(ConstFSEventStreamRef streamRef,
             }
             wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
             wi->attributes = 0;
+            wi->clone_id = 0;
             wi->stage = INDEX_NAMES_ONLY;
             wi->op = WI_DELETE;
             while(!MPMC_Push(s->outq, wi)) sched_yield();
@@ -108,6 +125,7 @@ static void* enum_thread(void* arg){
     FileScanner* s = (FileScanner*)arg;
     g_current = s;
     nftw(s->root, enum_cb, 16, FTW_PHYS);
+    apfs_list_snapshots(s->root, snapshot_cb, s);
     return NULL;
 }
 

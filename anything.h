@@ -34,6 +34,9 @@ typedef int64_t LONG64;
 #define MAX_THREADS 64
 #endif
 
+#define FILE_ATTRIBUTE_SNAPSHOT 0x20000000u
+#define FILE_ATTRIBUTE_CLONE    0x40000000u
+
 typedef enum {
     DB_REC_FILE = 1,
     DB_REC_DIR  = 2
@@ -89,6 +92,7 @@ typedef struct DbWorkItem {
     uint8_t  op; // 0 = add/update, 1 = delete
     wchar_t* content; // optional extracted text
     wchar_t* preview; // optional preview text or thumbnail path
+    uint64_t clone_id; // APFS clone identifier (0 if not clone)
 } DbWorkItem;
 
 #define WI_ADD    0
