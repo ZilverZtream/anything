@@ -37,6 +37,7 @@ static void emit(FileScanner* s, const char* parent, const char* name, const str
     wi->modified_time = st->st_mtime;
     wi->access_time = st->st_atime;
     wi->attributes = S_ISDIR(st->st_mode) ? FILE_ATTRIBUTE_DIRECTORY : 0;
+    wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)) sched_yield();
 }
 
@@ -60,6 +61,17 @@ static int enum_cb(const char* fpath, const struct stat* sb, int typeflag, struc
 
 static void process_event(FileScanner* s, struct inotify_event* ev){
     if(ev->len == 0) return;
+    if(ev->mask & (IN_DELETE|IN_MOVED_FROM)){
+        DbWorkItem* wi;
+        if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
+        mbstowcs(wi->parent_path, s->root, MAX_LONG_PATH);
+        mbstowcs(wi->name, ev->name, MAX_PATH);
+        wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
+        wi->attributes = 0;
+        wi->op = WI_DELETE;
+        while(!MPMC_Push(s->outq, wi)) sched_yield();
+        return;
+    }
     char full[PATH_MAX];
     snprintf(full, PATH_MAX, "%s/%s", s->root, ev->name);
     struct stat st;

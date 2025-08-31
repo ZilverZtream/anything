@@ -314,6 +314,26 @@ static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     _freea(tmp);
 }
 
+static void remove_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
+    size_t len = strlen(name_u8);
+    if(len < 3) return;
+    char* tmp = (char*)_malloca(len+1);
+    memcpy(tmp, name_u8, len+1);
+    lowercase_ascii(tmp, len);
+    uint32_t seen[256]; UINT seen_n=0;
+    for(size_t i=0;i+3<=len;i++){
+        uint32_t key = ((uint8_t)tmp[i]<<16)|((uint8_t)tmp[i+1]<<8)|((uint8_t)tmp[i+2]);
+        BOOL dup=FALSE;
+        for(UINT j=0;j<seen_n;j++){ if(seen[j]==key){ dup=TRUE; break; } }
+        if(dup) continue;
+        if(seen_n<256) seen[seen_n++]=key;
+        MDB_val k={.mv_data=&key,.mv_size=3}, v={.mv_data=&name_id,.mv_size=sizeof(name_id)};
+        int rc = mdb_del(d->wtxn, d->dbi_trigram_index, &k, &v);
+        if(rc && rc!=MDB_NOTFOUND){ set_last_err(d, rc); }
+    }
+    _freea(tmp);
+}
+
 
 
 BOOL db_get_index_state(Db* db_, IndexState* out){
@@ -436,4 +456,80 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
     rc = mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
     set_last_err(d, rc);
     return rc==0;
+}
+
+static BOOL db_delete_record(DbImpl* d, uint64_t id, const DbRecord* r){
+    MDB_val k;
+    to_mdb_val(&id, sizeof(id), &k);
+    mdb_del(d->wtxn, d->dbi_records, &k, NULL);
+
+    MDB_val ik,iv; to_mdb_val(&r->name_str_id, sizeof(r->name_str_id), &ik); to_mdb_val(&id, sizeof(id), &iv);
+    mdb_del(d->wtxn, d->dbi_fname_index, &ik, &iv);
+
+    MDB_val pk,pv; to_mdb_val(&r->parent_str_id, sizeof(r->parent_str_id), &pk); to_mdb_val(&id, sizeof(id), &pv);
+    mdb_del(d->wtxn, d->dbi_parent_index, &pk, &pv);
+    mdb_del(d->wtxn, d->dbi_path_hierarchy, &pk, &pv);
+
+    if(r->type == DB_REC_FILE){
+        MDB_val sk,sv; to_mdb_val(&r->file_size, sizeof(r->file_size), &sk); to_mdb_val(&id, sizeof(id), &sv);
+        mdb_del(d->wtxn, d->dbi_size_index, &sk, &sv);
+    }
+
+    uint64_t day = filetime_days(r->modified_time);
+    MDB_val dk,dv; to_mdb_val(&day, sizeof(day), &dk); to_mdb_val(&id, sizeof(id), &dv);
+    mdb_del(d->wtxn, d->dbi_date_index, &dk, &dv);
+
+    MDB_val namev;
+    if(str_by_id(d, d->wtxn, r->name_str_id, &namev)){
+        char ext[32]; split_extension_utf8((const char*)namev.mv_data, ext, sizeof(ext));
+        if(ext[0]){
+            MDB_val ek={.mv_data=ext,.mv_size=strlen(ext)}, ev={.mv_data=&id,.mv_size=sizeof(id)};
+            mdb_del(d->wtxn, d->dbi_extension_index, &ek, &ev);
+        }
+        remove_trigrams(d, (const char*)namev.mv_data, r->name_str_id);
+    }
+
+    if(r->content_str_id){
+        MDB_val ck,cv; to_mdb_val(&r->content_str_id, sizeof(r->content_str_id), &ck); to_mdb_val(&id, sizeof(id), &cv);
+        mdb_del(d->wtxn, d->dbi_content_index, &ck, &cv);
+        MDB_val cvstr;
+        if(str_by_id(d, d->wtxn, r->content_str_id, &cvstr)){
+            remove_trigrams(d, (const char*)cvstr.mv_data, r->content_str_id);
+        }
+    }
+
+    if(r->author_str_id){ MDB_val ak,av; to_mdb_val(&r->author_str_id, sizeof(r->author_str_id), &ak); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_author_index, &ak, &av); }
+    if(r->camera_str_id){ MDB_val ck,av; to_mdb_val(&r->camera_str_id, sizeof(r->camera_str_id), &ck); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_camera_index, &ck, &av); }
+    if(r->lens_str_id){ MDB_val lk,av; to_mdb_val(&r->lens_str_id, sizeof(r->lens_str_id), &lk); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_lens_index, &lk, &av); }
+    if(r->artist_str_id){ MDB_val ark,av; to_mdb_val(&r->artist_str_id, sizeof(r->artist_str_id), &ark); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_artist_index, &ark, &av); }
+    if(r->album_str_id){ MDB_val abk,av; to_mdb_val(&r->album_str_id, sizeof(r->album_str_id), &abk); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_album_index, &abk, &av); }
+    if(r->title_str_id){ MDB_val tk,av; to_mdb_val(&r->title_str_id, sizeof(r->title_str_id), &tk); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_title_index, &tk, &av); }
+    return TRUE;
+}
+
+BOOL db_delete_path(Db* db_, const wchar_t* parent, const wchar_t* name){
+    DbImpl* d = (DbImpl*)db_;
+    if(!d->wtxn){ if(!db_begin_write(db_)) return FALSE; }
+    uint64_t parent_id = db_intern_wstring(db_, parent);
+    uint64_t name_id   = db_intern_wstring(db_, name);
+    if(!parent_id || !name_id) return TRUE;
+    MDB_cursor* cur;
+    MDB_val key={.mv_data=&name_id,.mv_size=sizeof(name_id)}, val;
+    int rc = mdb_cursor_open(d->wtxn, d->dbi_fname_index, &cur);
+    if(rc){ set_last_err(d, rc); return FALSE; }
+    rc = mdb_cursor_get(cur, &key, &val, MDB_SET);
+    while(rc==0){
+        uint64_t id = *(uint64_t*)val.mv_data;
+        MDB_val rk,rv; to_mdb_val(&id,sizeof(id),&rk);
+        if(mdb_get(d->wtxn, d->dbi_records, &rk, &rv)==0){
+            DbRecord r; memcpy(&r, rv.mv_data, sizeof(r));
+            if(r.parent_str_id == parent_id){
+                db_delete_record(d, id, &r);
+                break;
+            }
+        }
+        rc = mdb_cursor_get(cur, &key, &val, MDB_NEXT_DUP);
+    }
+    mdb_cursor_close(cur);
+    return TRUE;
 }

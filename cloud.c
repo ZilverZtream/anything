@@ -132,6 +132,7 @@ static void enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_u
     wi->modified_time = mtime;
     wi->access_time = mtime;
     wi->attributes = is_dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
+    wi->op = WI_ADD;
     while(!MPMC_Push(q, wi)) { SwitchToThread(); }
 }
 

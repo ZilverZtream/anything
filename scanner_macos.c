@@ -45,6 +45,7 @@ static void emit(FileScanner* s, const char* path){
     wi->modified_time = st.st_mtime;
     wi->access_time = st.st_atime;
     wi->attributes = S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : 0;
+    wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)) sched_yield();
 }
 
@@ -64,7 +65,26 @@ static void fsevent_cb(ConstFSEventStreamRef streamRef,
     FileScanner* s = (FileScanner*)clientCallBackInfo;
     char** paths = (char**)eventPaths;
     for(size_t i=0;i<numEvents;i++){
-        emit(s, paths[i]);
+        if(eventFlags[i] & (kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemRenamed)){
+            DbWorkItem* wi;
+            if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) continue;
+            const char* p = strrchr(paths[i], '/');
+            if(p){
+                char parent[PATH_MAX]; size_t len = p - paths[i];
+                strncpy(parent, paths[i], len); parent[len]=0;
+                mbstowcs(wi->parent_path, parent, MAX_LONG_PATH);
+                mbstowcs(wi->name, p+1, MAX_PATH);
+            } else {
+                mbstowcs(wi->parent_path, "", MAX_LONG_PATH);
+                mbstowcs(wi->name, paths[i], MAX_PATH);
+            }
+            wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
+            wi->attributes = 0;
+            wi->op = WI_DELETE;
+            while(!MPMC_Push(s->outq, wi)) sched_yield();
+        } else {
+            emit(s, paths[i]);
+        }
     }
 }
 
