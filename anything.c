@@ -599,6 +599,10 @@ static DWORD WINAPI DbWriterThread(void* p){
         r.modified_time = wi->modified_time;
         r.access_time   = wi->access_time;
         r.attributes    = wi->attributes;
+        if(wi->preview){
+            r.preview_str_id = db_intern_wstring(ctx->db, wi->preview);
+            free(wi->preview);
+        }
         if(r.type == DB_REC_FILE){
             if(wi->content){
                 r.content_str_id = db_intern_wstring(ctx->db, wi->content);

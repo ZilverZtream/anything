@@ -58,6 +58,7 @@ typedef struct DbRecord {
     uint64_t  artist_str_id;
     uint64_t  album_str_id;
     uint64_t  title_str_id;
+    uint64_t  preview_str_id;
 } DbRecord;
 
 typedef struct DbHeader {
@@ -78,6 +79,7 @@ typedef struct DbWorkItem {
     uint32_t attributes;
     uint8_t  op; // 0 = add/update, 1 = delete
     wchar_t* content; // optional extracted text
+    wchar_t* preview; // optional preview text or thumbnail path
 } DbWorkItem;
 
 #define WI_ADD    0

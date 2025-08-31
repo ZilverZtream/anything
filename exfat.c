@@ -27,6 +27,7 @@ static void emit(MPMCQueue* q, const wchar_t* parent, const WIN32_FIND_DATAW* f)
     if(wcscmp(f->cFileName, L".")==0 || wcscmp(f->cFileName, L"..")==0) return;
     DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
     wi->content = NULL;
+    wi->preview = NULL;
     wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
     wcscpy_s(wi->name, MAX_PATH, f->cFileName);
     wi->attributes = f->dwFileAttributes;

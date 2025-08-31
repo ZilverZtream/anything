@@ -188,6 +188,7 @@ static void scan(void){
         DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
         if(!wi){ free(content); continue; }
         wi->content = content;
+        wi->preview = NULL;
         wcscpy_s(wi->parent_path, MAX_LONG_PATH, root);
         wcscpy_s(wi->name, MAX_PATH, fd.cFileName);
         ULARGE_INTEGER s; s.LowPart = fd.nFileSizeLow; s.HighPart = fd.nFileSizeHigh; wi->file_size = s.QuadPart;

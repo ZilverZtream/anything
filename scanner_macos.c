@@ -39,6 +39,7 @@ static void emit(FileScanner* s, const char* path){
     DbWorkItem* wi;
     if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
     wi->content = NULL;
+    wi->preview = NULL;
     mbstowcs(wi->parent_path, parent, MAX_LONG_PATH);
     mbstowcs(wi->name, name, MAX_PATH);
     wi->file_size = st.st_size;
@@ -70,6 +71,7 @@ static void fsevent_cb(ConstFSEventStreamRef streamRef,
             DbWorkItem* wi;
             if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) continue;
             wi->content = NULL;
+            wi->preview = NULL;
             const char* p = strrchr(paths[i], '/');
             if(p){
                 char parent[PATH_MAX]; size_t len = p - paths[i];

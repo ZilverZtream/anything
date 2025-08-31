@@ -37,6 +37,7 @@ static void emit(FileScanner* s, const char* parent, const char* name, const str
     DbWorkItem* wi;
     if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
     wi->content = NULL;
+    wi->preview = NULL;
     mbstowcs(wi->parent_path, parent, MAX_LONG_PATH);
     mbstowcs(wi->name, name, MAX_PATH);
     wi->file_size = st->st_size;
@@ -72,6 +73,7 @@ static void process_event(FileScanner* s, struct inotify_event* ev){
         DbWorkItem* wi;
         if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
         wi->content = NULL;
+        wi->preview = NULL;
         mbstowcs(wi->parent_path, s->root, MAX_LONG_PATH);
         mbstowcs(wi->name, ev->name, MAX_PATH);
         wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
