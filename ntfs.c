@@ -14,10 +14,17 @@
 
 // Minimal FRN map (open addressing)
 
+typedef struct NameArena {
+    wchar_t* base;
+    size_t used;
+    size_t cap;
+    struct NameArena* next;
+} NameArena;
+
 typedef struct FrnEntry {
     uint64_t frn;
     uint64_t parent;
-    wchar_t* name; // allocated
+    wchar_t* name; // from arena
     uint32_t attrs;
 } FrnEntry;
 
@@ -25,6 +32,7 @@ typedef struct FrnMap {
     FrnEntry* slots;
     size_t cap;
     size_t count;
+    NameArena* arena;
 } FrnMap;
 
 static uint64_t frn_hash(uint64_t x){
@@ -35,11 +43,21 @@ static void frnmap_init(FrnMap* m, size_t cap){
     m->cap = 1; while(m->cap < cap*2) m->cap <<= 1;
     m->slots = (FrnEntry*)calloc(m->cap, sizeof(FrnEntry));
     m->count = 0;
+    m->arena = NULL;
 }
 static void frnmap_free(FrnMap* m){
-    if(!m->slots) return;
-    for(size_t i=0;i<m->cap;i++){ if(m->slots[i].frn) free(m->slots[i].name); }
-    free(m->slots); m->slots=NULL; m->cap=m->count=0;
+    if(m->slots) free(m->slots);
+    NameArena* a = m->arena;
+    while(a){
+        NameArena* next = a->next;
+        free(a->base);
+        free(a);
+        a = next;
+    }
+    m->slots = NULL;
+    m->cap = 0;
+    m->count = 0;
+    m->arena = NULL;
 }
 static void frnmap_rehash_into(FrnMap* dst, const FrnMap* src){
     for(size_t i=0;i<src->cap;i++){
@@ -50,6 +68,23 @@ static void frnmap_rehash_into(FrnMap* dst, const FrnMap* src){
         dst->slots[j] = e;
     }
 }
+static wchar_t* arena_alloc(NameArena** arena, size_t n){
+    if(!*arena || (*arena)->used + n > (*arena)->cap){
+        size_t cap = n > 4096 ? n : 4096;
+        NameArena* a = (NameArena*)malloc(sizeof(NameArena));
+        if(!a) return NULL;
+        a->base = (wchar_t*)malloc(cap * sizeof(wchar_t));
+        if(!a->base){ free(a); return NULL; }
+        a->used = 0;
+        a->cap = cap;
+        a->next = *arena;
+        *arena = a;
+    }
+    wchar_t* ret = (*arena)->base + (*arena)->used;
+    (*arena)->used += n;
+    return ret;
+}
+
 static BOOL frnmap_resize(FrnMap* m){
     size_t newcap = m->cap ? m->cap*2 : 1024;
     FrnEntry* newslots = (FrnEntry*)calloc(newcap, sizeof(FrnEntry));
@@ -63,15 +98,16 @@ static BOOL frnmap_resize(FrnMap* m){
     return TRUE;
 }
 static FrnEntry* frnmap_put(FrnMap* m, uint64_t frn, uint64_t parent, const wchar_t* name, uint32_t attrs){
-    if(m->count*2 >= m->cap){ if(!frnmap_resize(m)) return NULL; }
+    if(m->count*2 >= m->cap){ if(!frnmap_resize(m)) { frnmap_free(m); return NULL; } }
     size_t i = (size_t)(frn_hash(frn) & (m->cap-1));
     while(m->slots[i].frn && m->slots[i].frn != frn){ i=(i+1)&(m->cap-1); }
     if(!m->slots[i].frn){ m->count++; }
     m->slots[i].frn = frn; m->slots[i].parent = parent; m->slots[i].attrs=attrs;
-    if(m->slots[i].name) free(m->slots[i].name);
-    size_t n = wcslen(name);
-    m->slots[i].name = (wchar_t*)malloc((n+1)*sizeof(wchar_t));
-    wcscpy_s(m->slots[i].name, n+1, name);
+    size_t n = wcslen(name)+1;
+    wchar_t* dst = arena_alloc(&m->arena, n);
+    if(!dst){ frnmap_free(m); return NULL; }
+    memcpy(dst, name, n*sizeof(wchar_t));
+    m->slots[i].name = dst;
     return &m->slots[i];
 }
 static FrnEntry* frnmap_get(FrnMap* m, uint64_t frn){
@@ -148,7 +184,10 @@ static DWORD WINAPI usn_thread(void* p){
             if(r->RecordLength < sizeof(USN_RECORD_V2)) break;
             wchar_t name[MAX_PATH];
             wcsncpy_s(name, MAX_PATH, (const wchar_t*)((BYTE*)r + r->FileNameOffset), r->FileNameLength/2);
-            frnmap_put(&s->map, r->FileReferenceNumber, r->ParentFileReferenceNumber, name, r->FileAttributes);
+            if(!frnmap_put(&s->map, r->FileReferenceNumber, r->ParentFileReferenceNumber, name, r->FileAttributes)){
+                VirtualFree(buf,0,MEM_RELEASE);
+                return 1;
+            }
             pRec += r->RecordLength;
         }
         med.StartFileReferenceNumber = *(USN*)buf;
