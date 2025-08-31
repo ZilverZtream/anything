@@ -545,16 +545,34 @@ void records_for_ext(MDB_txn* txn, MDB_dbi dbi_ext, const std::string& ext, IdVe
     mdb_cursor_close(ce);
 }
 
-void get_all_records(MDB_txn* txn, MDB_dbi dbi_date, IdVec* out) {
+typedef void (*RecordCallback)(uint64_t id, void* ctx);
+
+static void stream_all_records(MDB_txn* txn, MDB_dbi dbi_date,
+                               RecordCallback cb, void* ctx) {
     MDB_cursor* cd = nullptr;
-    mdb_cursor_open(txn, dbi_date, &cd);
+    if (mdb_cursor_open(txn, dbi_date, &cd) != 0) return;
     MDB_val k, v;
     int rc = mdb_cursor_get(cd, &k, &v, MDB_FIRST);
     while (rc == 0) {
-        idvec_push(out, *(uint64_t*)v.mv_data);
+        cb(*(uint64_t*)v.mv_data, ctx);
         rc = mdb_cursor_get(cd, &k, &v, MDB_NEXT);
     }
     mdb_cursor_close(cd);
+}
+
+struct DiffCtx { const IdVec* excl; IdVec* out; };
+static int cmp_u64(const void* a, const void* b) {
+    uint64_t ua = *(const uint64_t*)a, ub = *(const uint64_t*)b;
+    if (ua < ub) return -1; if (ua > ub) return 1; return 0;
+}
+static void diff_collect(uint64_t id, void* p) {
+    DiffCtx* c = (DiffCtx*)p;
+    if (!bsearch(&id, c->excl->ids, c->excl->n, sizeof(uint64_t), cmp_u64))
+        idvec_push(c->out, id);
+}
+
+static void collect_record(uint64_t id, void* ctx) {
+    idvec_push((IdVec*)ctx, id);
 }
 
 void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MDB_dbi dbi_trigram, MDB_dbi dbi_smeta, MDB_dbi dbi_content, MDB_dbi dbi_author, MDB_dbi dbi_ext, MDB_dbi dbi_strrev, MDB_dbi dbi_date, IdVec* out) {
@@ -583,10 +601,10 @@ void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MD
     if (n->type == TOK_NOT) {
         IdVec B; idvec_init(&B);
         eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &B);
+        sort_unique(&B);
         IdVec All; idvec_init(&All);
-        get_all_records(txn, dbi_date, &All);
-        sort_unique(&B); sort_unique(&All);
-        difference_inplace(&All, &B);
+        DiffCtx ctx{ &B, &All };
+        stream_all_records(txn, dbi_date, diff_collect, &ctx);
         idvec_free(&B);
         *out = All;
         return;
@@ -626,7 +644,7 @@ static void search_thread(SearchThreadArgs* sta) {
         eval_node(root, txn, dbi_strings, dbi_fname_index, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &rec_ids);
         free_node(root);
     } else {
-        get_all_records(txn, dbi_date, &rec_ids);
+        stream_all_records(txn, dbi_date, collect_record, &rec_ids);
     }
     sort_unique(&rec_ids);
     MDB_stat st; mdb_stat(txn, dbi_records, &st);
