@@ -53,6 +53,11 @@ typedef struct DbRecord {
     uint8_t   type;
     uint64_t  content_str_id;
     uint64_t  author_str_id;
+    uint64_t  camera_str_id;
+    uint64_t  lens_str_id;
+    uint64_t  artist_str_id;
+    uint64_t  album_str_id;
+    uint64_t  title_str_id;
 } DbRecord;
 
 typedef struct DbHeader {

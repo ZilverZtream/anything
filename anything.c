@@ -23,6 +23,13 @@
 #include "plugin.h"
 #include "scanner.h"
 
+#ifdef HAS_LIBEXIF
+#include <libexif/exif-data.h>
+#endif
+#ifdef HAS_ID3TAG
+#include <id3tag.h>
+#endif
+
 // ---- MPMC queue implementation ----
 typedef enum { CONTENT_NONE, CONTENT_TEXT, CONTENT_IFILTER } ContentMode;
 
@@ -87,8 +94,9 @@ static wchar_t* extract_with_ifilter(const wchar_t* path){
     return out;
 }
 
-static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t* name, uint64_t* author_out){
+static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t* name, uint64_t* author_out, uint64_t* title_out){
     *author_out = 0;
+    *title_out = 0;
     ContentMode mode = get_content_mode(name);
     if(mode==CONTENT_NONE) return 0;
     wchar_t path[MAX_LONG_PATH];
@@ -120,6 +128,16 @@ static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t*
             wchar_t wa[256]; to_wide(tmp, wa, 256);
             *author_out = db_intern_wstring(db, wa);
         }
+        char* t = StrStrIA(buf, "title:");
+        if(t){
+            t += 6;
+            while(*t==' '||*t=='\t') t++;
+            char tmp[256]; size_t len=0;
+            while(t[len] && t[len]!='\r' && t[len]!='\n' && len<255) len++;
+            memcpy(tmp,t,len); tmp[len]=0;
+            wchar_t wt[256]; to_wide(tmp, wt, 256);
+            *title_out = db_intern_wstring(db, wt);
+        }
         int wlen = MultiByteToWideChar(CP_UTF8,0,buf,-1,NULL,0);
         wbuf = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
         if(wbuf) MultiByteToWideChar(CP_UTF8,0,buf,-1,wbuf,wlen);
@@ -128,9 +146,83 @@ static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t*
         wbuf = extract_with_ifilter(path);
     }
     if(!wbuf) return 0;
+    wchar_t* meta_a = StrStrIW(wbuf, L"author:");
+    if(meta_a){
+        meta_a += 7;
+        while(*meta_a==L' '||*meta_a==L'\t') meta_a++;
+        wchar_t tmp[256]; size_t len=0;
+        while(meta_a[len] && meta_a[len]!=L'\r' && meta_a[len]!=L'\n' && len<255) len++;
+        wcsncpy_s(tmp,256,meta_a,len);
+        *author_out = db_intern_wstring(db, tmp);
+    }
+    wchar_t* meta_t = StrStrIW(wbuf, L"title:");
+    if(meta_t){
+        meta_t += 6;
+        while(*meta_t==L' '||*meta_t==L'\t') meta_t++;
+        wchar_t tmp[256]; size_t len=0;
+        while(meta_t[len] && meta_t[len]!=L'\r' && meta_t[len]!=L'\n' && len<255) len++;
+        wcsncpy_s(tmp,256,meta_t,len);
+        *title_out = db_intern_wstring(db, tmp);
+    }
     uint64_t id = db_intern_wstring(db, wbuf);
     free(wbuf);
     return id;
+}
+
+static void extract_exif_metadata(Db* db, const wchar_t* path, DbRecord* r){
+#ifdef HAS_LIBEXIF
+    char u8[MAX_LONG_PATH];
+    to_utf8(path, u8, sizeof(u8));
+    ExifData* ed = exif_data_new_from_file(u8);
+    if(ed){
+        ExifEntry* e = exif_content_get_entry(ed->ifd[EXIF_IFD_0], EXIF_TAG_MODEL);
+        if(e){
+            char buf[256]={0}; exif_entry_get_value(e, buf, sizeof(buf));
+            wchar_t wbuf[256]; to_wide(buf, wbuf, 256);
+            r->camera_str_id = db_intern_wstring(db, wbuf);
+        }
+        e = exif_content_get_entry(ed->ifd[EXIF_IFD_EXIF], EXIF_TAG_LENS_MODEL);
+        if(e){
+            char buf[256]={0}; exif_entry_get_value(e, buf, sizeof(buf));
+            wchar_t wbuf[256]; to_wide(buf, wbuf, 256);
+            r->lens_str_id = db_intern_wstring(db, wbuf);
+        }
+        exif_data_unref(ed);
+    }
+#else
+    (void)db; (void)path; (void)r;
+#endif
+}
+
+static void extract_id3_metadata(Db* db, const wchar_t* path, DbRecord* r){
+#ifdef HAS_ID3TAG
+    char u8[MAX_LONG_PATH];
+    to_utf8(path, u8, sizeof(u8));
+    struct id3_file* f = id3_file_open(u8, ID3_FILE_MODE_READONLY);
+    if(f){
+        struct id3_tag* tag = id3_file_tag(f);
+        struct id3_frame* fr;
+        if((fr = id3_tag_findframe(tag, "TPE1",0))){
+            const id3_ucs4_t* uc = id3_field_getstrings(&fr->fields[1],0);
+            if(uc){
+                char buf[256]; id3_ucs4_utf8duplicate(uc,(id3_utf8_t*)buf,sizeof(buf));
+                wchar_t wbuf[256]; to_wide(buf, wbuf, 256);
+                r->artist_str_id = db_intern_wstring(db, wbuf);
+            }
+        }
+        if((fr = id3_tag_findframe(tag, "TALB",0))){
+            const id3_ucs4_t* uc = id3_field_getstrings(&fr->fields[1],0);
+            if(uc){
+                char buf[256]; id3_ucs4_utf8duplicate(uc,(id3_utf8_t*)buf,sizeof(buf));
+                wchar_t wbuf[256]; to_wide(buf, wbuf, 256);
+                r->album_str_id = db_intern_wstring(db, wbuf);
+            }
+        }
+        id3_file_close(f);
+    }
+#else
+    (void)db; (void)path; (void)r;
+#endif
 }
 BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size){
     if(!q) return FALSE;
@@ -255,11 +347,13 @@ static DWORD WINAPI DbWriterThread(void* p){
         r.access_time   = wi->access_time;
         r.attributes    = wi->attributes;
         if(r.type == DB_REC_FILE){
-            r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id);
+            r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id, &r.title_str_id);
+            wchar_t fpath[MAX_LONG_PATH];
+            _snwprintf(fpath, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
+            extract_exif_metadata(ctx->db, fpath, &r);
+            extract_id3_metadata(ctx->db, fpath, &r);
             if(is_archive_file(wi->name)){
-                wchar_t apath[MAX_LONG_PATH];
-                _snwprintf(apath, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
-                index_archive(ctx->db, apath);
+                index_archive(ctx->db, fpath);
             }
         }
         _aligned_free(wi);

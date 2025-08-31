@@ -77,6 +77,11 @@ typedef struct {
     MDB_dbi  dbi_string_meta;    // key: string_id   → bloom+meta
     MDB_dbi  dbi_content_index;  // key: content_str_id → rec_id (dups)
     MDB_dbi  dbi_author_index;   // key: author_str_id  → rec_id (dups)
+    MDB_dbi  dbi_camera_index;   // key: camera_str_id  → rec_id (dups)
+    MDB_dbi  dbi_lens_index;     // key: lens_str_id    → rec_id (dups)
+    MDB_dbi  dbi_artist_index;   // key: artist_str_id  → rec_id (dups)
+    MDB_dbi  dbi_album_index;    // key: album_str_id   → rec_id (dups)
+    MDB_dbi  dbi_title_index;    // key: title_str_id   → rec_id (dups)
     MDB_txn* wtxn;
     int      last_err;
     size_t   map_init;
@@ -115,6 +120,11 @@ static int open_core_dbs(MDB_txn* txn, DbImpl* d, BOOL create){
     if((rc = mdb_dbi_open(txn, "string_meta", flags|MDB_CREATE, &d->dbi_string_meta))) return rc;
     if((rc = mdb_dbi_open(txn, "content_index", flags|MDB_DUPSORT, &d->dbi_content_index))) return rc;
     if((rc = mdb_dbi_open(txn, "author_index", flags|MDB_DUPSORT, &d->dbi_author_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "camera_index", flags|MDB_DUPSORT, &d->dbi_camera_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "lens_index", flags|MDB_DUPSORT, &d->dbi_lens_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "artist_index", flags|MDB_DUPSORT, &d->dbi_artist_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "album_index", flags|MDB_DUPSORT, &d->dbi_album_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "title_index", flags|MDB_DUPSORT, &d->dbi_title_index))) return rc;
     return 0;
 }
 
@@ -392,6 +402,31 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
         if(r->author_str_id){
             MDB_val ak,av; to_mdb_val(&r->author_str_id, sizeof(r->author_str_id), &ak); to_mdb_val(&id, sizeof(id), &av);
             rc = mdb_put(d->wtxn, d->dbi_author_index, &ak, &av, MDB_NODUPDATA);
+            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        }
+        if(r->camera_str_id){
+            MDB_val ck,av; to_mdb_val(&r->camera_str_id, sizeof(r->camera_str_id), &ck); to_mdb_val(&id, sizeof(id), &av);
+            rc = mdb_put(d->wtxn, d->dbi_camera_index, &ck, &av, MDB_NODUPDATA);
+            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        }
+        if(r->lens_str_id){
+            MDB_val lk,av; to_mdb_val(&r->lens_str_id, sizeof(r->lens_str_id), &lk); to_mdb_val(&id, sizeof(id), &av);
+            rc = mdb_put(d->wtxn, d->dbi_lens_index, &lk, &av, MDB_NODUPDATA);
+            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        }
+        if(r->artist_str_id){
+            MDB_val ark,av; to_mdb_val(&r->artist_str_id, sizeof(r->artist_str_id), &ark); to_mdb_val(&id, sizeof(id), &av);
+            rc = mdb_put(d->wtxn, d->dbi_artist_index, &ark, &av, MDB_NODUPDATA);
+            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        }
+        if(r->album_str_id){
+            MDB_val abk,av; to_mdb_val(&r->album_str_id, sizeof(r->album_str_id), &abk); to_mdb_val(&id, sizeof(id), &av);
+            rc = mdb_put(d->wtxn, d->dbi_album_index, &abk, &av, MDB_NODUPDATA);
+            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        }
+        if(r->title_str_id){
+            MDB_val tk,av; to_mdb_val(&r->title_str_id, sizeof(r->title_str_id), &tk); to_mdb_val(&id, sizeof(id), &av);
+            rc = mdb_put(d->wtxn, d->dbi_title_index, &tk, &av, MDB_NODUPDATA);
             if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
         }
     }

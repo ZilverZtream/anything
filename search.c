@@ -26,6 +26,11 @@ typedef struct {
     char* name_pattern;
     char* content_pattern;
     char* author_pattern;
+    char* camera_pattern;
+    char* lens_pattern;
+    char* artist_pattern;
+    char* album_pattern;
+    char* title_pattern;
     char* ext_pattern;
     uint64_t size_min, size_max;
     uint64_t date_min_day, date_max_day;
@@ -35,7 +40,7 @@ typedef struct {
 } SearchQuery;
 
 typedef enum { TOK_TERM, TOK_AND, TOK_OR, TOK_NOT, TOK_LPAREN, TOK_RPAREN } TokType;
-typedef enum { TERM_NAME, TERM_AUTHOR, TERM_EXT, TERM_CONTENT } TermType;
+typedef enum { TERM_NAME, TERM_AUTHOR, TERM_CAMERA, TERM_LENS, TERM_ARTIST, TERM_ALBUM, TERM_TITLE, TERM_EXT, TERM_CONTENT } TermType;
 typedef struct { TokType type; TermType ttype; char* text; } Token;
 typedef struct { Token* items; int n, cap; } TokenList;
 static void tokenlist_init(TokenList* t){ t->items=NULL; t->n=t->cap=0; }
@@ -123,6 +128,11 @@ static void add_logic_token(TokenList* toks, const char* s){
     if(_stricmp(s,"OR")==0){ tokenlist_push(toks,(Token){.type=TOK_OR}); return; }
     if(_stricmp(s,"NOT")==0){ tokenlist_push(toks,(Token){.type=TOK_NOT}); return; }
     if(_strnicmp(s,"author:",7)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_AUTHOR,.text=_strdup(s+7)}); return; }
+    if(_strnicmp(s,"camera:",7)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_CAMERA,.text=_strdup(s+7)}); return; }
+    if(_strnicmp(s,"lens:",5)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_LENS,.text=_strdup(s+5)}); return; }
+    if(_strnicmp(s,"artist:",7)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_ARTIST,.text=_strdup(s+7)}); return; }
+    if(_strnicmp(s,"album:",6)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_ALBUM,.text=_strdup(s+6)}); return; }
+    if(_strnicmp(s,"title:",6)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_TITLE,.text=_strdup(s+6)}); return; }
     if(_strnicmp(s,"ext:",4)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_EXT,.text=_strdup(s+4)}); return; }
     if(_strnicmp(s,"content:",8)==0){ tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_CONTENT,.text=_strdup(s+8)}); return; }
     tokenlist_push(toks,(Token){.type=TOK_TERM,.ttype=TERM_NAME,.text=_strdup(s)});
@@ -180,6 +190,11 @@ static void parse_query(int argc, wchar_t** argv, wchar_t* dbPath, SearchQuery* 
         if(!q->name_pattern && tokens->items[i].ttype==TERM_NAME) q->name_pattern=_strdup(tokens->items[i].text);
         if(!q->content_pattern && tokens->items[i].ttype==TERM_CONTENT) q->content_pattern=_strdup(tokens->items[i].text);
         if(!q->author_pattern && tokens->items[i].ttype==TERM_AUTHOR) q->author_pattern=_strdup(tokens->items[i].text);
+        if(!q->camera_pattern && tokens->items[i].ttype==TERM_CAMERA) q->camera_pattern=_strdup(tokens->items[i].text);
+        if(!q->lens_pattern && tokens->items[i].ttype==TERM_LENS) q->lens_pattern=_strdup(tokens->items[i].text);
+        if(!q->artist_pattern && tokens->items[i].ttype==TERM_ARTIST) q->artist_pattern=_strdup(tokens->items[i].text);
+        if(!q->album_pattern && tokens->items[i].ttype==TERM_ALBUM) q->album_pattern=_strdup(tokens->items[i].text);
+        if(!q->title_pattern && tokens->items[i].ttype==TERM_TITLE) q->title_pattern=_strdup(tokens->items[i].text);
         if(!q->ext_pattern && tokens->items[i].ttype==TERM_EXT) q->ext_pattern=_strdup(tokens->items[i].text);
     }
 }
@@ -386,6 +401,41 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
             if(_stricmp(author, q->author_pattern)==0) meta_score += 1.0f;
         }
     }
+    if(q->camera_pattern && r->camera_str_id){
+        MDB_val ck={.mv_data=&r->camera_str_id,.mv_size=sizeof(r->camera_str_id)}, cv;
+        if(mdb_get(txn, dbi_strings, &ck, &cv)==0){
+            const char* camera=(const char*)cv.mv_data;
+            if(_stricmp(camera, q->camera_pattern)==0) meta_score += 1.0f;
+        }
+    }
+    if(q->lens_pattern && r->lens_str_id){
+        MDB_val lk={.mv_data=&r->lens_str_id,.mv_size=sizeof(r->lens_str_id)}, lv;
+        if(mdb_get(txn, dbi_strings, &lk, &lv)==0){
+            const char* lens=(const char*)lv.mv_data;
+            if(_stricmp(lens, q->lens_pattern)==0) meta_score += 1.0f;
+        }
+    }
+    if(q->artist_pattern && r->artist_str_id){
+        MDB_val ark={.mv_data=&r->artist_str_id,.mv_size=sizeof(r->artist_str_id)}, av2;
+        if(mdb_get(txn, dbi_strings, &ark, &av2)==0){
+            const char* artist=(const char*)av2.mv_data;
+            if(_stricmp(artist, q->artist_pattern)==0) meta_score += 1.0f;
+        }
+    }
+    if(q->album_pattern && r->album_str_id){
+        MDB_val abk={.mv_data=&r->album_str_id,.mv_size=sizeof(r->album_str_id)}, abv;
+        if(mdb_get(txn, dbi_strings, &abk, &abv)==0){
+            const char* album=(const char*)abv.mv_data;
+            if(_stricmp(album, q->album_pattern)==0) meta_score += 1.0f;
+        }
+    }
+    if(q->title_pattern && r->title_str_id){
+        MDB_val tk={.mv_data=&r->title_str_id,.mv_size=sizeof(r->title_str_id)}, tv;
+        if(mdb_get(txn, dbi_strings, &tk, &tv)==0){
+            const char* title=(const char*)tv.mv_data;
+            if(_stricmp(title, q->title_pattern)==0) meta_score += 1.0f;
+        }
+    }
     if(q->ext_pattern){
         const char* ext = PathFindExtensionA(name_utf8);
         if(ext && ext[0]){ ext++; if(_stricmp(ext, q->ext_pattern)==0) meta_score += 1.0f; }
@@ -526,18 +576,36 @@ static void get_all_records(MDB_txn* txn, MDB_dbi dbi_date, IdVec* out){
     mdb_cursor_close(cd);
 }
 
-static void records_for_author(MDB_txn* txn, MDB_dbi dbi_author, MDB_dbi dbi_strrev, const char* author, IdVec* out){
-    MDB_val k={.mv_data=(void*)author,.mv_size=strlen(author)}, v;
+static void records_for_meta(MDB_txn* txn, MDB_dbi dbi_index, MDB_dbi dbi_strrev, const char* val, IdVec* out){
+    MDB_val k={.mv_data=(void*)val,.mv_size=strlen(val)}, v;
     if(mdb_get(txn, dbi_strrev,&k,&v)==0){
         uint64_t sid=*(uint64_t*)v.mv_data;
-        MDB_cursor* ca=NULL; mdb_cursor_open(txn, dbi_author,&ca);
+        MDB_cursor* c=NULL; mdb_cursor_open(txn, dbi_index,&c);
         MDB_val ak={.mv_data=&sid,.mv_size=sizeof(sid)}, av;
-        if(mdb_cursor_get(ca,&ak,&av,MDB_SET_KEY)==0){
+        if(mdb_cursor_get(c,&ak,&av,MDB_SET_KEY)==0){
             do{ idvec_push(out, *(uint64_t*)av.mv_data); }
-            while(mdb_cursor_get(ca,&ak,&av,MDB_NEXT_DUP)==0);
+            while(mdb_cursor_get(c,&ak,&av,MDB_NEXT_DUP)==0);
         }
-        mdb_cursor_close(ca);
+        mdb_cursor_close(c);
     }
+}
+static void records_for_author(MDB_txn* txn, MDB_dbi dbi_author, MDB_dbi dbi_strrev, const char* author, IdVec* out){
+    records_for_meta(txn, dbi_author, dbi_strrev, author, out);
+}
+static void records_for_camera(MDB_txn* txn, MDB_dbi dbi_camera, MDB_dbi dbi_strrev, const char* camera, IdVec* out){
+    records_for_meta(txn, dbi_camera, dbi_strrev, camera, out);
+}
+static void records_for_lens(MDB_txn* txn, MDB_dbi dbi_lens, MDB_dbi dbi_strrev, const char* lens, IdVec* out){
+    records_for_meta(txn, dbi_lens, dbi_strrev, lens, out);
+}
+static void records_for_artist(MDB_txn* txn, MDB_dbi dbi_artist, MDB_dbi dbi_strrev, const char* artist, IdVec* out){
+    records_for_meta(txn, dbi_artist, dbi_strrev, artist, out);
+}
+static void records_for_album(MDB_txn* txn, MDB_dbi dbi_album, MDB_dbi dbi_strrev, const char* album, IdVec* out){
+    records_for_meta(txn, dbi_album, dbi_strrev, album, out);
+}
+static void records_for_title(MDB_txn* txn, MDB_dbi dbi_title, MDB_dbi dbi_strrev, const char* title, IdVec* out){
+    records_for_meta(txn, dbi_title, dbi_strrev, title, out);
 }
 
 static void records_for_ext(MDB_txn* txn, MDB_dbi dbi_ext, const char* ext, IdVec* out){
@@ -634,13 +702,18 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
     idvec_free(&name_ids);
 }
 
-static void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MDB_dbi dbi_trigram, MDB_dbi dbi_smeta, MDB_dbi dbi_content, MDB_dbi dbi_author, MDB_dbi dbi_ext, MDB_dbi dbi_strrev, MDB_dbi dbi_date, IdVec* out){
+static void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MDB_dbi dbi_trigram, MDB_dbi dbi_smeta, MDB_dbi dbi_content, MDB_dbi dbi_author, MDB_dbi dbi_camera, MDB_dbi dbi_lens, MDB_dbi dbi_artist, MDB_dbi dbi_album, MDB_dbi dbi_title, MDB_dbi dbi_ext, MDB_dbi dbi_strrev, MDB_dbi dbi_date, IdVec* out){
     if(!n) return;
     if(n->type==TOK_TERM){
         switch(n->ttype){
             case TERM_NAME: records_for_name(txn, dbi_trigram, dbi_fname, dbi_strings, dbi_smeta, n->text, out); break;
             case TERM_CONTENT: records_for_content(txn, dbi_trigram, dbi_content, n->text, out); break;
             case TERM_AUTHOR: records_for_author(txn, dbi_author, dbi_strrev, n->text, out); break;
+            case TERM_CAMERA: records_for_camera(txn, dbi_camera, dbi_strrev, n->text, out); break;
+            case TERM_LENS: records_for_lens(txn, dbi_lens, dbi_strrev, n->text, out); break;
+            case TERM_ARTIST: records_for_artist(txn, dbi_artist, dbi_strrev, n->text, out); break;
+            case TERM_ALBUM: records_for_album(txn, dbi_album, dbi_strrev, n->text, out); break;
+            case TERM_TITLE: records_for_title(txn, dbi_title, dbi_strrev, n->text, out); break;
             case TERM_EXT: records_for_ext(txn, dbi_ext, n->text, out); break;
         }
         sort_unique(out);
@@ -648,15 +721,15 @@ static void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fn
     }
     if(n->type==TOK_AND || n->type==TOK_OR){
         IdVec L; idvec_init(&L); IdVec R; idvec_init(&R);
-        eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &L);
-        eval_node(n->right, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &R);
+        eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &L);
+        eval_node(n->right, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &R);
         sort_unique(&L); sort_unique(&R);
         if(n->type==TOK_AND){ intersect_inplace(&L,&R); } else { union_inplace(&L,&R); sort_unique(&L); }
         idvec_free(&R);
         *out=L; return;
     }
     if(n->type==TOK_NOT){
-        IdVec B; idvec_init(&B); eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &B);
+        IdVec B; idvec_init(&B); eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &B);
         IdVec All; idvec_init(&All); get_all_records(txn, dbi_date, &All); sort_unique(&B); sort_unique(&All); difference_inplace(&All,&B); idvec_free(&B); *out=All; return;
     }
 }
@@ -705,7 +778,7 @@ int wmain(int argc, wchar_t** argv){
     char u8db[MAX_PATH*3]; to_utf8(dbPath,u8db,sizeof(u8db));
     if(mdb_env_open(env, u8db, MDB_RDONLY, 0664)!=0){ fwprintf(stderr,L"env_open failed\n"); return 1; }
     if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ fwprintf(stderr,L"txn_begin failed\n"); return 1; }
-    MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_strrev;
+    MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_strrev;
     if(mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
        mdb_dbi_open(txn,"records",0,&dbi_records)!=0 ||
        mdb_dbi_open(txn,"filename_index",0,&dbi_fname_index)!=0 ||
@@ -716,6 +789,11 @@ int wmain(int argc, wchar_t** argv){
        mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0 ||
        mdb_dbi_open(txn,"content_index",0,&dbi_content)!=0 ||
        mdb_dbi_open(txn,"author_index",0,&dbi_author)!=0 ||
+       mdb_dbi_open(txn,"camera_index",0,&dbi_camera)!=0 ||
+       mdb_dbi_open(txn,"lens_index",0,&dbi_lens)!=0 ||
+       mdb_dbi_open(txn,"artist_index",0,&dbi_artist)!=0 ||
+       mdb_dbi_open(txn,"album_index",0,&dbi_album)!=0 ||
+       mdb_dbi_open(txn,"title_index",0,&dbi_title)!=0 ||
        mdb_dbi_open(txn,"strrev",0,&dbi_strrev)!=0){
        fwprintf(stderr,L"dbi_open failed\n"); mdb_txn_abort(txn); mdb_env_close(env); return 1;
     }
@@ -724,7 +802,7 @@ int wmain(int argc, wchar_t** argv){
     IdVec rec_ids; idvec_init(&rec_ids);
     Node* root = parse_tokens(&tokens);
     if(root){
-        eval_node(root, txn, dbi_strings, dbi_fname_index, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &rec_ids);
+        eval_node(root, txn, dbi_strings, dbi_fname_index, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &rec_ids);
         free_node(root);
     } else {
         get_all_records(txn, dbi_date, &rec_ids);
@@ -798,6 +876,11 @@ int wmain(int argc, wchar_t** argv){
     if(q.name_pattern) free(q.name_pattern);
     if(q.content_pattern) free(q.content_pattern);
     if(q.author_pattern) free(q.author_pattern);
+    if(q.camera_pattern) free(q.camera_pattern);
+    if(q.lens_pattern) free(q.lens_pattern);
+    if(q.artist_pattern) free(q.artist_pattern);
+    if(q.album_pattern) free(q.album_pattern);
+    if(q.title_pattern) free(q.title_pattern);
     if(q.ext_pattern) free(q.ext_pattern);
     if(q.path_filter) free(q.path_filter);
     idvec_free(&rec_ids);
