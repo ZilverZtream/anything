@@ -6,7 +6,10 @@
 #include <immintrin.h>
 #include <stdio.h>
 #include <math.h>
+#include <nmmintrin.h>
+#include <bcrypt.h>
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 void lowercase_ascii(char* s, size_t n){
     for(size_t i=0;i<n && s[i];++i){
@@ -97,6 +100,55 @@ uint64_t hash64(const void* data, size_t len){
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+uint64_t crc64_update(uint64_t crc, const void* data, size_t len){
+    const uint8_t* p = (const uint8_t*)data;
+    while(len >= 8){
+        uint64_t chunk;
+        memcpy(&chunk, p, sizeof(chunk));
+        crc = _mm_crc32_u64(crc, chunk);
+        p += 8; len -= 8;
+    }
+    while(len--){
+        crc = _mm_crc32_u8((uint32_t)crc, *p++);
+    }
+    return crc;
+}
+
+uint64_t crc64(const void* data, size_t len){
+    return crc64_update(0, data, len);
+}
+
+uint64_t crc64_file(const wchar_t* path){
+    if(!path) return 0;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if(h==INVALID_HANDLE_VALUE) return 0;
+    uint8_t buf[64*1024];
+    DWORD rd = 0;
+    uint64_t crc = 0;
+    while(ReadFile(h, buf, sizeof(buf), &rd, NULL) && rd>0){
+        crc = crc64_update(crc, buf, rd);
+    }
+    CloseHandle(h);
+    return crc;
+}
+
+void sha1(const void* data, size_t len, uint8_t out[20]){
+    if(!data || !out){ if(out) memset(out,0,20); return; }
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    DWORD hashObjSize=0, cbData=0;
+    if(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA1_ALGORITHM, NULL, 0)!=0){ memset(out,0,20); return; }
+    if(BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&hashObjSize, sizeof(hashObjSize), &cbData, 0)!=0){ BCryptCloseAlgorithmProvider(hAlg,0); memset(out,0,20); return; }
+    PUCHAR hashObj = (PUCHAR)malloc(hashObjSize);
+    if(!hashObj){ BCryptCloseAlgorithmProvider(hAlg,0); memset(out,0,20); return; }
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    if(BCryptCreateHash(hAlg, &hHash, hashObj, hashObjSize, NULL, 0, 0)!=0){ free(hashObj); BCryptCloseAlgorithmProvider(hAlg,0); memset(out,0,20); return; }
+    BCryptHashData(hHash, (PUCHAR)data, (ULONG)len, 0);
+    BCryptFinishHash(hHash, out, 20, 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg,0);
+    free(hashObj);
 }
 
 // Runtime AVX2 check via CPUID

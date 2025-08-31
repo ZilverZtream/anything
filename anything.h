@@ -59,6 +59,7 @@ typedef struct DbRecord {
     uint64_t  album_str_id;
     uint64_t  title_str_id;
     uint64_t  preview_str_id;
+    uint64_t  hash_crc;
 } DbRecord;
 
 typedef struct DbHeader {

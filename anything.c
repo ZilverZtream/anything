@@ -617,6 +617,7 @@ static DWORD WINAPI DbWriterThread(void* p){
             if(is_archive_file(wi->name)){
                 index_archive(ctx->db, fpath);
             }
+            r.hash_crc = crc64_file(fpath);
         }
         _aligned_free(wi);
 
