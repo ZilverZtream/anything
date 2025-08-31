@@ -608,7 +608,9 @@ static DWORD WINAPI DbWriterThread(void* p){
             if(!wi->content){
                 DbRecord existing;
                 if(db_get_record_by_path(ctx->db, wi->parent_path, wi->name, &existing)){
-                    if(existing.modified_time == wi->modified_time && existing.file_size == wi->file_size && existing.content_str_id){
+                    // If the file hasn't changed since the last index run, reuse the
+                    // previously stored metadata and avoid re-scanning its contents.
+                    if(existing.modified_time == wi->modified_time && existing.file_size == wi->file_size){
                         r.content_str_id = existing.content_str_id;
                         r.author_str_id  = existing.author_str_id;
                         r.title_str_id   = existing.title_str_id;
