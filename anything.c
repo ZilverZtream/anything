@@ -66,12 +66,7 @@ static void push_live_update(const DbWorkItem* wi){
     while(!MPMC_Push(&g_live_updates, lu)) Sleep(0);
 }
 
-#ifdef HAS_LIBEXIF
-#include <libexif/exif-data.h>
-#endif
-#ifdef HAS_ID3TAG
-#include <id3tag.h>
-#endif
+#include "metadata.h"
 
 // ---- MPMC queue implementation ----
 typedef enum { CONTENT_NONE, CONTENT_TEXT, CONTENT_IFILTER, CONTENT_EMAIL, CONTENT_EPUB, CONTENT_PST } ContentMode;
@@ -457,61 +452,6 @@ static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t*
     return id;
 }
 
-static void extract_exif_metadata(Db* db, const wchar_t* path, DbRecord* r){
-#ifdef HAS_LIBEXIF
-    char u8[MAX_LONG_PATH];
-    to_utf8(path, u8, sizeof(u8));
-    ExifData* ed = exif_data_new_from_file(u8);
-    if(ed){
-        ExifEntry* e = exif_content_get_entry(ed->ifd[EXIF_IFD_0], EXIF_TAG_MODEL);
-        if(e){
-            char buf[256]={0}; exif_entry_get_value(e, buf, sizeof(buf));
-            wchar_t wbuf[256]; to_wide(buf, wbuf, 256);
-            r->camera_str_id = db_intern_wstring(db, wbuf);
-        }
-        e = exif_content_get_entry(ed->ifd[EXIF_IFD_EXIF], EXIF_TAG_LENS_MODEL);
-        if(e){
-            char buf[256]={0}; exif_entry_get_value(e, buf, sizeof(buf));
-            wchar_t wbuf[256]; to_wide(buf, wbuf, 256);
-            r->lens_str_id = db_intern_wstring(db, wbuf);
-        }
-        exif_data_unref(ed);
-    }
-#else
-    (void)db; (void)path; (void)r;
-#endif
-}
-
-static void extract_id3_metadata(Db* db, const wchar_t* path, DbRecord* r){
-#ifdef HAS_ID3TAG
-    char u8[MAX_LONG_PATH];
-    to_utf8(path, u8, sizeof(u8));
-    struct id3_file* f = id3_file_open(u8, ID3_FILE_MODE_READONLY);
-    if(f){
-        struct id3_tag* tag = id3_file_tag(f);
-        struct id3_frame* fr;
-        if((fr = id3_tag_findframe(tag, "TPE1",0))){
-            const id3_ucs4_t* uc = id3_field_getstrings(&fr->fields[1],0);
-            if(uc){
-                char buf[256]; id3_ucs4_utf8duplicate(uc,(id3_utf8_t*)buf,sizeof(buf));
-                wchar_t wbuf[256]; to_wide(buf, wbuf, 256);
-                r->artist_str_id = db_intern_wstring(db, wbuf);
-            }
-        }
-        if((fr = id3_tag_findframe(tag, "TALB",0))){
-            const id3_ucs4_t* uc = id3_field_getstrings(&fr->fields[1],0);
-            if(uc){
-                char buf[256]; id3_ucs4_utf8duplicate(uc,(id3_utf8_t*)buf,sizeof(buf));
-                wchar_t wbuf[256]; to_wide(buf, wbuf, 256);
-                r->album_str_id = db_intern_wstring(db, wbuf);
-            }
-        }
-        id3_file_close(f);
-    }
-#else
-    (void)db; (void)path; (void)r;
-#endif
-}
 BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size){
     if(!q) return FALSE;
     LONG size=1; while(size<pow2_size) size<<=1;
