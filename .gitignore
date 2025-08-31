@@ -1,0 +1,55 @@
+# Compiled object files
+*.obj
+*.o
+
+# Precompiled headers
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+*.dll
+*.so
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Debug / Release folders
+Debug/
+Release/
+x64/
+x86/
+build/
+bin/
+obj/
+
+# Visual Studio specific
+.vs/
+*.vcxproj*
+*.sln
+*.user
+*.aps
+*.ncb
+*.suo
+*.cachefile
+ipch/
+
+# Database / index files
+*.db
+*.mdb
+*.accdb
+*.sqlite
+cache_*.tmp
+
+# Logs
+*.log
+
+# Other
+*.pdb
+*.ilk
+*.idb

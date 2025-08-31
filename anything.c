@@ -1,251 +1,282 @@
-// anything.c - Orchestrator for high-speed file indexing using LMDB.
-// Build: cl /O2 /W3 /Gy /GL /Fe:anything.exe anything.c ntfs.c exfat.c database.c /I path\to\lmdb /link lmdb.lib shlwapi.lib
 
+// anything.c — Orchestrator
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <shlwapi.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <process.h>
+#include <wchar.h>
 #include <intrin.h>
 
 #pragma comment(lib, "shlwapi.lib")
 
 #include "anything.h"
 #include "database.h"
-#include "lmdb.h" // for MDB_MAP_FULL
+#include "util.h"
 
-// ---- MPMC Queue implementation -------------------------------------------
-
-static inline LONG64 mpmc_min(LONG64 a, LONG64 b) { return a < b ? a : b; }
-
-BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size) {
-    if (!q) return FALSE;
-    LONG size = 1;
-    while (size < pow2_size) size <<= 1;
-    q->mask = size - 1;
-
+// ---- MPMC queue implementation ----
+BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size){
+    if(!q) return FALSE;
+    LONG size=1; while(size<pow2_size) size<<=1;
+    q->mask = size-1;
     size_t cells_size = sizeof(MPMCCell) * (size_t)size;
     q->cells = (MPMCCell*)_aligned_malloc(cells_size, CACHE_LINE_SIZE);
-    if (!q->cells) return FALSE;
+    if(!q->cells) return FALSE;
     ZeroMemory(q->cells, cells_size);
-    for (LONG i=0; i<size; ++i) {
-        q->cells[i].seq = i;
-        q->cells[i].data = NULL;
-    }
-    q->head = 0;
-    q->tail = 0;
+    for(LONG i=0;i<size;i++){ q->cells[i].seq = i; }
+    q->head=0; q->tail=0;
     return TRUE;
 }
-void MPMC_Destroy(MPMCQueue* q) {
-    if (!q) return;
-    if (q->cells) _aligned_free(q->cells);
-    ZeroMemory(q, sizeof(*q));
+void MPMC_Destroy(MPMCQueue* q){
+    if(!q || !q->cells) return;
+    _aligned_free(q->cells); q->cells=NULL;
 }
-BOOL MPMC_Push(MPMCQueue* q, void* val) {
-    MPMCCell* cells = q->cells;
-    LONG64 mask = q->mask;
-    for (;;) {
-        LONG64 pos = q->tail;
-        MPMCCell* cell = &cells[pos & mask];
+BOOL MPMC_Push(MPMCQueue* q, void* data){
+    MPMCCell* cell; LONG64 pos = q->head;
+    for(;;){
+        cell = &q->cells[pos & q->mask];
         LONG64 seq = cell->seq;
-        LONG64 dif = seq - pos;
-        if (dif == 0) {
-            if (_InterlockedCompareExchange64(&q->tail, pos+1, pos) == pos) {
-                cell->data = val;
-                cell->seq = pos + 1;
+        if(seq == pos){
+            if(InterlockedCompareExchange64(&q->head, pos+1, pos)==pos){
+                cell->data = data;
+                _ReadWriteBarrier();
+                cell->seq = pos+1;
                 return TRUE;
             }
-        } else if (dif < 0) {
+        } else if(seq < pos) {
             return FALSE; // full
         } else {
-            YieldProcessor();
+            pos = q->head;
         }
+        SwitchToThread();
     }
 }
-BOOL MPMC_Pop(MPMCQueue* q, void** out) {
-    MPMCCell* cells = q->cells;
-    LONG64 mask = q->mask;
-    for (;;) {
-        LONG64 pos = q->head;
-        MPMCCell* cell = &cells[pos & mask];
+BOOL MPMC_Pop(MPMCQueue* q, void** out){
+    MPMCCell* cell; LONG64 pos = q->tail;
+    for(;;){
+        cell = &q->cells[pos & q->mask];
         LONG64 seq = cell->seq;
-        LONG64 dif = seq - (pos + 1);
-        if (dif == 0) {
-            if (_InterlockedCompareExchange64(&q->head, pos+1, pos) == pos) {
-                void* data = cell->data;
-                cell->seq = pos + mask + 1;
-                *out = data;
+        if(seq == pos+1){
+            if(InterlockedCompareExchange64(&q->tail, pos+1, pos)==pos){
+                void* d = cell->data;
+                _ReadWriteBarrier();
+                cell->seq = pos + q->mask + 1;
+                *out = d;
                 return TRUE;
             }
-        } else if (dif < 0) {
-            return FALSE;
+        } else if(seq < pos+1){
+            return FALSE; // empty
         } else {
-            YieldProcessor();
+            pos = q->tail;
         }
+        SwitchToThread();
     }
 }
 
-// ---- Args -----------------------------------------------------------------
+// ---- Writer context & thread ----
+typedef struct WriterCtx {
+    Db* db;
+    int batch_size;
+    volatile BOOL done;
+    MPMCQueue queue;
+    HANDLE cancel_event;
+    size_t grow_attempts;
+} WriterCtx;
 
-typedef struct {
-    WCHAR startPath[MAX_LONG_PATH];
-    WCHAR dbPath[MAX_PATH];
-    int   threads;
-    int   batch;
-    size_t map_init_mb;
-    size_t map_max_mb;
-    BOOL  force_generic;
-    BOOL  force_ntfs;
-} AppArgs;
-
-static void print_usage() {
-    puts("ANYTHING - ultra-fast file indexer (Windows)\n");
-    puts("Usage:");
-    puts("  anything.exe <start-path> <db-path> [options]\n");
-    puts("Options:");
-    puts("  -threads N     Number of worker threads (default: all CPUs)");
-    puts("  -batch N       LMDB batch size (default: 50000)");
-    puts("  -mapinit N     Initial LMDB map size in MB (default: 512)");
-    puts("  -mapmax N      Maximum LMDB map size in MB (default: 16384)");
-    puts("  -generic       Force generic file scanner");
-    puts("  -ntfs          Force NTFS USN scanner");
-    puts("  -help          Show this help\n");
-}
-
-static BOOL parse_args(int argc, char** argv, AppArgs* args) {
-    if (argc < 3) {
-        print_usage();
-        return FALSE;
-    }
-    ZeroMemory(args, sizeof(*args));
-    GetFullPathNameA(argv[1], MAX_LONG_PATH, args->startPath, NULL);
-    GetFullPathNameA(argv[2], MAX_PATH, args->dbPath, NULL);
-    args->threads = 0;
-    args->batch = LMDB_BATCH_SIZE_SUGGESTION;
-    args->map_init_mb = 512;
-    args->map_max_mb = 16384;
-
-    for (int i=3; i<argc; ++i) {
-        if (_stricmp(argv[i], "-threads") == 0 && i+1 < argc) {
-            args->threads = atoi(argv[++i]);
-        } else if (_stricmp(argv[i], "-batch") == 0 && i+1 < argc) {
-            args->batch = atoi(argv[++i]);
-        } else if (_stricmp(argv[i], "-mapinit") == 0 && i+1 < argc) {
-            args->map_init_mb = (size_t)atoi(argv[++i]);
-        } else if (_stricmp(argv[i], "-mapmax") == 0 && i+1 < argc) {
-            args->map_max_mb = (size_t)atoi(argv[++i]);
-        } else if (_stricmp(argv[i], "-generic") == 0) {
-            args->force_generic = TRUE;
-        } else if (_stricmp(argv[i], "-ntfs") == 0) {
-            args->force_ntfs = TRUE;
-        } else if (_stricmp(argv[i], "-help") == 0) {
-            print_usage();
-            exit(0);
+static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch){
+    for(;;){
+        if(db_put_records(ctx->db, buf, in_batch)){
+            return TRUE;
+        }
+        int err = db_last_error(ctx->db);
+        if(err == MDB_MAP_FULL){
+            db_abort_write(ctx->db);
+            size_t cur = db_current_mapsize(ctx->db);
+            size_t newsize = cur * 2;
+            if(newsize > db_max_mapsize(ctx->db)){
+                fprintf(stderr, "DB mapsize at max; cannot grow beyond %llu bytes\n", (unsigned long long)db_max_mapsize(ctx->db));
+                return FALSE;
+            }
+            if(!db_set_mapsize(ctx->db, newsize)){
+                fprintf(stderr, "db_set_mapsize failed (err=%d)\n", db_last_error(ctx->db));
+                return FALSE;
+            }
+            if(!db_begin_write(ctx->db)) return FALSE;
+            ctx->grow_attempts++;
+            continue; // retry put
         } else {
-            printf("Unknown option: %s\n", argv[i]);
-            print_usage();
+            fprintf(stderr, "db_put_records failed (err=%d)\n", err);
             return FALSE;
         }
     }
-    return TRUE;
 }
 
-// ---- Worker orchestrator --------------------------------------------------
-
-static DWORD WINAPI DbWriterThread(void* p) {
+static DWORD WINAPI DbWriterThread(void* p){
     WriterCtx* ctx = (WriterCtx*)p;
-    void* item;
-    RecordBatch* batch = (RecordBatch*)malloc(sizeof(RecordBatch));
-    batch->count = 0;
+    if(!db_begin_write(ctx->db)) return 1;
+    size_t in_batch = 0;
+    DbRecord* buf = (DbRecord*)malloc(sizeof(DbRecord) * ctx->batch_size);
+    if(!buf) return 1;
+    ZeroMemory(buf, sizeof(DbRecord)*ctx->batch_size);
 
-    for (;;) {
-        if (!MPMC_Pop(&ctx->queue, &item)) {
-            if (ctx->done) break;
+    for(;;){
+        void* item = NULL;
+        if(!MPMC_Pop(&ctx->queue, &item)){
+            if(ctx->done) break;
             Sleep(1);
             continue;
         }
-        if (item == NULL) {
-            break;
-        }
-        Record* rec = (Record*)item;
-        batch->items[batch->count++] = *rec;
-        free(rec);
-        if (batch->count >= ctx->batch_size) {
-            db_write_batch(ctx->db, batch->items, batch->count);
-            batch->count = 0;
+        if(item == NULL) break; // sentinel
+        DbWorkItem* wi = (DbWorkItem*)item;
+        DbRecord r = {0};
+        r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
+        r.parent_str_id = db_intern_wstring(ctx->db, wi->parent_path);
+        r.name_str_id   = db_intern_wstring(ctx->db, wi->name);
+        r.file_size     = wi->file_size;
+        r.creation_time = wi->creation_time;
+        r.modified_time = wi->modified_time;
+        r.access_time   = wi->access_time;
+        r.attributes    = wi->attributes;
+        _aligned_free(wi);
+
+        buf[in_batch++] = r;
+        if(in_batch >= (size_t)ctx->batch_size){
+            if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); return 1; }
+            if(!db_commit_write(ctx->db)) { free(buf); return 1; }
+            if(!db_begin_write(ctx->db))  { free(buf); return 1; }
+            in_batch = 0;
         }
     }
-    if (batch->count > 0) {
-        db_write_batch(ctx->db, batch->items, batch->count);
+    if(in_batch){
+        if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); return 1; }
+        if(!db_commit_write(ctx->db)) { free(buf); return 1; }
+    } else {
+        db_commit_write(ctx->db);
     }
-    free(batch);
+    free(buf);
     return 0;
 }
 
-int main(int argc, char** argv) {
-    AppArgs args;
-    if (!parse_args(argc, argv, &args)) {
+// ---- CLI parsing ----
+typedef struct {
+    wchar_t dbPath[MAX_PATH];
+    wchar_t rootPath[MAX_LONG_PATH];
+    int threads;
+    int batch;
+    BOOL use_ntfs;
+    BOOL tail_changes;
+    BOOL all_drives;
+} Args;
+
+static void usage(void){
+    wprintf(L"anything.exe index --db <path> (--root <folder> | --all-drives) [--threads N] [--batch N] [--ntfs] [--tail]\n");
+}
+
+static BOOL parse_args(int argc, wchar_t** argv, Args* a){
+    ZeroMemory(a, sizeof(*a));
+    a->threads = 8; a->batch=50000; a->use_ntfs=FALSE; a->tail_changes=FALSE; a->all_drives=FALSE;
+    for(int i=1;i<argc;i++){
+        if(wcscmp(argv[i], L"index")==0){ continue; }
+        else if(wcscmp(argv[i], L"--db")==0 && i+1<argc){ wcscpy_s(a->dbPath, MAX_PATH, argv[++i]); }
+        else if(wcscmp(argv[i], L"--root")==0 && i+1<argc){ wcscpy_s(a->rootPath, MAX_LONG_PATH, argv[++i]); }
+        else if(wcscmp(argv[i], L"--threads")==0 && i+1<argc){ a->threads = _wtoi(argv[++i]); }
+        else if(wcscmp(argv[i], L"--batch")==0 && i+1<argc){ a->batch = _wtoi(argv[++i]); }
+        else if(wcscmp(argv[i], L"--ntfs")==0){ a->use_ntfs = TRUE; }
+        else if(wcscmp(argv[i], L"--tail")==0){ a->tail_changes = TRUE; }
+        else if(wcscmp(argv[i], L"--all-drives")==0){ a->all_drives = TRUE; }
+        else { usage(); return FALSE; }
+    }
+    if(!a->dbPath[0] || (!a->rootPath[0] && !a->all_drives)){ usage(); return FALSE; }
+    if(a->threads<1) a->threads=1; if(a->threads>MAX_THREADS) a->threads=MAX_THREADS;
+    if(a->batch<1000) a->batch=1000;
+    return TRUE;
+}
+
+static DWORD WINAPI scan_drive_thread(void* p){
+    struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = p;
+    NTFSScanner* nts = NULL;
+    GenericScanner* gen = NULL;
+    if(in->use_ntfs){
+        nts = NTFSScanner_Start(in->root, in->threads, &in->ctx->queue, in->ctx->cancel_event);
+    }
+    if(!nts){
+        gen = GenericScanner_Start(in->root, in->threads, &in->ctx->queue, in->ctx->cancel_event);
+    }
+    if(nts){ NTFSScanner_Wait(nts); NTFSScanner_Free(nts); }
+    if(gen){ GenericScanner_Wait(gen); GenericScanner_Free(gen); }
+    free(in);
+    return 0;
+}
+
+int wmain(int argc, wchar_t** argv){
+    Args args;
+    if(!parse_args(argc, argv, &args)) return 1;
+
+    Db* db=NULL;
+    if(!db_create(args.dbPath, /*init_mb*/1024, /*max_mb*/16384, &db)){
+        fwprintf(stderr, L"Failed to create/open DB at %s (err=%d)\n", args.dbPath, db?db_last_error(db):0);
         return 1;
     }
-    SYSTEM_INFO sysinfo;
-    GetSystemInfo(&sysinfo);
-    if (args.threads <= 0) args.threads = sysinfo.dwNumberOfProcessors;
 
-    printf("Starting scan: %S\n", args.startPath);
-    printf("Database: %S\n", args.dbPath);
-    printf("Threads: %d, Batch: %d, MapInit: %zu MB, MapMax: %zu MB\n",
-        args.threads, args.batch, args.map_init_mb, args.map_max_mb);
-
-    DbHandle* db = db_create(args.dbPath, args.map_init_mb*1024*1024, args.map_max_mb*1024*1024);
-    if (!db) {
-        fprintf(stderr, "Failed to create database.\n");
-        return 1;
+    WriterCtx ctx = {0};
+    ctx.db = db; ctx.batch_size = args.batch; ctx.done=FALSE; ctx.cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if(!MPMC_Init(&ctx.queue, 1<<16)){
+        fwprintf(stderr, L"MPMC_Init failed\n"); db_close(db); return 1;
     }
+    HANDLE writer = CreateThread(NULL,0,DbWriterThread,&ctx,0,NULL);
 
-    WriterCtx ctx;
-    ctx.db = db;
-    ctx.batch_size = args.batch;
-    ctx.done = FALSE;
-    if (!MPMC_Init(&ctx.queue, 1<<16)) {
-        fprintf(stderr, "Queue init failed\n");
-        return 1;
-    }
-    HANDLE writer = CreateThread(NULL, 0, DbWriterThread, &ctx, 0, NULL);
+    HANDLE drive_threads[26]; int drive_count=0;
+    // Incremental index state
+    IndexState st={0}; BOOL has_state = db_get_index_state(db, &st);
+    // TODO: compute drive signatures; for now, always scan (production: compare st.drive_signatures)
 
-    BOOL use_ntfs = args.force_ntfs;
-    BOOL use_generic = args.force_generic;
-    if (!use_ntfs && !use_generic) {
-        WCHAR fsname[MAX_PATH];
-        if (GetVolumeInformationW(args.startPath, NULL, 0, NULL, NULL, NULL, fsname, MAX_PATH)) {
-            if (_wcsicmp(fsname, L"NTFS") == 0) {
-                use_ntfs = TRUE;
-            } else {
-                use_generic = TRUE;
+    if(args.all_drives){
+        DWORD mask = GetLogicalDrives();
+        for(int i=0;i<26;i++){
+            if(mask & (1u<<i)){
+                wchar_t root[8]; swprintf(root, 8, L"%c:\\", L'A'+i);
+                UINT type = GetDriveTypeW(root);
+                if(type==DRIVE_FIXED || type==DRIVE_REMOVABLE){
+                    struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = (struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; }*)malloc(sizeof(*in));
+                    wcscpy_s(in->root, 8, root);
+                    in->ctx=&ctx; in->use_ntfs=args.use_ntfs; in->threads=args.threads;
+                    drive_threads[drive_count++] = CreateThread(NULL,0,scan_drive_thread,in,0,NULL);
+                }
             }
-        } else {
-            use_generic = TRUE;
+        }
+    } else {
+        struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = (struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; }*)malloc(sizeof(*in));
+        wcscpy_s(in->root, 8, args.rootPath);
+        in->ctx=&ctx; in->use_ntfs=args.use_ntfs; in->threads=args.threads;
+        drive_threads[drive_count++] = CreateThread(NULL,0,scan_drive_thread,in,0,NULL);
+    }
+
+    WaitForMultipleObjects(drive_count, drive_threads, TRUE, INFINITE);
+    for(int i=0;i<drive_count;i++) CloseHandle(drive_threads[i]);
+
+    if(args.tail_changes && !args.all_drives){
+        HANDLE tailer = StartUSNTailer(args.rootPath, &ctx.queue, ctx.cancel_event);
+        if(tailer){
+            wprintf(L"Tailing changes on %s. Press Ctrl+C to stop...\n", args.rootPath);
+            Sleep(5000); // demo
         }
     }
 
-    if (use_ntfs) {
-        IndexVolume_NTFS(args.startPath, &ctx, args.threads);
-    } else {
-        IndexVolume_Generic(args.startPath, &ctx, args.threads);
-    }
-
     ctx.done = TRUE;
+    MPMC_Push(&ctx.queue, NULL); // sentinel
     WaitForSingleObject(writer, INFINITE);
     CloseHandle(writer);
 
-    db_close(db);
-    const DbHeader* header = db_open_readonly(args.dbPath, &db);
-    if (header) {
-        printf("Total records: %llu\n", (unsigned long long)header->record_count);
-        db_close(db);
+    const DbHeader* header = db_header(db);
+    if(header){
+        wprintf(L"Total records: %llu, strings: %llu, map: %llu MiB\n",
+            (unsigned long long)header->record_count,
+            (unsigned long long)header->string_count,
+            (unsigned long long)(header->map_size_bytes/1024/1024));
     }
-
+    db_close(db);
     MPMC_Destroy(&ctx.queue);
+    CloseHandle(ctx.cancel_event);
     return 0;
 }

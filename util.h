@@ -1,0 +1,32 @@
+
+#ifndef UTIL_H
+#define UTIL_H
+#include <windows.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <wchar.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void lowercase_ascii(char* s, size_t n);
+void lowercase_wchar(wchar_t* s);
+BOOL path_join(wchar_t* dst, size_t dstcch, const wchar_t* a, const wchar_t* b);
+BOOL path_dirname(const wchar_t* path, wchar_t* out, size_t outcch);
+BOOL get_drive_root(const wchar_t* any_path, wchar_t* root, size_t cch);
+uint64_t filetime_days(uint64_t ft);
+BOOL get_file_info_basic(const wchar_t* full, uint32_t* attrs, uint64_t* size, uint64_t* ctime, uint64_t* mtime, uint64_t* atime);
+void split_extension_utf8(const char* name_utf8, char* ext_out, size_t ext_len);
+void to_utf8(const wchar_t* w, char* u8, size_t u8cap);
+void to_wide(const char* u8, wchar_t* w, size_t wcap);
+uint64_t hash64(const void* data, size_t len);
+
+// SIMD search
+BOOL is_avx2_supported(void);
+BOOL avx2_contains(const char* haystack, size_t hlen, const char* needle, size_t nlen);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
