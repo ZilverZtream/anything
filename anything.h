@@ -82,6 +82,15 @@ typedef struct DbWorkItem {
 #define WI_ADD    0
 #define WI_DELETE 1
 
+typedef struct LiveUpdate {
+    wchar_t  parent_path[MAX_LONG_PATH];
+    wchar_t  name[MAX_PATH];
+    uint8_t  op;
+} LiveUpdate;
+
+void live_updates_init(void);
+BOOL live_updates_poll(LiveUpdate* out);
+
 // ---- MPMC lock-free queue (Vyukov) ----
 typedef struct MPMCCell {
     volatile LONG64 seq;
