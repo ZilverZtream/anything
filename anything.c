@@ -585,13 +585,13 @@ static DWORD WINAPI DbWriterThread(void* p){
         }
         if(item == NULL) break; // sentinel
         DbWorkItem* wi = (DbWorkItem*)item;
-        if(wi->stage == 1 || wi->op == WI_DELETE) push_live_update(wi);
+        if(wi->stage == INDEX_NAMES_ONLY || wi->op == WI_DELETE) push_live_update(wi);
         if(wi->op == WI_DELETE){
             db_delete_path(ctx->db, wi->parent_path, wi->name);
             _aligned_free(wi);
             continue;
         }
-        if(wi->stage == 1){
+        if(wi->stage == INDEX_NAMES_ONLY){
             DbRecord r = {0};
             r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
             r.parent_str_id = db_intern_wstring(ctx->db, wi->parent_path);
@@ -605,11 +605,11 @@ static DWORD WINAPI DbWriterThread(void* p){
                 wcscpy_s(next->name, MAX_PATH, wi->name);
                 next->file_size = next->creation_time = next->modified_time = next->access_time = 0;
                 next->attributes = wi->attributes;
-                next->stage = 2; next->op = WI_ADD;
+                next->stage = INDEX_METADATA_LIGHT; next->op = WI_ADD;
                 while(!MPMC_Push(&ctx->queue, next)) Sleep(0);
             }
             _aligned_free(wi);
-        } else if(wi->stage == 2){
+        } else if(wi->stage == INDEX_METADATA_LIGHT){
             DbRecord r = {0};
             r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
             r.parent_str_id = db_intern_wstring(ctx->db, wi->parent_path);
@@ -632,12 +632,12 @@ static DWORD WINAPI DbWriterThread(void* p){
                     wcscpy_s(next->name, MAX_PATH, wi->name);
                     next->file_size = sz; next->creation_time=ct; next->modified_time=mt; next->access_time=at;
                     next->attributes = attrs;
-                    next->stage = 3; next->op = WI_ADD;
+                    next->stage = INDEX_FULL_CONTENT; next->op = WI_ADD;
                     while(!MPMC_Push(&ctx->queue, next)) Sleep(0);
                 }
             }
             _aligned_free(wi);
-        } else { // stage 3 content
+        } else { // full content stage
             DbRecord existing;
             if(db_get_record_by_path(ctx->db, wi->parent_path, wi->name, &existing)){
                 if(existing.type == DB_REC_FILE){
@@ -773,6 +773,7 @@ int wmain(int argc, wchar_t** argv){
     HANDLE drive_threads[26]; int drive_count=0;
     // Incremental index state
     IndexState st={0}; BOOL has_state = db_get_index_state(db, &st);
+    if(!has_state || st.indexing_level == 0) st.indexing_level = INDEX_FULL_CONTENT;
     uint8_t current_sigs[26][32];
     ZeroMemory(current_sigs, sizeof(current_sigs));
     for(int i=0;i<26;i++){

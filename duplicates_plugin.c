@@ -108,7 +108,7 @@ static void emit_duplicates(void){
                 wi->modified_time = g_files[k].mtime;
                 wi->access_time   = g_files[k].atime;
                 wi->attributes    = g_files[k].attrs;
-                wi->stage         = 2;
+                wi->stage         = INDEX_METADATA_LIGHT;
                 wi->op            = WI_ADD;
                 wi->content = NULL;
                 wi->preview = NULL;
