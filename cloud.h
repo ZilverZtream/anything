@@ -6,7 +6,12 @@
 extern "C" {
 #endif
 
-typedef enum { CLOUD_ONEDRIVE, CLOUD_GOOGLE_DRIVE, CLOUD_DROPBOX } CloudProvider;
+typedef enum {
+    CLOUD_ONEDRIVE,
+    CLOUD_GOOGLE_DRIVE,
+    CLOUD_PCLOUD,
+    CLOUD_DROPBOX
+} CloudProvider;
 BOOL CloudScanner_Start(CloudProvider provider, const char* auth_token, Db* db);
 
 #ifdef __cplusplus
