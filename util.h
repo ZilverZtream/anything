@@ -21,6 +21,8 @@ void split_extension_utf8(const char* name_utf8, char* ext_out, size_t ext_len);
 void to_utf8(const wchar_t* w, char* u8, size_t u8cap);
 void to_wide(const char* u8, wchar_t* w, size_t wcap);
 uint64_t hash64(const void* data, size_t len);
+void compute_drive_signature(const wchar_t* drive, uint8_t sig[32]);
+float bm25_score(int tf, int doc_len, float avg_doc_len, int docs_total, int docs_with_term);
 
 // SIMD search
 BOOL is_avx2_supported(void);

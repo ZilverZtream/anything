@@ -3,6 +3,8 @@
 #include <shlwapi.h>
 #include <string.h>
 #include <immintrin.h>
+#include <stdio.h>
+#include <math.h>
 #pragma comment(lib, "shlwapi.lib")
 
 void lowercase_ascii(char* s, size_t n){
@@ -133,4 +135,43 @@ BOOL avx2_contains(const char* haystack, size_t hlen, const char* needle, size_t
         }
     }
     return FALSE;
+}
+
+void compute_drive_signature(const wchar_t* drive, uint8_t sig[32]){
+    if(!drive || !sig){ return; }
+    wchar_t vol[64];
+    DWORD serial=0,max_comp=0,flags=0;
+    if(!GetVolumeInformationW(drive, vol, 64, &serial, &max_comp, &flags, NULL, 0)){
+        memset(sig,0,32);
+        return;
+    }
+    ULARGE_INTEGER freeb,totalb;
+    if(!GetDiskFreeSpaceExW(drive, &freeb, &totalb, NULL)){
+        memset(sig,0,32);
+        return;
+    }
+    char vol_utf8[128];
+    to_utf8(vol, vol_utf8, sizeof(vol_utf8));
+    char data[256];
+    sprintf_s(data, sizeof(data), "%08X:%s:%llu", serial, vol_utf8, totalb.QuadPart);
+    uint64_t h1 = hash64(data, strlen(data));
+    uint64_t h2 = hash64(&h1, sizeof(h1));
+    uint64_t h3 = hash64(&h2, sizeof(h2));
+    uint64_t h4 = hash64(&h3, sizeof(h3));
+    memcpy(sig, &h1, 8);
+    memcpy(sig+8, &h2, 8);
+    memcpy(sig+16, &h3, 8);
+    memcpy(sig+24, &h4, 8);
+}
+
+float bm25_score(int tf, int doc_len, float avg_doc_len, int docs_total, int docs_with_term){
+    const float k1 = 1.5f;
+    const float b = 0.75f;
+    if(tf<=0 || doc_len<=0 || avg_doc_len<=0.0f || docs_total<=0 || docs_with_term<=0){
+        return 0.0f;
+    }
+    float idf = logf(( (float)docs_total - (float)docs_with_term + 0.5f) /
+                     ((float)docs_with_term + 0.5f) + 1.0f);
+    float denom = (float)tf + k1 * (1.0f - b + b * ((float)doc_len / avg_doc_len));
+    return idf * ((float)tf * (k1 + 1.0f) / denom);
 }
