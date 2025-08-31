@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <shlwapi.h>
+#include <immintrin.h>
 #pragma comment(lib, "shlwapi.lib")
 
 #include "database.h"
@@ -296,6 +297,41 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
 
 // ---- Trigram helpers ----
 
+static void extract_trigrams(const char* text, uint32_t** out_tris, size_t* out_count){
+    size_t len = strlen(text);
+    if(len < 3){ *out_tris = NULL; *out_count = 0; return; }
+    size_t need = len - 2;
+    static uint32_t* pool = NULL;
+    static size_t pool_cap = 0;
+    if(pool_cap < need){
+        uint32_t* nb = (uint32_t*)realloc(pool, need * sizeof(uint32_t));
+        if(!nb){ *out_tris = NULL; *out_count = 0; return; }
+        pool = nb; pool_cap = need;
+    }
+#if defined(__SSE4_1__)
+    size_t i = 0;
+    size_t simd_end = (len >= 16) ? len - 16 : 0;
+    for(; i <= simd_end; i += 4){
+        __m128i bytes = _mm_loadu_si128((const __m128i*)(text + i));
+        __m128i b0 = _mm_cvtepu8_epi32(bytes);
+        __m128i b1 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes,1));
+        __m128i b2 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes,2));
+        __m128i t  = _mm_or_si128(_mm_slli_epi32(b0,16),
+                          _mm_or_si128(_mm_slli_epi32(b1,8), b2));
+        _mm_storeu_si128((__m128i*)(pool + i), t);
+    }
+    for(; i < need; ++i){
+        pool[i] = ((uint8_t)text[i]<<16)|((uint8_t)text[i+1]<<8)|((uint8_t)text[i+2]);
+    }
+#else
+    for(size_t i=0;i<need;i++){
+        pool[i]=((uint8_t)text[i]<<16)|((uint8_t)text[i+1]<<8)|((uint8_t)text[i+2]);
+    }
+#endif
+    *out_tris = pool;
+    *out_count = need;
+}
+
 static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     size_t len = strlen(name_u8);
     if(len < 3) return;
@@ -303,10 +339,13 @@ static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     memcpy(tmp, name_u8, len+1);
     lowercase_ascii(tmp, len);
 
+    uint32_t* tris; size_t tri_n;
+    extract_trigrams(tmp, &tris, &tri_n);
+
     // Deduplicate trigrams to avoid duplicate index entries
     uint32_t seen[256]; UINT seen_n=0;
-    for(size_t i=0;i+3<=len;i++){
-        uint32_t key = ((uint8_t)tmp[i]<<16)|((uint8_t)tmp[i+1]<<8)|((uint8_t)tmp[i+2]);
+    for(size_t i=0;i<tri_n;i++){
+        uint32_t key = tris[i];
         BOOL dup=FALSE;
         for(UINT j=0;j<seen_n;j++){ if(seen[j]==key){ dup=TRUE; break; } }
         if(dup) continue;
@@ -325,9 +364,13 @@ static void remove_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     char* tmp = (char*)_malloca(len+1);
     memcpy(tmp, name_u8, len+1);
     lowercase_ascii(tmp, len);
+
+    uint32_t* tris; size_t tri_n;
+    extract_trigrams(tmp, &tris, &tri_n);
+
     uint32_t seen[256]; UINT seen_n=0;
-    for(size_t i=0;i+3<=len;i++){
-        uint32_t key = ((uint8_t)tmp[i]<<16)|((uint8_t)tmp[i+1]<<8)|((uint8_t)tmp[i+2]);
+    for(size_t i=0;i<tri_n;i++){
+        uint32_t key = tris[i];
         BOOL dup=FALSE;
         for(UINT j=0;j<seen_n;j++){ if(seen[j]==key){ dup=TRUE; break; } }
         if(dup) continue;
