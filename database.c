@@ -237,6 +237,7 @@ BOOL db_commit_write(Db* db_){
     if(rc==0){
         d->header_cache.updated_time = now_filetime();
         d->header_cache.map_size_bytes = db_current_mapsize(db_);
+        mdb_env_sync(d->env, 1);
     }
     return rc==0;
 }
