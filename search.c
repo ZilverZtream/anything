@@ -22,12 +22,15 @@
 
 typedef struct {
     char* name_pattern;
+    char* content_pattern;
+    char* author;
     uint64_t size_min, size_max;
     uint64_t date_min_day, date_max_day;
     char* path_filter;   // utf8
     char* ext;           // utf8
     bool regex_mode;
     bool whole_word;
+    uint64_t author_str_id;
 } SearchQuery;
 
 static void usage(void){
@@ -124,6 +127,10 @@ static void parse_query(int argc, wchar_t** argv, wchar_t* dbPath, SearchQuery* 
         } else if(_strnicmp(u8,"ext:",4)==0){
             q->ext = _strdup(u8+4);
             lowercase_ascii(q->ext, strlen(q->ext));
+        } else if(_strnicmp(u8,"content:",8)==0){
+            q->content_pattern = _strdup(u8+8);
+        } else if(_strnicmp(u8,"author:",7)==0){
+            q->author = _strdup(u8+7);
         } else if(_strnicmp(u8,"regex:",6)==0){
             q->regex_mode = true;
             q->name_pattern = _strdup(u8+6);
@@ -246,6 +253,7 @@ static DWORD WINAPI filter_worker_thread(void* p){
         if(r->file_size < a->q->size_min || r->file_size > a->q->size_max) continue;
         uint64_t day = filetime_days(r->modified_time);
         if(day < a->q->date_min_day || day > a->q->date_max_day) continue;
+        if(a->q->author_str_id && r->author_str_id != a->q->author_str_id) continue;
         MDB_val pk={.mv_data=&r->parent_str_id,.mv_size=sizeof(r->parent_str_id)}, pv;
         MDB_val nk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, nv;
         if(mdb_get(txn, dbi_strings, &pk, &pv)!=0) continue;
@@ -402,7 +410,7 @@ int wmain(int argc, wchar_t** argv){
     char u8db[MAX_PATH*3]; to_utf8(dbPath,u8db,sizeof(u8db));
     if(mdb_env_open(env, u8db, MDB_RDONLY, 0664)!=0){ fwprintf(stderr,L"env_open failed\n"); return 1; }
     if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ fwprintf(stderr,L"txn_begin failed\n"); return 1; }
-    MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_date, dbi_ext, dbi_smeta;
+    MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_strrev;
     if(mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
        mdb_dbi_open(txn,"records",0,&dbi_records)!=0 ||
        mdb_dbi_open(txn,"filename_index",0,&dbi_fname_index)!=0 ||
@@ -410,12 +418,28 @@ int wmain(int argc, wchar_t** argv){
        mdb_dbi_open(txn,"size_index",0,&dbi_size)!=0 ||
        mdb_dbi_open(txn,"date_index",0,&dbi_date)!=0 ||
        mdb_dbi_open(txn,"extension_index",0,&dbi_ext)!=0 ||
-       mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0){
+       mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0 ||
+       mdb_dbi_open(txn,"content_index",0,&dbi_content)!=0 ||
+       mdb_dbi_open(txn,"author_index",0,&dbi_author)!=0 ||
+       mdb_dbi_open(txn,"strrev",0,&dbi_strrev)!=0){
         fwprintf(stderr,L"dbi_open failed\n"); mdb_txn_abort(txn); mdb_env_close(env); return 1;
     }
 
-    // Step 1: candidate name string_ids via trigram
+    if(q.author){
+        wchar_t wtmp[256]; to_wide(q.author, wtmp, 256);
+        int need = WideCharToMultiByte(CP_UTF8,0,wtmp,-1,NULL,0,NULL,NULL);
+        if(need>0){
+            char* u8 = (char*)_malloca(need);
+            WideCharToMultiByte(CP_UTF8,0,wtmp,-1,u8,need,NULL,NULL);
+            MDB_val k={.mv_data=u8,.mv_size=(size_t)(need-1)}, v;
+            if(mdb_get(txn, dbi_strrev, &k, &v)==0){ q.author_str_id = *(uint64_t*)v.mv_data; }
+            _freea(u8);
+        }
+    }
+
+    // Step 1: candidate string_ids via trigram
     IdVec name_ids; idvec_init(&name_ids);
+    IdVec content_ids; idvec_init(&content_ids);
     if(q.name_pattern){
         collect_trigram_candidates(txn, dbi_trigram, q.name_pattern, &name_ids);
         sort_unique(&name_ids);
@@ -451,48 +475,68 @@ int wmain(int argc, wchar_t** argv){
         name_ids.n=keep;
         _freea(tl);
     }
-
+    }
+    if(q.content_pattern){
+        collect_trigram_candidates(txn, dbi_trigram, q.content_pattern, &content_ids);
+        sort_unique(&content_ids);
     }
 
-    // Step 2: expand to record ids via filename_index
+    // Step 2: expand to record ids via indices
     IdVec rec_ids; idvec_init(&rec_ids);
-    MDB_cursor* cix=NULL; mdb_cursor_open(txn, dbi_fname_index, &cix);
-    if(name_ids.n>0){
-        for(size_t i=0;i<name_ids.n;i++){
-            MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
-            if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY)==0){
-                do{ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP)==0);
-            }
-        }
-    } else if(q.name_pattern){
-        // No trigram narrowing (too short): fallback to full scan of strings to find matching names, then map via filename_index
-        MDB_cursor* cs=NULL; mdb_cursor_open(txn, dbi_strings, &cs);
-        MDB_val sk, sv; int rc = mdb_cursor_get(cs, &sk, &sv, MDB_FIRST);
-        char* npat = _strdup(q.name_pattern); lowercase_ascii(npat, strlen(npat));
-        while(rc==0){
-            uint64_t sid = *(uint64_t*)sk.mv_data;
-            char* name = (char*)sv.mv_data; size_t nlen = sv.mv_size;
-            char* tmp = (char*)_malloca(nlen+1); memcpy(tmp,name,nlen); tmp[nlen]=0; lowercase_ascii(tmp,nlen);
-            if(strstr(tmp, npat)){
-                MDB_val k={.mv_data=&sid,.mv_size=sizeof(sid)}, v;
+    if(name_ids.n>0 || q.name_pattern){
+        MDB_cursor* cix=NULL; mdb_cursor_open(txn, dbi_fname_index, &cix);
+        if(name_ids.n>0){
+            for(size_t i=0;i<name_ids.n;i++){
+                MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
                 if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY)==0){
                     do{ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP)==0);
                 }
             }
-            _freea(tmp);
-            rc = mdb_cursor_get(cs, &sk, &sv, MDB_NEXT);
+        } else {
+            // No trigram narrowing (too short): fallback to full scan of strings to find matching names
+            MDB_cursor* cs=NULL; mdb_cursor_open(txn, dbi_strings, &cs);
+            MDB_val sk, sv; int rc = mdb_cursor_get(cs, &sk, &sv, MDB_FIRST);
+            char* npat = _strdup(q.name_pattern); lowercase_ascii(npat, strlen(npat));
+            while(rc==0){
+                uint64_t sid = *(uint64_t*)sk.mv_data;
+                char* name = (char*)sv.mv_data; size_t nlen = sv.mv_size;
+                char* tmp = (char*)_malloca(nlen+1); memcpy(tmp,name,nlen); tmp[nlen]=0; lowercase_ascii(tmp,nlen);
+                if(strstr(tmp, npat)){
+                    MDB_val k={.mv_data=&sid,.mv_size=sizeof(sid)}, v;
+                    if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY)==0){
+                        do{ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP)==0);
+                    }
+                }
+                _freea(tmp);
+                rc = mdb_cursor_get(cs, &sk, &sv, MDB_NEXT);
+            }
+            mdb_cursor_close(cs);
+            free(npat);
         }
-        mdb_cursor_close(cs);
-        free(npat);
-    } else {
-        // No name term: user may only filter by size/date/ext/path; start from all records by iterating size_index or date_index; choose smaller range
-        // We'll just iterate date_index today
+        mdb_cursor_close(cix);
+    }
+
+    if(q.content_pattern){
+        IdVec crec; idvec_init(&crec);
+        MDB_cursor* cc=NULL; mdb_cursor_open(txn, dbi_content, &cc);
+        for(size_t i=0;i<content_ids.n;i++){
+            MDB_val k={.mv_data=&content_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
+            if(mdb_cursor_get(cc,&k,&v,MDB_SET_KEY)==0){
+                do{ idvec_push(&crec, *(uint64_t*)v.mv_data); } while(mdb_cursor_get(cc,&k,&v,MDB_NEXT_DUP)==0);
+            }
+        }
+        mdb_cursor_close(cc);
+        sort_unique(&crec);
+        if(rec_ids.n>0){ intersect_inplace(&rec_ids, &crec); idvec_free(&crec); }
+        else { rec_ids = crec; }
+    }
+
+    if(rec_ids.n==0 && !q.name_pattern && !q.content_pattern){
         MDB_cursor* cd=NULL; mdb_cursor_open(txn, dbi_date, &cd);
         MDB_val k,v; int rc = mdb_cursor_get(cd, &k, &v, MDB_FIRST);
         while(rc==0){ idvec_push(&rec_ids, *(uint64_t*)v.mv_data); rc = mdb_cursor_get(cd, &k, &v, MDB_NEXT); }
         mdb_cursor_close(cd);
     }
-    mdb_cursor_close(cix);
     sort_unique(&rec_ids);
 
     MDB_stat st; mdb_stat(txn, dbi_records, &st);

@@ -75,6 +75,8 @@ typedef struct {
     MDB_dbi  dbi_path_hierarchy;  // key: parent_id  → rec_id (dups)
     MDB_dbi  dbi_trigram_index;   // key: 3 bytes    → string_id (dups)
     MDB_dbi  dbi_string_meta;    // key: string_id   → bloom+meta
+    MDB_dbi  dbi_content_index;  // key: content_str_id → rec_id (dups)
+    MDB_dbi  dbi_author_index;   // key: author_str_id  → rec_id (dups)
     MDB_txn* wtxn;
     int      last_err;
     size_t   map_init;
@@ -111,6 +113,8 @@ static int open_core_dbs(MDB_txn* txn, DbImpl* d, BOOL create){
     if((rc = mdb_dbi_open(txn, "path_hierarchy", flags|MDB_DUPSORT, &d->dbi_path_hierarchy))) return rc;
     if((rc = mdb_dbi_open(txn, "trigram_index", flags|MDB_DUPSORT, &d->dbi_trigram_index))) return rc;
     if((rc = mdb_dbi_open(txn, "string_meta", flags|MDB_CREATE, &d->dbi_string_meta))) return rc;
+    if((rc = mdb_dbi_open(txn, "content_index", flags|MDB_DUPSORT, &d->dbi_content_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "author_index", flags|MDB_DUPSORT, &d->dbi_author_index))) return rc;
     return 0;
 }
 
@@ -382,6 +386,26 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
                 if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
             }
             emit_trigrams(d, (const char*)namev.mv_data, r->name_str_id);
+        }
+        if(r->content_str_id){
+            MDB_val cv;
+            if(str_by_id(d, d->wtxn, r->content_str_id, &cv)){
+                MDB_val mk={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, mv;
+                if(mdb_get(d->wtxn, d->dbi_string_meta, &mk, &mv)!=0){
+                    StringMeta sm; build_bloom_for_name((const char*)cv.mv_data, &sm);
+                    MDB_val smv={.mv_data=&sm,.mv_size=sizeof(sm)};
+                    mdb_put(d->wtxn, d->dbi_string_meta, &mk, &smv, 0);
+                }
+                emit_trigrams(d, (const char*)cv.mv_data, r->content_str_id);
+            }
+            MDB_val ck={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, cvv={.mv_data=&id,.mv_size=sizeof(id)};
+            rc = mdb_put(d->wtxn, d->dbi_content_index, &ck, &cvv, MDB_NODUPDATA);
+            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        }
+        if(r->author_str_id){
+            MDB_val ak={.mv_data=&r->author_str_id,.mv_size=sizeof(r->author_str_id)}, av={.mv_data=&id,.mv_size=sizeof(id)};
+            rc = mdb_put(d->wtxn, d->dbi_author_index, &ak, &av, MDB_NODUPDATA);
+            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
         }
     }
     // update header

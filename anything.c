@@ -16,6 +16,25 @@
 #include "util.h"
 
 // ---- MPMC queue implementation ----
+static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t* name, uint64_t* author_out){
+    *author_out = 0;
+    wchar_t path[MAX_LONG_PATH];
+    _snwprintf(path, MAX_LONG_PATH, L"%s\\%s", parent, name);
+    FILE* f = _wfopen(path, L"rb");
+    if(!f) return 0;
+    char buf[8192+1]; size_t n = fread(buf,1,8192,f); buf[n]=0; fclose(f);
+    char* a = StrStrIA(buf, "author:");
+    if(a){
+        a+=7; while(*a==' '||*a=='\t') a++;
+        char tmp[256]; size_t len=0; while(a[len] && a[len]!='\r' && a[len]!='\n' && len<255) len++;
+        memcpy(tmp,a,len); tmp[len]=0;
+        wchar_t wa[256]; to_wide(tmp, wa, 256);
+        *author_out = db_intern_wstring(db, wa);
+    }
+    wchar_t wbuf[4096];
+    MultiByteToWideChar(CP_UTF8,0,buf,-1,wbuf,4096);
+    return db_intern_wstring(db, wbuf);
+}
 BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size){
     if(!q) return FALSE;
     LONG size=1; while(size<pow2_size) size<<=1;
@@ -138,6 +157,9 @@ static DWORD WINAPI DbWriterThread(void* p){
         r.modified_time = wi->modified_time;
         r.access_time   = wi->access_time;
         r.attributes    = wi->attributes;
+        if(r.type == DB_REC_FILE){
+            r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id);
+        }
         _aligned_free(wi);
 
         buf[in_batch++] = r;

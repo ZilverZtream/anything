@@ -12,12 +12,14 @@ It scans drives (via NTFS USN journal or generic directory walking), stores file
   - File size
   - Modified date
   - Extension
+  - Author metadata
+  - Content snippets
   - Path hierarchy
   - Trigram-based full-text search
 - Bloom filters for quick name filtering.
 - Command-line tools:
   - `anything.exe index` — build or update the database
-  - `search.exe` — query the database with filters (size, date, path, extension, regex, etc.)
+  - `search.exe` — query the database with filters (size, date, path, extension, author, content phrases, regex, etc.)
 
 ## Build
 This project is written in **C** for Windows.
@@ -29,3 +31,4 @@ This project is written in **C** for Windows.
 ### Example Build Command (Visual Studio Developer Command Prompt)
 ```bat
 cl /O2 /MD anything.c database.c exfat.c ntfs.c search.c util.c lmdb.lib shlwapi.lib
+```
