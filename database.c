@@ -69,8 +69,10 @@ typedef struct {
     MDB_dbi  dbi_records;
     MDB_dbi  dbi_fname_index;
     MDB_dbi  dbi_parent_index;
-    MDB_dbi  dbi_size_index;      // key: uint64 size → rec_id (dups)
-    MDB_dbi  dbi_date_index;      // key: uint64 day  → rec_id (dups)
+    MDB_dbi  dbi_size_index;      // key: uint64 size        → rec_id (dups)
+    MDB_dbi  dbi_date_index;      // key: uint64 day         → rec_id (dups)
+    MDB_dbi  dbi_mtime_index;     // key: uint64 modified    → rec_id (dups)
+    MDB_dbi  dbi_attr_index;      // key: uint32 attributes  → rec_id (dups)
     MDB_dbi  dbi_extension_index; // key: utf8 ext   → rec_id (dups)
     MDB_dbi  dbi_path_hierarchy;  // key: parent_id  → rec_id (dups)
     MDB_dbi  dbi_trigram_index;   // key: 3 bytes    → string_id (dups)
@@ -112,8 +114,10 @@ static int open_core_dbs(MDB_txn* txn, DbImpl* d, BOOL create){
     if((rc = mdb_dbi_open(txn, "records", flags, &d->dbi_records))) return rc;
     if((rc = mdb_dbi_open(txn, "filename_index", flags|MDB_DUPSORT, &d->dbi_fname_index))) return rc;
     if((rc = mdb_dbi_open(txn, "parent_index", flags|MDB_DUPSORT, &d->dbi_parent_index))) return rc;
-    if((rc = mdb_dbi_open(txn, "size_index", flags|MDB_DUPSORT, &d->dbi_size_index))) return rc;
-    if((rc = mdb_dbi_open(txn, "date_index", flags|MDB_DUPSORT, &d->dbi_date_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "size_index", flags|MDB_DUPSORT|MDB_INTEGERKEY, &d->dbi_size_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "date_index", flags|MDB_DUPSORT|MDB_INTEGERKEY, &d->dbi_date_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "mtime_index", flags|MDB_DUPSORT|MDB_INTEGERKEY, &d->dbi_mtime_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "attr_index", flags|MDB_DUPSORT|MDB_INTEGERKEY, &d->dbi_attr_index))) return rc;
     if((rc = mdb_dbi_open(txn, "extension_index", flags|MDB_DUPSORT, &d->dbi_extension_index))) return rc;
     if((rc = mdb_dbi_open(txn, "path_hierarchy", flags|MDB_DUPSORT, &d->dbi_path_hierarchy))) return rc;
     if((rc = mdb_dbi_open(txn, "trigram_index", flags|MDB_DUPSORT, &d->dbi_trigram_index))) return rc;
@@ -385,6 +389,14 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
         MDB_val dk,dv; to_mdb_val(&day, sizeof(day), &dk); to_mdb_val(&id, sizeof(id), &dv);
         rc = mdb_put(d->wtxn, d->dbi_date_index, &dk, &dv, MDB_NODUPDATA);
         if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        // mtime_index
+        MDB_val mk,mv; to_mdb_val(&r->modified_time, sizeof(r->modified_time), &mk); to_mdb_val(&id, sizeof(id), &mv);
+        rc = mdb_put(d->wtxn, d->dbi_mtime_index, &mk, &mv, MDB_NODUPDATA);
+        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        // attributes index
+        MDB_val ak,av; to_mdb_val(&r->attributes, sizeof(r->attributes), &ak); to_mdb_val(&id, sizeof(id), &av);
+        rc = mdb_put(d->wtxn, d->dbi_attr_index, &ak, &av, MDB_NODUPDATA);
+        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
         // extension_index & trigrams from name
         // Fetch UTF-8 name by id
         MDB_val namev;
@@ -478,6 +490,10 @@ static BOOL db_delete_record(DbImpl* d, uint64_t id, const DbRecord* r){
     uint64_t day = filetime_days(r->modified_time);
     MDB_val dk,dv; to_mdb_val(&day, sizeof(day), &dk); to_mdb_val(&id, sizeof(id), &dv);
     mdb_del(d->wtxn, d->dbi_date_index, &dk, &dv);
+    MDB_val mk,mv; to_mdb_val(&r->modified_time, sizeof(r->modified_time), &mk); to_mdb_val(&id, sizeof(id), &mv);
+    mdb_del(d->wtxn, d->dbi_mtime_index, &mk, &mv);
+    MDB_val ak,av; to_mdb_val(&r->attributes, sizeof(r->attributes), &ak); to_mdb_val(&id, sizeof(id), &av);
+    mdb_del(d->wtxn, d->dbi_attr_index, &ak, &av);
 
     MDB_val namev;
     if(str_by_id(d, d->wtxn, r->name_str_id, &namev)){
