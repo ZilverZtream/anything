@@ -9,6 +9,7 @@
 #include <shlwapi.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <math.h>
 #pragma comment(lib, "shlwapi.lib")
 
 #include "database.h"
@@ -19,6 +20,16 @@
 #ifdef HAS_PCRE2
 #include <pcre2.h>
 #endif
+
+// Mirror of the metadata structure stored in the database for each string.
+typedef struct {
+    uint32_t trigram_count;
+    uint32_t term_freq;
+    uint32_t doc_length;
+    uint8_t  bloom[8192];
+} StringMeta;
+
+static float bm25_score(const StringMeta* sm, uint64_t doc_count, double avgdl, uint64_t df);
 
 typedef struct {
     char* name_pattern;
@@ -235,7 +246,7 @@ static DWORD WINAPI filter_worker_thread(void* p){
     MDB_env* env; mdb_env_create(&env); mdb_env_set_maxdbs(env,64);
     mdb_env_open(env, a->db_path, MDB_RDONLY, 0664);
     MDB_txn* txn; mdb_txn_begin(env,NULL,MDB_RDONLY,&txn);
-    MDB_dbi dbi_strings, dbi_records; mdb_dbi_open(txn,"strings",0,&dbi_strings); mdb_dbi_open(txn,"records",0,&dbi_records);
+    MDB_dbi dbi_strings, dbi_records, dbi_smeta; mdb_dbi_open(txn,"strings",0,&dbi_strings); mdb_dbi_open(txn,"records",0,&dbi_records); mdb_dbi_open(txn,"string_meta",0,&dbi_smeta);
     for(size_t i=a->start;i<a->end;i++){
         uint64_t rid = a->ids[i];
         MDB_val rk={.mv_data=&rid,.mv_size=sizeof(rid)}, rv;
@@ -250,6 +261,9 @@ static DWORD WINAPI filter_worker_thread(void* p){
         if(mdb_get(txn, dbi_strings, &nk, &nv)!=0) continue;
         char* parent = (char*)pv.mv_data;
         char* name = (char*)nv.mv_data;
+        MDB_val mk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, mv;
+        if(mdb_get(txn, dbi_smeta, &mk, &mv)!=0 || mv.mv_size<sizeof(StringMeta)) continue;
+        StringMeta* sm = (StringMeta*)mv.mv_data;
         if(a->q->ext){ char ext[32]; split_extension_utf8(name, ext, sizeof(ext)); if(_stricmp(ext, a->q->ext)!=0) continue; }
         if(a->q->path_filter){ if(strncmp(parent,a->q->path_filter,strlen(a->q->path_filter))!=0) continue; }
         if(a->q->name_pattern){ char* tmp=_strdup(name); lowercase_ascii(tmp,strlen(tmp)); char* pat=_strdup(a->q->name_pattern);
@@ -257,7 +271,7 @@ static DWORD WINAPI filter_worker_thread(void* p){
             free(tmp); free(pat);
             if(!ok) continue;
         }
-        float score = calculate_relevance(r, parent, name, a->q);
+        float score = bm25_score(sm, a->doc_count, a->avg_dl, a->df);
         AcquireSRWLockExclusive(a->lock);
         a->out[*a->outn].rec_id = rid; a->out[*a->outn].score = score; (*a->outn)++;
         ReleaseSRWLockExclusive(a->lock);
@@ -272,35 +286,17 @@ static int cmp_rank(const void* A, const void* B){
     float b = ((const RankedResult*)B)->score;
     return (a<b) - (a>b);
 }
-static int count_slashes(const char* s){
-    int c=0; for(;*s;s++){ if(*s=='\\' || *s=='/') c++; } return c;
-}
-static BOOL name_exact_prefix(const char* name, const char* pat, BOOL* exact, BOOL* prefix){
-    size_t nl=strlen(name), pl=strlen(pat);
-    *exact = (nl==pl && _stricmp(name, pat)==0);
-    *prefix = (nl>=pl && _strnicmp(name, pat, pl)==0);
-    return TRUE;
-}
-static BOOL is_executable_ext(const char* name){
-    const char* dot = strrchr(name,'.'); if(!dot) return FALSE;
-    const char* exts[] = {"exe","bat","cmd","ps1","msi","com"};
-    char ext[16]; size_t n=strlen(dot+1); if(n>15)n=15; memcpy(ext,dot+1,n); ext[n]=0; lowercase_ascii(ext,n);
-    for(int i=0;i<6;i++){ if(strcmp(ext, exts[i])==0) return TRUE; } return FALSE;
-}
-static float calculate_relevance(const DbRecord* r, const char* parent_utf8, const char* name_utf8, const SearchQuery* q){
-    float score = 100.0f;
-    if(q->name_pattern){
-        BOOL ex=FALSE, pr=FALSE; name_exact_prefix(name_utf8, q->name_pattern, &ex, &pr);
-        if(ex) score += 50.0f; else if(pr) score += 25.0f;
-    }
-    int depth = count_slashes(parent_utf8);
-    score -= (float)depth * 2.0f;
-    uint64_t days_old = today_day() - filetime_days(r->modified_time);
-    if(days_old < 7) score += 20.0f; else if(days_old < 30) score += 10.0f;
-    if(is_executable_ext(name_utf8)) score += 15.0f;
-    // size heuristic
-    if(r->file_size>0 && r->file_size < 4096) score -= 2.0f;
-    return score;
+// Compute BM25 score using stored metadata for a document.
+static float bm25_score(const StringMeta* sm, uint64_t doc_count, double avgdl, uint64_t df){
+    if(df==0 || doc_count==0 || avgdl==0.0) return 0.0f;
+    const double k1 = 1.2;
+    const double b  = 0.75;
+    double tf  = (double)sm->term_freq;
+    double dl  = (double)sm->doc_length;
+    double idf = log(( (double)doc_count - (double)df + 0.5) / ((double)df + 0.5) + 1.0);
+    double denom = tf + k1*(1.0 - b + b*dl/avgdl);
+    double score = idf * ((tf * (k1 + 1.0)) / denom);
+    return (float)score;
 }
 
     if(v->n==0) return;
@@ -387,7 +383,7 @@ int wmain(int argc, wchar_t** argv){
     char u8db[MAX_PATH*3]; to_utf8(dbPath,u8db,sizeof(u8db));
     if(mdb_env_open(env, u8db, MDB_RDONLY, 0664)!=0){ fwprintf(stderr,L"env_open failed\n"); return 1; }
     if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ fwprintf(stderr,L"txn_begin failed\n"); return 1; }
-    MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_date, dbi_ext, dbi_smeta;
+    MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_date, dbi_ext, dbi_smeta, dbi_meta;
     if(mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
        mdb_dbi_open(txn,"records",0,&dbi_records)!=0 ||
        mdb_dbi_open(txn,"filename_index",0,&dbi_fname_index)!=0 ||
@@ -395,8 +391,15 @@ int wmain(int argc, wchar_t** argv){
        mdb_dbi_open(txn,"size_index",0,&dbi_size)!=0 ||
        mdb_dbi_open(txn,"date_index",0,&dbi_date)!=0 ||
        mdb_dbi_open(txn,"extension_index",0,&dbi_ext)!=0 ||
-       mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0){
+       mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0 ||
+       mdb_dbi_open(txn,"meta",0,&dbi_meta)!=0){
         fwprintf(stderr,L"dbi_open failed\n"); mdb_txn_abort(txn); mdb_env_close(env); return 1;
+    }
+
+    DbHeader header={0};
+    MDB_val hk={.mv_data="header",.mv_size=6}, hv;
+    if(mdb_get(txn, dbi_meta, &hk, &hv)==0 && hv.mv_size>=sizeof(DbHeader)){
+        memcpy(&header, hv.mv_data, sizeof(DbHeader));
     }
 
     // Step 1: candidate name string_ids via trigram
@@ -424,8 +427,8 @@ int wmain(int argc, wchar_t** argv){
         }
         for(size_t i=0;i<name_ids.n;i++){
             MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
-            if(mdb_get(txn, dbi_smeta, &k, &v)!=0 || v.mv_size<8196){ continue; }
-            const uint8_t* bloom = (const uint8_t*)v.mv_data + 4; // skip trigram_count
+            if(mdb_get(txn, dbi_smeta, &k, &v)!=0 || v.mv_size<sizeof(StringMeta)){ continue; }
+            const uint8_t* bloom = (const uint8_t*)v.mv_data + 12; // skip trigram_count, term_freq and doc_length
             BOOL ok=TRUE;
             for(size_t j=0;j<hn;j++){
                 uint32_t bit = hbuf[j];
@@ -438,6 +441,8 @@ int wmain(int argc, wchar_t** argv){
     }
 
     }
+
+    uint64_t df = name_ids.n;
 
     // Step 2: expand to record ids via filename_index
     IdVec rec_ids; idvec_init(&rec_ids);
@@ -481,15 +486,18 @@ int wmain(int argc, wchar_t** argv){
     sort_unique(&rec_ids);
 
     // Step 3: Apply filters, rank, and print (parallel)
-    typedef struct { 
-    MDB_env* env; 
-    uint64_t* ids; 
-    size_t start, end; 
-    SearchQuery* q; 
-    RankedResult* out; 
+    typedef struct {
+    MDB_env* env;
+    uint64_t* ids;
+    size_t start, end;
+    SearchQuery* q;
+    RankedResult* out;
     size_t* outn;
     char db_path[MAX_PATH*3];
     SRWLOCK* lock;
+    uint64_t doc_count;
+    double   avg_dl;
+    uint64_t df;
 } FilterArgs;
     SRWLOCK outlock; InitializeSRWLock(&outlock);
     int tcount = workers;
@@ -500,6 +508,9 @@ int wmain(int argc, wchar_t** argv){
         size_t e = (rec_ids.n*(ti+1))/tcount;
         ZeroMemory(&fa[ti], sizeof(FilterArgs));
         fa[ti].ids = rec_ids.ids; fa[ti].start=s; fa[ti].end=e; fa[ti].q=&q; fa[ti].out=all; fa[ti].outn=&alln; fa[ti].lock=&outlock;
+        fa[ti].doc_count = header.doc_count;
+        fa[ti].avg_dl = header.avg_doc_length;
+        fa[ti].df = df;
         to_utf8(dbPath, fa[ti].db_path, sizeof(fa[ti].db_path));
         th[ti] = CreateThread(NULL,0,filter_worker_thread,&fa[ti],0,NULL);
     }

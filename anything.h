@@ -39,6 +39,8 @@ typedef struct DbRecord {
 typedef struct DbHeader {
     uint64_t record_count;
     uint64_t string_count;
+    uint64_t doc_count;       // total number of documents (records)
+    double   avg_doc_length;  // average document length
     uint64_t created_time;
     uint64_t updated_time;
     uint64_t map_size_bytes;

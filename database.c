@@ -16,9 +16,15 @@
 #include "util.h"
 #include "lmdb.h"
 
+// Per-string metadata stored alongside the trigram bloom filter.  In addition to
+// the number of trigrams we also persist basic statistics required for BM25
+// scoring: term frequency (the number of terms in the string) and the raw
+// document length.  The bloom filter itself remains at 64Kb bits.
 typedef struct {
-    uint32_t trigram_count;
-    uint8_t  bloom[8192]; // 64Kb bits
+    uint32_t trigram_count; // number of trigrams observed
+    uint32_t term_freq;     // generic term frequency for the string
+    uint32_t doc_length;    // document length (characters)
+    uint8_t  bloom[8192];   // 64Kb bits
 } StringMeta;
 
 static inline void bloom_set(StringMeta* sm, uint32_t h){
@@ -47,6 +53,7 @@ static void build_bloom_hashes_simd(const char* tri, uint32_t* out4){
 static void build_bloom_for_name(const char* name_u8, StringMeta* sm){
     ZeroMemory(sm, sizeof(*sm));
     size_t len = strlen(name_u8);
+    sm->doc_length = (uint32_t)len;
     if(len<3) return;
     char* tmp=(char*)_malloca(len+1); memcpy(tmp,name_u8,len+1); lowercase_ascii(tmp,len);
     for(size_t i=0;i+3<=len;i++){
@@ -55,6 +62,7 @@ static void build_bloom_for_name(const char* name_u8, StringMeta* sm){
         bloom_set(sm, hs[0]); bloom_set(sm, hs[1]); bloom_set(sm, hs[2]); bloom_set(sm, hs[3]);
         sm->trigram_count++;
     }
+    sm->term_freq = sm->trigram_count;
     _freea(tmp);
 }
 
@@ -366,15 +374,23 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
         if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
         // extension_index & trigrams from name
         // Fetch UTF-8 name by id
-        MDB_val namev;
+        MDB_val namev; uint32_t doclen = 0;
         if(str_by_id(d, d->wtxn, r->name_str_id, &namev)){
             // ensure bloom meta exists
             MDB_val mk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, mv;
+            StringMeta sm;
             if(mdb_get(d->wtxn, d->dbi_string_meta, &mk, &mv)!=0){
-                StringMeta sm; build_bloom_for_name((const char*)namev.mv_data, &sm);
+                build_bloom_for_name((const char*)namev.mv_data, &sm);
+                MDB_val smv={.mv_data=&sm,.mv_size=sizeof(sm)};
+                mdb_put(d->wtxn, d->dbi_string_meta, &mk, &smv, 0);
+            } else if(mv.mv_size==sizeof(StringMeta)){
+                memcpy(&sm, mv.mv_data, sizeof(sm));
+            } else {
+                build_bloom_for_name((const char*)namev.mv_data, &sm);
                 MDB_val smv={.mv_data=&sm,.mv_size=sizeof(sm)};
                 mdb_put(d->wtxn, d->dbi_string_meta, &mk, &smv, 0);
             }
+            doclen = sm.doc_length;
             char ext[32]; split_extension_utf8((const char*)namev.mv_data, ext, sizeof(ext));
             if(ext[0]){
                 MDB_val ek={.mv_data=ext,.mv_size=strlen(ext)}, ev={.mv_data=&id,.mv_size=sizeof(id)};
@@ -383,6 +399,10 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
             }
             emit_trigrams(d, (const char*)namev.mv_data, r->name_str_id);
         }
+        // update global document stats
+        d->header_cache.doc_count++;
+        double dc = (double)d->header_cache.doc_count;
+        d->header_cache.avg_doc_length = ((d->header_cache.avg_doc_length * (dc - 1)) + (double)doclen) / dc;
     }
     // update header
     MDB_val mk,mv; const char* H="header"; to_mdb_val(H, strlen(H), &mk);
