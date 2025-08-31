@@ -24,6 +24,9 @@
 
 typedef struct {
     char* name_pattern;
+    char* content_pattern;
+    char* author_pattern;
+    char* ext_pattern;
     uint64_t size_min, size_max;
     uint64_t date_min_day, date_max_day;
     char* path_filter;   // utf8
@@ -146,9 +149,13 @@ static void parse_query(int argc, wchar_t** argv, wchar_t* dbPath, SearchQuery* 
             if(bi>0){ buf[bi]=0; add_logic_token(tokens, buf); }
         }
     }
-    // choose first plain term for scoring
+    // choose first term of each type for scoring
     for(int i=0;i<tokens->n;i++){
-        if(tokens->items[i].type==TOK_TERM && tokens->items[i].ttype==TERM_NAME){ q->name_pattern=_strdup(tokens->items[i].text); break; }
+        if(tokens->items[i].type!=TOK_TERM || !tokens->items[i].text) continue;
+        if(!q->name_pattern && tokens->items[i].ttype==TERM_NAME) q->name_pattern=_strdup(tokens->items[i].text);
+        if(!q->content_pattern && tokens->items[i].ttype==TERM_CONTENT) q->content_pattern=_strdup(tokens->items[i].text);
+        if(!q->author_pattern && tokens->items[i].ttype==TERM_AUTHOR) q->author_pattern=_strdup(tokens->items[i].text);
+        if(!q->ext_pattern && tokens->items[i].ttype==TERM_EXT) q->ext_pattern=_strdup(tokens->items[i].text);
     }
 }
 
@@ -264,7 +271,7 @@ typedef struct FilterArgs {
     size_t docs_with_term;
 } FilterArgs;
 
-static float calculate_relevance(const DbRecord* r, const char* parent_utf8, const char* name_utf8, const SearchQuery* q, size_t total_docs, size_t docs_with_term);
+static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbRecord* r, const char* parent_utf8, const char* name_utf8, const SearchQuery* q, size_t total_docs, size_t docs_with_term);
 
 static DWORD WINAPI filter_worker_thread(void* p){
     FilterArgs* a=(FilterArgs*)p;
@@ -297,7 +304,7 @@ static DWORD WINAPI filter_worker_thread(void* p){
             free(pat);
             if(!ok) continue;
         }
-        float score = calculate_relevance(r, parent, name, a->q, a->total_docs, a->docs_with_term);
+        float score = calculate_relevance(txn, dbi_strings, r, parent, name, a->q, a->total_docs, a->docs_with_term);
         AcquireSRWLockExclusive(a->lock);
         a->out[*a->outn].rec_id = rid; a->out[*a->outn].score = score; (*a->outn)++;
         ReleaseSRWLockExclusive(a->lock);
@@ -312,20 +319,11 @@ static int cmp_rank(const void* A, const void* B){
     float b = ((const RankedResult*)B)->score;
     return (a<b) - (a>b);
 }
-static int count_slashes(const char* s){
-    int c=0; for(;*s;s++){ if(*s=='\\' || *s=='/') c++; } return c;
-}
 static BOOL name_exact_prefix(const char* name, const char* pat, BOOL* exact, BOOL* prefix){
     size_t nl=strlen(name), pl=strlen(pat);
     *exact = (nl==pl && _stricmp(name, pat)==0);
     *prefix = (nl>=pl && _strnicmp(name, pat, pl)==0);
     return TRUE;
-}
-static BOOL is_executable_ext(const char* name){
-    const char* dot = strrchr(name,'.'); if(!dot) return FALSE;
-    const char* exts[] = {"exe","bat","cmd","ps1","msi","com"};
-    char ext[16]; size_t n=strlen(dot+1); if(n>15)n=15; memcpy(ext,dot+1,n); ext[n]=0; lowercase_ascii(ext,n);
-    for(int i=0;i<6;i++){ if(strcmp(ext, exts[i])==0) return TRUE; } return FALSE;
 }
 
 static int count_term_occurrences(const char* text, const char* term){
@@ -334,26 +332,43 @@ static int count_term_occurrences(const char* text, const char* term){
     return c;
 }
 
-static float calculate_relevance(const DbRecord* r, const char* parent_utf8, const char* name_utf8, const SearchQuery* q, size_t total_docs, size_t docs_with_term){
-    float score = 0.0f;
+static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbRecord* r, const char* parent_utf8, const char* name_utf8, const SearchQuery* q, size_t total_docs, size_t docs_with_term){
+    const float W_FILENAME=0.4f, W_CONTENT=0.4f, W_METADATA=0.1f, W_RECENCY=0.1f;
+    float fname_score=0.0f, content_score=0.0f, meta_score=0.0f, recency_score=0.0f;
+    (void)parent_utf8;
     if(q->name_pattern){
         int tf = count_term_occurrences(name_utf8, q->name_pattern);
         int dl = (int)strlen(name_utf8);
-        const float avgdl = 16.0f; // typical filename length
-        float bm = bm25_score(tf, dl, avgdl, (int)total_docs, (int)docs_with_term);
-        score += bm;
+        const float avgdl = 16.0f;
+        fname_score = bm25_score(tf, dl, avgdl, (int)total_docs, (int)docs_with_term);
         BOOL ex=FALSE, pr=FALSE; name_exact_prefix(name_utf8, q->name_pattern, &ex, &pr);
-        if(ex) score += 50.0f; else if(pr) score += 25.0f;
-    } else {
-        score += 100.0f;
+        if(ex) fname_score += 2.0f; else if(pr) fname_score += 1.0f;
     }
-    int depth = count_slashes(parent_utf8);
-    score -= (float)depth * 2.0f;
+    if(q->content_pattern && r->content_str_id){
+        MDB_val ck={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, cv;
+        if(mdb_get(txn, dbi_strings, &ck, &cv)==0){
+            const char* content=(const char*)cv.mv_data;
+            int tf = count_term_occurrences(content, q->content_pattern);
+            int dl = (int)strlen(content);
+            const float avgdl = 1000.0f;
+            content_score = bm25_score(tf, dl, avgdl, (int)total_docs, (int)docs_with_term);
+        }
+    }
+    if(q->author_pattern && r->author_str_id){
+        MDB_val ak={.mv_data=&r->author_str_id,.mv_size=sizeof(r->author_str_id)}, av;
+        if(mdb_get(txn, dbi_strings, &ak, &av)==0){
+            const char* author=(const char*)av.mv_data;
+            if(_stricmp(author, q->author_pattern)==0) meta_score += 1.0f;
+        }
+    }
+    if(q->ext_pattern){
+        const char* ext = PathFindExtensionA(name_utf8);
+        if(ext && ext[0]){ ext++; if(_stricmp(ext, q->ext_pattern)==0) meta_score += 1.0f; }
+    }
     uint64_t days_old = today_day() - filetime_days(r->modified_time);
-    if(days_old < 7) score += 20.0f; else if(days_old < 30) score += 10.0f;
-    if(is_executable_ext(name_utf8)) score += 15.0f;
-    if(r->file_size>0 && r->file_size < 4096) score -= 2.0f;
-    return score;
+    if(days_old < 7) recency_score = 1.0f; else if(days_old < 30) recency_score = 0.5f;
+    float final = fname_score*W_FILENAME + content_score*W_CONTENT + meta_score*W_METADATA + recency_score*W_RECENCY;
+    return final;
 }
 static void intersect_inplace(IdVec* a, const IdVec* b){
     size_t i=0,j=0,w=0;
@@ -735,6 +750,9 @@ int wmain(int argc, wchar_t** argv){
 
     // cleanup
     if(q.name_pattern) free(q.name_pattern);
+    if(q.content_pattern) free(q.content_pattern);
+    if(q.author_pattern) free(q.author_pattern);
+    if(q.ext_pattern) free(q.ext_pattern);
     if(q.path_filter) free(q.path_filter);
     idvec_free(&rec_ids);
     tokenlist_free(&tokens);
