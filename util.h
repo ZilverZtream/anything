@@ -10,6 +10,12 @@
 extern "C" {
 #endif
 
+// configurable sort buffer size (default 256MB)
+extern size_t g_sort_buffer_size;
+
+// dynamic work memory helper
+size_t dynamic_work_mem(void);
+
 void lowercase_ascii(char* s, size_t n);
 void lowercase_wchar(wchar_t* s);
 BOOL path_join(wchar_t* dst, size_t dstcch, const wchar_t* a, const wchar_t* b);
@@ -35,6 +41,26 @@ void normalize_filename_utf8(const char* name_utf8, char* out, size_t outcap);
 // SIMD search
 BOOL is_avx2_supported(void);
 BOOL avx2_contains(const char* haystack, size_t hlen, const char* needle, size_t nlen);
+
+// packed sort buffer helpers
+typedef struct {
+    uint8_t* data;
+    size_t len;
+    size_t cap;
+} SortBuffer;
+
+void sb_init(SortBuffer* sb);
+void sb_free(SortBuffer* sb);
+BOOL sb_pack_str(SortBuffer* sb, const char* s);
+BOOL sb_pack_u64(SortBuffer* sb, uint64_t v);
+
+// incremental hash helpers for sort keys
+uint64_t hash64_add(uint64_t h, const void* data, size_t len);
+uint64_t hash64_sort_key(const SortBuffer* sb);
+
+// external sort spilling to disk when exceeding sort_buffer_size
+BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
+                   int (*cmp)(const void*, const void*));
 
 #ifdef __cplusplus
 }

@@ -65,3 +65,9 @@ cl /std:c++17 /EHsc ui_imgui.cpp imgui*.cpp glfw3.lib opengl32.lib lmdb.lib shlw
 ```
 
 Without these libraries the `run_ui` function prints a message and exits so command-line tools remain usable.
+
+## Memory and Buffer Optimizations
+- Configurable `g_sort_buffer_size` (default 256MB) controls how much data is sorted in memory before spilling to temporary files.
+- Sort buffers pack variable-length values using length prefixes and include incremental 64-bit hashing helpers for composite sort keys.
+- If the data set exceeds the in-memory buffer, an external sort writes sorted chunks to temp files and merges them with a k-way merge.
+- Work memory is determined dynamically at runtime via `GlobalMemoryStatusEx` to adapt to available RAM.
