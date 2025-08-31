@@ -21,6 +21,7 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
 - Archive content indexing (ZIP/RAR/7z) via libzip.
 - Pluggable scanners for cloud drives (OneDrive/Google Drive/pCloud/Dropbox).
 - Native WSL filesystem indexing without wsl.exe overhead.
+- Experimental macOS virtualization disk indexing for Docker, Parallels and VMware images.
 - Incremental content indexing avoids re-scanning unchanged files.
 - Hybrid indexing levels for name-only, metadata-light, or full content extraction.
 - Extensible plugin system so third parties can add new scanners.
@@ -51,6 +52,9 @@ Stub scanners exist for OneDrive, Google Drive, and Dropbox. They will use offic
 
 ## Native WSL File System Indexing
 The WSL scanner reads the ext4.vhdx virtual disk directly to enumerate files and capture full metadata without shelling out to `wsl.exe` for every file.
+
+## macOS Virtual Machine Disk Indexing
+The MacVM scanner can read ext4-based virtual disk images used by Docker, Parallels or VMware on macOS. It opens the disk image directly and walks the contained filesystem without needing to boot the virtual machine.
 
 ## Plugin API
 Custom data source scanners can be implemented as DLLs. Place compiled plugins in a `plugins` folder next to the executable and they will be loaded at startup. The `plugin.h` header documents the API each DLL must expose.
