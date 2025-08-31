@@ -1,20 +1,26 @@
 
 // anything.c — Orchestrator
 #define _CRT_SECURE_NO_WARNINGS
+#ifdef _WIN32
 #include <windows.h>
 #include <shlwapi.h>
+#include <intrin.h>
+#include <objbase.h>
+#include <filter.h>
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "query.lib")
+#else
+#include <unistd.h>
+#endif
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
-#include <intrin.h>
-#include <objbase.h>
-#include <filter.h>
-
-#pragma comment(lib, "shlwapi.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "query.lib")
+#ifdef __APPLE__
+#include <CoreServices/CoreServices.h>
+#endif
 
 #include "anything.h"
 #include "database.h"
@@ -109,7 +115,8 @@ static BOOL is_archive_file(const wchar_t* name){
 
 #define MAX_INDEXED_CONTENT (1024*1024) // 1MB
 
-static wchar_t* extract_with_ifilter(const wchar_t* path){
+static wchar_t* extract_with_filter(const wchar_t* path){
+#ifdef _WIN32
     if(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED)!=S_OK) return NULL;
     IFilter* filter=NULL;
     HRESULT hr = LoadIFilter(path, NULL, NULL, 0, 0, 0, &filter);
@@ -138,6 +145,39 @@ static wchar_t* extract_with_ifilter(const wchar_t* path){
     filter->Release();
     CoUninitialize();
     return out;
+#elif defined(__APPLE__)
+    char utf8[MAX_LONG_PATH];
+    wcstombs(utf8, path, sizeof(utf8));
+    CFStringRef cfpath = CFStringCreateWithCString(NULL, utf8, kCFStringEncodingUTF8);
+    if(!cfpath) return NULL;
+    CFURLRef url = CFURLCreateWithFileSystemPath(NULL, cfpath, kCFURLPOSIXPathStyle, false);
+    CFRelease(cfpath);
+    if(!url) return NULL;
+    MDItemRef item = MDItemCreate(NULL, url);
+    CFRelease(url);
+    if(!item) return NULL;
+    CFStringRef text = MDItemCopyAttribute(item, kMDItemTextContent);
+    CFRelease(item);
+    if(!text) return NULL;
+    CFIndex len = CFStringGetLength(text);
+    CFIndex max = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+    char* buf = (char*)malloc((size_t)max);
+    if(!buf){ CFRelease(text); return NULL; }
+    if(!CFStringGetCString(text, buf, max, kCFStringEncodingUTF8)){
+        free(buf);
+        CFRelease(text);
+        return NULL;
+    }
+    CFRelease(text);
+    size_t wlen = mbstowcs(NULL, buf, 0) + 1;
+    wchar_t* wout = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
+    if(wout) mbstowcs(wout, buf, wlen);
+    free(buf);
+    return wout;
+#else
+    (void)path;
+    return NULL;
+#endif
 }
 
 static wchar_t* extract_email_content(Db* db, const wchar_t* path, uint64_t* author_out, uint64_t* title_out){
@@ -385,7 +425,7 @@ static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t*
         if(wbuf) MultiByteToWideChar(CP_UTF8,0,buf,-1,wbuf,wlen);
         free(buf);
     } else if(mode == CONTENT_IFILTER){
-        wbuf = extract_with_ifilter(path);
+        wbuf = extract_with_filter(path);
     } else if(mode == CONTENT_EMAIL){
         wbuf = extract_email_content(db, path, author_out, title_out);
     } else if(mode == CONTENT_EPUB){
