@@ -17,7 +17,12 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #endif
- #include <wchar.h>
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
+#endif // __APPLE__
+#include <wchar.h>
  #include <algorithm>
  #include <vector>
  #include <string>
@@ -221,8 +226,15 @@ static void open_file_os(const std::string& p){
 #ifdef _WIN32
     ShellExecuteA(NULL, "open", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
 #elif defined(__APPLE__)
-    std::string cmd = std::string("open \"") + p + "\"";
-    system(cmd.c_str());
+    CFStringRef cfPath = CFStringCreateWithCString(nullptr, p.c_str(), kCFStringEncodingUTF8);
+    if(!cfPath) return;
+    CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
+    CFRelease(cfPath);
+    if(!url) return;
+    // Use NSWorkspace for native file opening
+    id ws = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSWorkspace"), sel_registerName("sharedWorkspace"));
+    ((void(*)(id, SEL, id))objc_msgSend)(ws, sel_registerName("openURL:"), url);
+    CFRelease(url);
 #elif defined(__ANDROID__)
     std::string cmd = std::string("am start -a android.intent.action.VIEW -d \"file://") + p + "\"";
     system(cmd.c_str());
@@ -236,8 +248,15 @@ static void open_folder_os(const std::string& p){
 #ifdef _WIN32
     ShellExecuteA(NULL, "open", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
 #elif defined(__APPLE__)
-    std::string cmd = std::string("open \"") + p + "\"";
-    system(cmd.c_str());
+    CFStringRef cfPath = CFStringCreateWithCString(nullptr, p.c_str(), kCFStringEncodingUTF8);
+    if(!cfPath) return;
+    CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, true);
+    CFRelease(cfPath);
+    if(!url) return;
+    // Use NSWorkspace for native folder opening
+    id ws = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSWorkspace"), sel_registerName("sharedWorkspace"));
+    ((void(*)(id, SEL, id))objc_msgSend)(ws, sel_registerName("openURL:"), url);
+    CFRelease(url);
 #elif defined(__ANDROID__)
     std::string cmd = std::string("am start -a android.intent.action.VIEW -d \"file://") + p + "\"";
     system(cmd.c_str());
