@@ -5,9 +5,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#else
+#include <strings.h>
+#endif
 
 #include <ext2fs/ext2fs.h>
 #include <ext2fs/ext2_io.h>
+#ifdef HAS_LIBVMDK
+#include <libvmdk.h>
+#endif
+
 
 #ifndef FILE_ATTRIBUTE_DIRECTORY
 #define FILE_ATTRIBUTE_DIRECTORY 0x10
@@ -34,6 +43,99 @@ static uint32_t ext_mode_to_attrs(uint16_t mode){
     if(!a) a = FILE_ATTRIBUTE_NORMAL;
     return a;
 }
+
+#ifdef HAS_LIBVMDK
+
+// ---- Minimal VMDK io_manager for libext2fs ---------------------------
+typedef struct {
+    libvmdk_handle_t* handle;
+} vmdk_priv;
+
+static errcode_t vmdk_open(const char* name, int flags, io_channel* out){
+    (void)flags;
+    io_channel channel = (io_channel)calloc(1, sizeof(struct struct_io_channel));
+    if(!channel) return ENOMEM;
+    channel->magic = EXT2_ET_MAGIC_IO_CHANNEL;
+    channel->manager = &vmdk_manager;
+    channel->block_size = 1024;
+
+    libvmdk_error_t* error = NULL;
+    libvmdk_handle_t* handle = NULL;
+    if(libvmdk_handle_initialize(&handle, &error) != 1) goto fail;
+    int access = libvmdk_get_access_flags_read();
+    if(libvmdk_handle_open(handle, name, access, &error) != 1) goto fail;
+    if(libvmdk_handle_open_extent_data_files(handle, &error) != 1) goto fail;
+
+    vmdk_priv* p = (vmdk_priv*)calloc(1, sizeof(vmdk_priv));
+    if(!p) goto fail;
+    p->handle = handle;
+    channel->private_data = p;
+    channel->name = strdup(name);
+    *out = channel;
+    if(error) libvmdk_error_free(&error);
+    return 0;
+fail:
+    if(error) libvmdk_error_free(&error);
+    if(handle){ libvmdk_handle_close(handle, NULL); libvmdk_handle_free(&handle, NULL); }
+    free(channel);
+    return EIO;
+}
+
+static errcode_t vmdk_close(io_channel channel){
+    if(!channel) return 0;
+    vmdk_priv* p = (vmdk_priv*)channel->private_data;
+    if(p){
+        if(p->handle){
+            libvmdk_handle_close(p->handle, NULL);
+            libvmdk_handle_free(&p->handle, NULL);
+        }
+        free(p);
+    }
+    free(channel->name);
+    free(channel);
+    return 0;
+}
+
+static errcode_t vmdk_set_blksize(io_channel channel, int blksize){
+    channel->block_size = blksize;
+    return 0;
+}
+
+static errcode_t vmdk_read_blk64(io_channel channel, unsigned long long block,
+                                 int count, void* data){
+    vmdk_priv* p = (vmdk_priv*)channel->private_data;
+    size_t to_read = (size_t)count * channel->block_size;
+    ssize_t got = libvmdk_handle_read_buffer_at_offset(
+        p->handle, data, to_read, (off64_t)block * channel->block_size, NULL);
+    return (got == (ssize_t)to_read) ? 0 : EIO;
+}
+
+static errcode_t vmdk_read_blk(io_channel channel, unsigned long block,
+                               int count, void* data){
+    return vmdk_read_blk64(channel, block, count, data);
+}
+
+static struct struct_io_manager vmdk_manager = {
+    EXT2_ET_MAGIC_IO_MANAGER,
+    "vmdk",
+    vmdk_open,
+    vmdk_close,
+    vmdk_set_blksize,
+    vmdk_read_blk,
+    0,
+    0,
+    0,
+    0,
+    0,
+    vmdk_read_blk64,
+    0,
+    0,
+    0,
+    0,
+    {0}
+};
+
+#endif // HAS_LIBVMDK
 
 // ---- Directory traversal ---------------------------------------------
 typedef struct {
@@ -104,6 +206,12 @@ static BOOL scan_directory(ScanCtx* ctx, ext2_ino_t ino, const wchar_t* parent){
     return err == 0;
 }
 
+static BOOL ends_with(const char* s, const char* ext){
+    size_t ls = strlen(s), le = strlen(ext);
+    if(ls < le) return FALSE;
+    return strcasecmp(s + ls - le, ext) == 0;
+}
+
 // ---- Entry point -----------------------------------------------------
 BOOL MacVMScanner_Start(const wchar_t* image_path, Db* db){
     if(!image_path || !db) return FALSE;
@@ -112,8 +220,13 @@ BOOL MacVMScanner_Start(const wchar_t* image_path, Db* db){
     wcstombs(img_utf8, image_path, sizeof(img_utf8));
 
     ext2_filsys fs;
+    const struct struct_io_manager* iom = unix_io_manager;
+#ifdef HAS_LIBVMDK
+    if(ends_with(img_utf8, ".vmdk"))
+        iom = &vmdk_manager;
+#endif
     errcode_t err = ext2fs_open2(img_utf8, NULL, EXT2_FLAG_RDONLY, 0, 0,
-                                 unix_io_manager, &fs);
+                                 iom, &fs);
     if(err) return FALSE;
 
     if(!db_begin_write(db)){ ext2fs_close(fs); return FALSE; }
