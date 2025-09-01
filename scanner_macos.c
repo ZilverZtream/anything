@@ -15,6 +15,7 @@
 #include <ftw.h>
 #include <zip.h>
 #include <libpst/libpst.h>
+#include <stdint.h>
 
 #ifndef FILE_ATTRIBUTE_DIRECTORY
 #define FILE_ATTRIBUTE_DIRECTORY 0x10
@@ -26,6 +27,7 @@ struct FileScanner {
     pthread_t enum_thread;
     CFRunLoopRef run_loop;
     volatile BOOL stop;
+    HANDLE cancel;
     MPMCQueue* outq;
     char root[PATH_MAX];
     BOOL is_network;
@@ -33,6 +35,15 @@ struct FileScanner {
 };
 
 static FileScanner* g_current;
+
+static BOOL is_cancelled(HANDLE h){
+#ifdef _WIN32
+    return WaitForSingleObject(h,0)==WAIT_OBJECT_0;
+#else
+    if(!h) return FALSE;
+    return *(volatile BOOL*)(uintptr_t)h;
+#endif
+}
 
 static void fs_to_wide(wchar_t* dst, const char* src, size_t dstlen){
     if(!dstlen) return;
@@ -186,7 +197,11 @@ static void emit(FileScanner* s, const char* path, int base){
 
 static int enum_cb(const char* fpath, const struct stat* sb, int typeflag, struct FTW* ftwbuf){
     (void)sb; (void)typeflag;
-    emit(g_current, fpath, ftwbuf ? ftwbuf->base : -1);
+    FileScanner* s = g_current;
+    if(!s) return 0;
+    if(is_cancelled(s->cancel)) s->stop = TRUE;
+    if(s->stop) return 1;
+    emit(s, fpath, ftwbuf ? ftwbuf->base : -1);
     return 0;
 }
 
@@ -254,7 +269,7 @@ static void* loop_thread(void* arg){
 }
 
 FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent){
-    (void)threads; (void)cancelEvent;
+    (void)threads;
     char tmp[PATH_MAX];
     wcstombs(tmp, rootPath, PATH_MAX);
     struct statfs sfs;
@@ -271,6 +286,7 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
     FileScanner* s = (FileScanner*)calloc(1,sizeof(FileScanner));
     if(!s) return NULL;
     s->outq = outQueue;
+    s->cancel = cancelEvent;
     wcstombs(s->root, rootPath, PATH_MAX);
     CFStringRef path = CFStringCreateWithCString(NULL, s->root, kCFStringEncodingUTF8);
     CFArrayRef paths = CFArrayCreate(NULL, (const void**)&path, 1, &kCFTypeArrayCallBacks);
