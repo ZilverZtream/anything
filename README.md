@@ -32,7 +32,7 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
 - Switchable dark and light themes in the graphical interface.
 - Command-line tools:
   - `anything.exe index` — build or update the database
-  - `search.exe` — query the database with filters (size, date, path, extension, content, author, camera, lens, artist, album, title, regex, etc.). Add `--json` to emit results as structured JSON
+  - `search.exe` — query the database with filters (size, date, path, extension, content, author, camera, lens, artist, album, title, regex, etc.). Add `--json` to emit results and errors as structured JSON. Administrative flags `--start-indexer` and `--pause-indexer` control the indexing service.
 
 ### Enterprise Features (paywalled)
 The source tree contains placeholders for several enterprise-only capabilities.
