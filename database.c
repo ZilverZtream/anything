@@ -88,7 +88,7 @@ typedef struct {
     MDB_dbi  dbi_album_index;    // key: album_str_id   → rec_id (dups)
     MDB_dbi  dbi_title_index;    // key: title_str_id   → rec_id (dups)
     MDB_txn* wtxn;
-    int      last_err;
+    DbError  last_error;
     size_t   map_init;
     size_t   map_max;
     HANDLE   bloom_file;
@@ -97,7 +97,24 @@ typedef struct {
     IndexLoadState load_state;
 } DbImpl;
 
-static void set_last_err(DbImpl* d, int err) { d->last_err = err; }
+static void set_error(DbImpl* d, DbErrorCode code, int detail, const char* msg){
+    if(!d) return;
+    d->last_error.code = code;
+    d->last_error.detail = detail;
+    if(msg){
+        snprintf(d->last_error.message, sizeof(d->last_error.message), "%s", msg);
+    } else {
+        d->last_error.message[0] = '\0';
+    }
+}
+static void set_mdb_error(DbImpl* d, int rc){
+    set_error(d, DB_ERROR_LMDB, rc, mdb_strerror(rc));
+}
+static void set_sys_error(DbImpl* d, DWORD err){
+    char buf[256];
+    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS,NULL,err,0,buf,sizeof(buf),NULL);
+    set_error(d, DB_ERROR_OS, (int)err, buf);
+}
 static uint64_t now_filetime(void) {
     FILETIME ft; GetSystemTimeAsFileTime(&ft);
     ULARGE_INTEGER u; u.LowPart=ft.dwLowDateTime; u.HighPart=ft.dwHighDateTime;
@@ -170,38 +187,39 @@ static int ensure_indices(DbImpl* d, IndexLoadState desired){
 }
 
 BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** out_db){
-    if(!out_db) return FALSE; *out_db=NULL;
+    if(!out_db){ return FALSE; }
+    *out_db=NULL;
     DbImpl* d = (DbImpl*)calloc(1,sizeof(DbImpl));
-    if(!d) return FALSE;
+    if(!d){ return FALSE; }
     d->map_init = (size_t)map_init_mb * 1024ull * 1024ull;
     d->map_max  = (size_t)map_max_mb  * 1024ull * 1024ull;
     if(d->map_init < 128*1024*1024) d->map_init = 128*1024*1024;
     if(d->map_max  < d->map_init)   d->map_max = d->map_init*4;
     ensure_dir(path);
     int rc = mdb_env_create(&d->env);
-    if(rc){ set_last_err(d,rc); free(d); return FALSE; }
+    if(rc){ set_mdb_error(d,rc); free(d); return FALSE; }
     mdb_env_set_mapsize(d->env, d->map_init);
     mdb_env_set_maxdbs(d->env, 64);
     char u8[MAX_PATH*3]; WideCharToMultiByte(CP_UTF8,0,path,-1,u8,sizeof(u8),NULL,NULL);
     rc = mdb_env_open(d->env, u8, MDB_WRITEMAP|MDB_MAPASYNC, 0664);
-    if(rc){ set_last_err(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
+    if(rc){ set_mdb_error(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
     wchar_t bloomPath[MAX_PATH];
     swprintf(bloomPath, MAX_PATH, L"%s\\bloom.dat", path);
     d->bloom_file = CreateFileW(bloomPath, GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if(d->bloom_file==INVALID_HANDLE_VALUE){ set_last_err(d, GetLastError()); mdb_env_close(d->env); free(d); return FALSE; }
+    if(d->bloom_file==INVALID_HANDLE_VALUE){ set_sys_error(d, GetLastError()); mdb_env_close(d->env); free(d); return FALSE; }
     LARGE_INTEGER sz; sz.QuadPart = 0; GetFileSizeEx(d->bloom_file, &sz); d->bloom_offset = sz.QuadPart; SetFilePointerEx(d->bloom_file, sz, NULL, FILE_BEGIN);
     MDB_txn* txn;
-    if((rc = mdb_txn_begin(d->env, NULL, 0, &txn))){ set_last_err(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
-    if((rc = open_core_dbs(txn, d, TRUE))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
-    if((rc = open_metadata_dbs(txn, d, TRUE))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
-    if((rc = open_content_dbs(txn, d, TRUE))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
+    if((rc = mdb_txn_begin(d->env, NULL, 0, &txn))){ set_mdb_error(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
+    if((rc = open_core_dbs(txn, d, TRUE))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
+    if((rc = open_metadata_dbs(txn, d, TRUE))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
+    if((rc = open_content_dbs(txn, d, TRUE))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
     // initialize header
     DbHeader hdr = {0};
     hdr.created_time = hdr.updated_time = now_filetime();
     hdr.map_size_bytes = d->map_init;
     MDB_val k,v; const char* H="header"; to_mdb_val(H, strlen(H), &k); to_mdb_val(&hdr, sizeof(hdr), &v);
-    if((rc = mdb_put(txn, d->dbi_meta, &k, &v, 0))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
-    if((rc = mdb_txn_commit(txn))){ set_last_err(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
+    if((rc = mdb_put(txn, d->dbi_meta, &k, &v, 0))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
+    if((rc = mdb_txn_commit(txn))){ set_mdb_error(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
     d->header_cache = hdr;
     d->load_state = INDEX_CONTENT_LOADED;
     *out_db = (Db*)d;
@@ -209,21 +227,22 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
 }
 
 const DbHeader* db_open_readonly(const wchar_t* path, Db** out_db){
-    if(!out_db) return NULL; *out_db=NULL;
+    if(!out_db){ return NULL; }
+    *out_db=NULL;
     DbImpl* d = (DbImpl*)calloc(1,sizeof(DbImpl));
-    if(!d) return NULL;
+    if(!d){ return NULL; }
     d->map_init = 128*1024*1024; d->map_max = d->map_init*16;
     int rc = mdb_env_create(&d->env);
-    if(rc){ set_last_err(d,rc); free(d); return NULL; }
+    if(rc){ set_mdb_error(d,rc); free(d); return NULL; }
     mdb_env_set_maxdbs(d->env, 64);
     char u8[MAX_PATH*3]; WideCharToMultiByte(CP_UTF8,0,path,-1,u8,sizeof(u8),NULL,NULL);
-    if((rc = mdb_env_open(d->env, u8, MDB_RDONLY, 0664))){ set_last_err(d,rc); mdb_env_close(d->env); free(d); return NULL; }
+    if((rc = mdb_env_open(d->env, u8, MDB_RDONLY, 0664))){ set_mdb_error(d,rc); mdb_env_close(d->env); free(d); return NULL; }
     MDB_txn* txn;
-    if((rc = mdb_txn_begin(d->env, NULL, MDB_RDONLY, &txn))){ set_last_err(d,rc); mdb_env_close(d->env); free(d); return NULL; }
-    if((rc = open_core_dbs(txn, d, FALSE))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return NULL; }
+    if((rc = mdb_txn_begin(d->env, NULL, MDB_RDONLY, &txn))){ set_mdb_error(d,rc); mdb_env_close(d->env); free(d); return NULL; }
+    if((rc = open_core_dbs(txn, d, FALSE))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return NULL; }
     // read header
     MDB_val k,v; const char* H="header"; to_mdb_val(H, strlen(H), &k);
-    if((rc = mdb_get(txn, d->dbi_meta, &k, &v))){ set_last_err(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return NULL; }
+    if((rc = mdb_get(txn, d->dbi_meta, &k, &v))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return NULL; }
     if(v.mv_size < sizeof(DbHeader)){ mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return NULL; }
     memcpy(&d->header_cache, v.mv_data, sizeof(DbHeader));
     mdb_txn_abort(txn);
@@ -259,19 +278,19 @@ BOOL db_set_mapsize(Db* db_, size_t new_size_bytes){
     DbImpl* d = (DbImpl*)db_;
     if(new_size_bytes <= db_current_mapsize(db_) || new_size_bytes > d->map_max) return FALSE;
     int rc = mdb_env_set_mapsize(d->env, new_size_bytes);
-    set_last_err(d, rc);
+    if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     if(rc==0){ d->header_cache.map_size_bytes = new_size_bytes; }
     return rc==0;
 }
-int db_last_error(Db* db_){
+const DbError* db_last_error(Db* db_){
     DbImpl* d = (DbImpl*)db_;
-    return d->last_err;
+    return &d->last_error;
 }
 
 BOOL db_ensure_loaded(Db* db_, IndexLoadState state){
     DbImpl* d = (DbImpl*)db_;
     int rc = ensure_indices(d, state);
-    set_last_err(d, rc);
+    if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     return rc==0;
 }
 
@@ -279,16 +298,16 @@ BOOL db_begin_write(Db* db_){
     DbImpl* d = (DbImpl*)db_;
     if(d->wtxn) return TRUE;
     int rc = ensure_indices(d, INDEX_CONTENT_LOADED);
-    if(rc){ set_last_err(d, rc); return FALSE; }
+    if(rc){ set_mdb_error(d, rc); return FALSE; }
     rc = mdb_txn_begin(d->env, NULL, 0, &d->wtxn);
-    set_last_err(d, rc);
+    if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     return rc==0;
 }
 BOOL db_commit_write(Db* db_){
     DbImpl* d = (DbImpl*)db_;
     if(!d->wtxn) return TRUE;
     int rc = mdb_txn_commit(d->wtxn);
-    set_last_err(d, rc);
+    if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     d->wtxn = NULL;
     if(rc==0){
         d->header_cache.updated_time = now_filetime();
@@ -310,9 +329,9 @@ BOOL db_compress(Db* db_, const wchar_t* out_path){
     }
     char u8[MAX_PATH*3];
     int rc = WideCharToMultiByte(CP_UTF8,0,out_path,-1,u8,sizeof(u8),NULL,NULL);
-    if(rc<=0){ set_last_err(d, GetLastError()); return FALSE; }
+    if(rc<=0){ set_sys_error(d, GetLastError()); return FALSE; }
     rc = mdb_env_copy2(d->env, u8, MDB_CP_COMPACT);
-    set_last_err(d, rc);
+    if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     return rc==0;
 }
 
@@ -351,16 +370,16 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
     MDB_val idkey={.mv_data=&new_id,.mv_size=sizeof(new_id)};
     MDB_val idval={.mv_data=u8,.mv_size=(size_t)(needed-1)};
     rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
-    if(rc){ set_last_err(d,rc); _freea(u8); return 0; }
+    if(rc){ set_mdb_error(d,rc); _freea(u8); return 0; }
     MDB_val revval={.mv_data=&new_id,.mv_size=sizeof(new_id)};
     rc = mdb_put(d->wtxn, d->dbi_strrev, &k, &revval, 0);
-    if(rc){ set_last_err(d,rc); _freea(u8); return 0; }
+    if(rc){ set_mdb_error(d,rc); _freea(u8); return 0; }
     // update header
     MDB_val mk,mv; const char* H="header"; to_mdb_val(H, strlen(H), &mk);
     to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
     rc = mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
     _freea(u8);
-    if(rc){ set_last_err(d,rc); return 0; }
+    if(rc){ set_mdb_error(d,rc); return 0; }
     return new_id;
 }
 
@@ -422,7 +441,7 @@ static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
 
         MDB_val k={.mv_data=&key,.mv_size=3}, v={.mv_data=&name_id,.mv_size=sizeof(name_id)};
         int rc = mdb_put(d->wtxn, d->dbi_trigram_index, &k, &v, MDB_NODUPDATA);
-        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d, rc); }
+        if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d, rc); }
     }
     _freea(tmp);
 }
@@ -446,7 +465,7 @@ static void remove_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
         if(seen_n<256) seen[seen_n++]=key;
         MDB_val k={.mv_data=&key,.mv_size=3}, v={.mv_data=&name_id,.mv_size=sizeof(name_id)};
         int rc = mdb_del(d->wtxn, d->dbi_trigram_index, &k, &v);
-        if(rc && rc!=MDB_NOTFOUND){ set_last_err(d, rc); }
+        if(rc && rc!=MDB_NOTFOUND){ set_mdb_error(d, rc); }
     }
     _freea(tmp);
 }
@@ -501,7 +520,7 @@ BOOL db_set_index_state(Db* db_, const IndexState* st){
     if(!d->wtxn){ if(!db_begin_write(db_)) return FALSE; }
     MDB_val k={.mv_data="index_state",.mv_size=11}, v={.mv_data=(void*)st,.mv_size=sizeof(IndexState)};
     int rc = mdb_put(d->wtxn, d->dbi_meta, &k, &v, 0);
-    set_last_err(d, rc);
+    if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     return rc==0;
 }
 
@@ -515,36 +534,36 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
         uint64_t id = d->header_cache.record_count + 1;
         d->header_cache.record_count = id;
         MDB_val k,v; to_mdb_val(&id, sizeof(id), &k); to_mdb_val((void*)r, sizeof(*r), &v);
-        if((rc = mdb_put(d->wtxn, d->dbi_records, &k, &v, 0))){ set_last_err(d,rc); return FALSE; }
+        if((rc = mdb_put(d->wtxn, d->dbi_records, &k, &v, 0))){ set_mdb_error(d,rc); return FALSE; }
         // filename_index
         MDB_val ik,iv; to_mdb_val(&r->name_str_id, sizeof(r->name_str_id), &ik); to_mdb_val(&id, sizeof(id), &iv);
         rc = mdb_put(d->wtxn, d->dbi_fname_index, &ik, &iv, MDB_NODUPDATA);
-        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         // parent_index & path_hierarchy
         MDB_val pk,pv; to_mdb_val(&r->parent_str_id, sizeof(r->parent_str_id), &pk); to_mdb_val(&id, sizeof(id), &pv);
         rc = mdb_put(d->wtxn, d->dbi_parent_index, &pk, &pv, MDB_NODUPDATA);
-        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         rc = mdb_put(d->wtxn, d->dbi_path_hierarchy, &pk, &pv, MDB_NODUPDATA);
-        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         // size_index (files only)
         if(r->type == DB_REC_FILE){
             MDB_val sk,sv; to_mdb_val(&r->file_size, sizeof(r->file_size), &sk); to_mdb_val(&id, sizeof(id), &sv);
             rc = mdb_put(d->wtxn, d->dbi_size_index, &sk, &sv, MDB_NODUPDATA);
-            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+            if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         }
         // date_index (modified time day)
         uint64_t day = filetime_days(r->modified_time);
         MDB_val dk,dv; to_mdb_val(&day, sizeof(day), &dk); to_mdb_val(&id, sizeof(id), &dv);
         rc = mdb_put(d->wtxn, d->dbi_date_index, &dk, &dv, MDB_NODUPDATA);
-        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         // mtime_index
         MDB_val mk,mv; to_mdb_val(&r->modified_time, sizeof(r->modified_time), &mk); to_mdb_val(&id, sizeof(id), &mv);
         rc = mdb_put(d->wtxn, d->dbi_mtime_index, &mk, &mv, MDB_NODUPDATA);
-        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         // attributes index
         MDB_val ak,av; to_mdb_val(&r->attributes, sizeof(r->attributes), &ak); to_mdb_val(&id, sizeof(id), &av);
         rc = mdb_put(d->wtxn, d->dbi_attr_index, &ak, &av, MDB_NODUPDATA);
-        if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+        if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         // extension_index & trigrams from name
         // Fetch UTF-8 name by id
         MDB_val namev;
@@ -565,14 +584,14 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
             if(ext[0]){
                 MDB_val ek={.mv_data=ext,.mv_size=strlen(ext)}, ev={.mv_data=&id,.mv_size=sizeof(id)};
                 rc = mdb_put(d->wtxn, d->dbi_extension_index, &ek, &ev, MDB_NODUPDATA);
-                if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+                if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
             }
             emit_trigrams(d, (const char*)namev.mv_data, r->name_str_id);
         }
         if(r->content_str_id){
             MDB_val ck, cv; to_mdb_val(&r->content_str_id, sizeof(r->content_str_id), &ck); to_mdb_val(&id, sizeof(id), &cv);
             rc = mdb_put(d->wtxn, d->dbi_content_index, &ck, &cv, MDB_NODUPDATA);
-            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+            if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
             MDB_val cvstr;
             if(str_by_id(d, d->wtxn, r->content_str_id, &cvstr)){
                 MDB_val mk={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, mv;
@@ -592,39 +611,39 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
         if(r->author_str_id){
             MDB_val ak,av; to_mdb_val(&r->author_str_id, sizeof(r->author_str_id), &ak); to_mdb_val(&id, sizeof(id), &av);
             rc = mdb_put(d->wtxn, d->dbi_author_index, &ak, &av, MDB_NODUPDATA);
-            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+            if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         }
         if(r->camera_str_id){
             MDB_val ck,av; to_mdb_val(&r->camera_str_id, sizeof(r->camera_str_id), &ck); to_mdb_val(&id, sizeof(id), &av);
             rc = mdb_put(d->wtxn, d->dbi_camera_index, &ck, &av, MDB_NODUPDATA);
-            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+            if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         }
         if(r->lens_str_id){
             MDB_val lk,av; to_mdb_val(&r->lens_str_id, sizeof(r->lens_str_id), &lk); to_mdb_val(&id, sizeof(id), &av);
             rc = mdb_put(d->wtxn, d->dbi_lens_index, &lk, &av, MDB_NODUPDATA);
-            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+            if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         }
         if(r->artist_str_id){
             MDB_val ark,av; to_mdb_val(&r->artist_str_id, sizeof(r->artist_str_id), &ark); to_mdb_val(&id, sizeof(id), &av);
             rc = mdb_put(d->wtxn, d->dbi_artist_index, &ark, &av, MDB_NODUPDATA);
-            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+            if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         }
         if(r->album_str_id){
             MDB_val abk,av; to_mdb_val(&r->album_str_id, sizeof(r->album_str_id), &abk); to_mdb_val(&id, sizeof(id), &av);
             rc = mdb_put(d->wtxn, d->dbi_album_index, &abk, &av, MDB_NODUPDATA);
-            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+            if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         }
         if(r->title_str_id){
             MDB_val tk,av; to_mdb_val(&r->title_str_id, sizeof(r->title_str_id), &tk); to_mdb_val(&id, sizeof(id), &av);
             rc = mdb_put(d->wtxn, d->dbi_title_index, &tk, &av, MDB_NODUPDATA);
-            if(rc && rc!=MDB_KEYEXIST){ set_last_err(d,rc); return FALSE; }
+            if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
         }
     }
     // update header
     MDB_val mk,mv; const char* H="header"; to_mdb_val(H, strlen(H), &mk);
     to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
     rc = mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
-    set_last_err(d, rc);
+    if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     return rc==0;
 }
 
@@ -690,7 +709,7 @@ BOOL db_delete_path(Db* db_, const wchar_t* parent, const wchar_t* name){
     MDB_cursor* cur;
     MDB_val key={.mv_data=&name_id,.mv_size=sizeof(name_id)}, val;
     int rc = mdb_cursor_open(d->wtxn, d->dbi_fname_index, &cur);
-    if(rc){ set_last_err(d, rc); return FALSE; }
+    if(rc){ set_mdb_error(d, rc); return FALSE; }
     rc = mdb_cursor_get(cur, &key, &val, MDB_SET);
     while(rc==0){
         uint64_t id = *(uint64_t*)val.mv_data;

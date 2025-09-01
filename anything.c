@@ -625,8 +625,8 @@ static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch
         if(db_put_records(ctx->db, buf, in_batch)){
             return TRUE;
         }
-        int err = db_last_error(ctx->db);
-        if(err == MDB_MAP_FULL){
+        const DbError* err = db_last_error(ctx->db);
+        if(err->code == DB_ERROR_LMDB && err->detail == MDB_MAP_FULL){
             db_abort_write(ctx->db);
             size_t cur = db_current_mapsize(ctx->db);
             size_t newsize = cur * 2;
@@ -635,14 +635,15 @@ static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch
                 return FALSE;
             }
             if(!db_set_mapsize(ctx->db, newsize)){
-                fprintf(stderr, "db_set_mapsize failed (err=%d)\n", db_last_error(ctx->db));
+                const DbError* serr = db_last_error(ctx->db);
+                fprintf(stderr, "db_set_mapsize failed: %s (code=%d)\n", serr->message, serr->detail);
                 return FALSE;
             }
             if(!db_begin_write(ctx->db)) return FALSE;
             ctx->grow_attempts++;
             continue; // retry put
         } else {
-            fprintf(stderr, "db_put_records failed (err=%d)\n", err);
+            fprintf(stderr, "db_put_records failed: %s (code=%d)\n", err->message, err->detail);
             return FALSE;
         }
     }
@@ -826,7 +827,10 @@ int wmain(int argc, wchar_t** argv){
             return 1;
         }
         BOOL ok = db_compress(cdb, outPath);
-        if(!ok){ fwprintf(stderr, L"Compression failed (err=%d)\n", db_last_error(cdb)); }
+        if(!ok){
+            const DbError* derr = db_last_error(cdb);
+            fwprintf(stderr, L"Compression failed (err=%d: %hs)\n", derr->detail, derr->message);
+        }
         db_close(cdb);
         return ok?0:1;
     }
@@ -839,7 +843,8 @@ int wmain(int argc, wchar_t** argv){
 
     Db* db=NULL;
     if(!db_create(args.dbPath, /*init_mb*/1024, /*max_mb*/16384, &db)){
-        fwprintf(stderr, L"Failed to create/open DB at %s (err=%d)\n", args.dbPath, db?db_last_error(db):0);
+        const DbError* cerr = db ? db_last_error(db) : NULL;
+        fwprintf(stderr, L"Failed to create/open DB at %s (err=%d: %hs)\n", args.dbPath, cerr?cerr->detail:0, cerr?cerr->message:"");
         return 1;
     }
 

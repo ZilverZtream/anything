@@ -154,6 +154,20 @@ HANDLE StartUSNTailer(const wchar_t* volumeRoot, MPMCQueue* outQueue, HANDLE can
 #endif
 
 // ---- DB API (LMDB) ----
+typedef enum {
+    DB_ERROR_NONE = 0,
+    DB_ERROR_INVALID_ARGUMENT,
+    DB_ERROR_MEMORY,
+    DB_ERROR_LMDB,
+    DB_ERROR_OS
+} DbErrorCode;
+
+typedef struct DbError {
+    DbErrorCode code;
+    int         detail;
+    char        message[256];
+} DbError;
+
 BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** out_db);
 const DbHeader* db_open_readonly(const wchar_t* path, Db** out_db);
 void db_close(Db* db);
@@ -162,7 +176,7 @@ const DbHeader* db_header(Db* db);
 size_t db_current_mapsize(Db* db);
 size_t db_max_mapsize(Db* db);
 BOOL   db_set_mapsize(Db* db, size_t new_size_bytes);
-int    db_last_error(Db* db);
+const DbError* db_last_error(Db* db);
 
 BOOL db_begin_write(Db* db);
 BOOL db_commit_write(Db* db);
