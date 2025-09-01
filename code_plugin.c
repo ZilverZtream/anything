@@ -5,6 +5,24 @@
 #include <string.h>
 #include <ctype.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <limits.h>
+#define _snwprintf swprintf
+#define _wcsicmp wcscasecmp
+#define WAIT_OBJECT_0 0
+static int WaitForSingleObject(HANDLE h, unsigned int ms){(void)h;(void)ms;return 1;}
+#define Sleep(ms) usleep((ms)*1000)
+static int wcscpy_s(wchar_t* dst,size_t dstcch,const wchar_t* src){ if(!dst||!src||dstcch==0) return 1; wcsncpy(dst,src,dstcch); dst[dstcch-1]=0; return 0; }
+static void* _aligned_malloc(size_t size,size_t align){ void* p=NULL; if(posix_memalign(&p,align,size)!=0) return NULL; return p; }
+static void _aligned_free(void* p){ free(p); }
+static uint64_t to_filetime(time_t t){ return ((uint64_t)t*10000000ULL)+116444736000000000ULL; }
+#endif
+
 static PluginHost g_host;
 
 static void append_token(char** buf, size_t* len, size_t* cap, const char* type, const char* name){
@@ -137,7 +155,13 @@ static void process_line(char* line, char** buf, size_t* len, size_t* cap){
 }
 
 static wchar_t* parse_file(const wchar_t* path){
+#ifdef _WIN32
     FILE* f = _wfopen(path, L"rb");
+#else
+    char path_mb[PATH_MAX];
+    wcstombs(path_mb, path, sizeof(path_mb));
+    FILE* f = fopen(path_mb, "rb");
+#endif
     if(!f) return NULL;
     fseek(f,0,SEEK_END); long len = ftell(f); fseek(f,0,SEEK_SET);
     char* data = (char*)malloc(len+1);
@@ -154,9 +178,15 @@ static wchar_t* parse_file(const wchar_t* path){
         line = strtok_s(NULL, "\n\r", &ctx);
     }
 
+#ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8,0,out,-1,NULL,0);
     wchar_t* wout = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
     if(wout) MultiByteToWideChar(CP_UTF8,0,out,-1,wout,wlen);
+#else
+    size_t wlen = mbstowcs(NULL, out, 0);
+    wchar_t* wout = (wchar_t*)malloc(sizeof(wchar_t)*(wlen+1));
+    if(wout) mbstowcs(wout, out, wlen+1);
+#endif
     free(out); free(data);
     return wout;
 }
@@ -171,6 +201,7 @@ static BOOL has_ext(const wchar_t* ext){
     return FALSE;
 }
 
+#ifdef _WIN32
 static void scan(void){
     const wchar_t* root = L"code"; // folder containing source files
     wchar_t pattern[MAX_PATH];
@@ -213,6 +244,58 @@ static void scan(void){
     }while(FindNextFileW(h,&fd));
     FindClose(h);
 }
+#else
+static void scan(void){
+    const wchar_t* root = L"code"; // folder containing source files
+    char root_mb[PATH_MAX];
+    wcstombs(root_mb, root, sizeof(root_mb));
+    DIR* d = opendir(root_mb);
+    if(!d) return;
+    struct dirent* ent;
+    while((ent = readdir(d))){
+        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+        char* ext = strrchr(ent->d_name, '.');
+        if(!ext) continue; ext++;
+        wchar_t wext[32]; mbstowcs(wext, ext, 32);
+        if(!has_ext(wext)) continue;
+        char full_mb[PATH_MAX];
+        snprintf(full_mb, sizeof(full_mb), "%s/%s", root_mb, ent->d_name);
+        struct stat st; if(stat(full_mb, &st)!=0) continue;
+        if(S_ISDIR(st.st_mode)) continue;
+        wchar_t full[MAX_PATH]; mbstowcs(full, full_mb, MAX_PATH);
+        for(wchar_t* p=full; *p; ++p) if(*p==L'/') *p=L'\\';
+        wchar_t* content = parse_file(full);
+        if(!content) continue;
+        DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+        if(!wi){ free(content); continue; }
+        wi->content = content;
+        wi->preview = NULL;
+        wcscpy_s(wi->parent_path, MAX_LONG_PATH, root);
+        wchar_t name_w[MAX_PATH]; mbstowcs(name_w, ent->d_name, MAX_PATH);
+        for(wchar_t* p=name_w; *p; ++p) if(*p==L'/') *p=L'\\';
+        wcscpy_s(wi->name, MAX_PATH, name_w);
+        wi->file_size = (uint64_t)st.st_size;
+        wi->creation_time = to_filetime(st.st_ctime);
+        wi->modified_time = to_filetime(st.st_mtime);
+        wi->access_time   = to_filetime(st.st_atime);
+        wi->attributes = 0;
+        wi->clone_id = 0;
+        wi->stage = INDEX_FULL_CONTENT;
+        wi->op = WI_ADD;
+        int tries = 0;
+        while(!MPMC_Push(g_host.queue, wi)){
+            if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
+                free(wi->content);
+                _aligned_free(wi);
+                closedir(d);
+                return;
+            }
+            Sleep(0);
+        }
+    }
+    closedir(d);
+}
+#endif
 
 static void shutdown(void){ }
 
