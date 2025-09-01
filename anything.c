@@ -67,12 +67,6 @@ static int _snwprintf(wchar_t* dst, size_t cch, const wchar_t* fmt, ...){
     va_end(ap);
     return r;
 }
-static void* _aligned_malloc(size_t size, size_t align){
-    void* p = NULL;
-    if(posix_memalign(&p, align, size)!=0) return NULL;
-    return p;
-}
-static void _aligned_free(void* p){ free(p); }
 #define CP_UTF8 65001
 #ifdef __APPLE__
 static void utf8_to_wide(const char* src, wchar_t* dst, size_t dstlen){
@@ -152,13 +146,13 @@ BOOL live_updates_poll(LiveUpdate* out){
     if(!p) return FALSE;
     LiveUpdate* lu = (LiveUpdate*)p;
     *out = *lu;
-    _aligned_free(lu);
+    aligned_free(lu);
     return TRUE;
 }
 
 static void push_live_update(const DbWorkItem* wi){
     if(!g_live_inited) return;
-    LiveUpdate* lu = (LiveUpdate*)_aligned_malloc(sizeof(LiveUpdate), CACHE_LINE_SIZE);
+    LiveUpdate* lu = (LiveUpdate*)aligned_malloc(sizeof(LiveUpdate), CACHE_LINE_SIZE);
     if(!lu) return;
     wcscpy_s(lu->parent_path, MAX_LONG_PATH, wi->parent_path);
     wcscpy_s(lu->name, MAX_PATH, wi->name);
@@ -557,7 +551,7 @@ BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size){
     LONG size=1; while(size<pow2_size) size<<=1;
     q->mask = size-1;
     size_t cells_size = sizeof(MPMCCell) * (size_t)size;
-    q->cells = (MPMCCell*)_aligned_malloc(cells_size, CACHE_LINE_SIZE);
+    q->cells = (MPMCCell*)aligned_malloc(cells_size, CACHE_LINE_SIZE);
     if(!q->cells) return FALSE;
     ZeroMemory(q->cells, cells_size);
     for(LONG i=0;i<size;i++){ q->cells[i].seq = i; }
@@ -566,7 +560,7 @@ BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size){
 }
 void MPMC_Destroy(MPMCQueue* q){
     if(!q || !q->cells) return;
-    _aligned_free(q->cells); q->cells=NULL;
+    aligned_free(q->cells); q->cells=NULL;
 }
 BOOL MPMC_Push(MPMCQueue* q, void* data){
     MPMCCell* cell; LONG64 pos = q->head;
@@ -669,7 +663,7 @@ static DWORD WINAPI DbWriterThread(void* p){
         if(wi->stage == INDEX_NAMES_ONLY || wi->op == WI_DELETE) push_live_update(wi);
         if(wi->op == WI_DELETE){
             db_delete_path(ctx->db, wi->parent_path, wi->name);
-            _aligned_free(wi);
+            aligned_free(wi);
             continue;
         }
         if(wi->stage == INDEX_NAMES_ONLY){
@@ -679,7 +673,7 @@ static DWORD WINAPI DbWriterThread(void* p){
             r.name_str_id   = db_intern_wstring(ctx->db, wi->name);
             r.attributes    = wi->attributes;
             buf[in_batch++] = r;
-            DbWorkItem* next = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+            DbWorkItem* next = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
             if(next){
                 next->content = NULL; next->preview = NULL;
                 wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
@@ -690,7 +684,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                 next->stage = INDEX_METADATA_LIGHT; next->op = WI_ADD;
                 while(!MPMC_Push(&ctx->queue, next)) Sleep(0);
             }
-            _aligned_free(wi);
+            aligned_free(wi);
         } else if(wi->stage == INDEX_METADATA_LIGHT){
             DbRecord r = {0};
             r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
@@ -707,7 +701,7 @@ static DWORD WINAPI DbWriterThread(void* p){
             r.access_time   = at;
             buf[in_batch++] = r;
             if(!(attrs & FILE_ATTRIBUTE_DIRECTORY)){
-                DbWorkItem* next = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                DbWorkItem* next = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
                 if(next){
                     next->content = NULL; next->preview = NULL;
                     wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
@@ -719,7 +713,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                     while(!MPMC_Push(&ctx->queue, next)) Sleep(0);
                 }
             }
-            _aligned_free(wi);
+            aligned_free(wi);
         } else { // full content stage
             DbRecord existing;
             if(db_get_record_by_path(ctx->db, wi->parent_path, wi->name, &existing)){
@@ -744,7 +738,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                     buf[in_batch++] = r;
                 }
             }
-            _aligned_free(wi);
+            aligned_free(wi);
         }
         if(in_batch >= (size_t)ctx->batch_size){
             if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); return 1; }

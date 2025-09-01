@@ -16,6 +16,10 @@ extern size_t g_sort_buffer_size;
 // dynamic work memory helper
 size_t dynamic_work_mem(void);
 
+// aligned allocation helpers
+void* aligned_malloc(size_t size, size_t alignment);
+void aligned_free(void* p);
+
 void lowercase_ascii(char* s, size_t n);
 void lowercase_wchar(wchar_t* s);
 BOOL path_join(wchar_t* dst, size_t dstcch, const wchar_t* a, const wchar_t* b);

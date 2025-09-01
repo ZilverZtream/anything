@@ -1,4 +1,5 @@
 #include "plugin.h"
+#include "util.h"
 #include <tesseract/capi.h>
 #include <wchar.h>
 #include <stdlib.h>
@@ -17,8 +18,6 @@
 static int WaitForSingleObject(HANDLE h, unsigned int ms){(void)h;(void)ms;return 1;}
 #define Sleep(ms) usleep((ms)*1000)
 static int wcscpy_s(wchar_t* dst,size_t dstcch,const wchar_t* src){ if(!dst||!src||dstcch==0) return 1; wcsncpy(dst,src,dstcch); dst[dstcch-1]=0; return 0; }
-static void* _aligned_malloc(size_t size,size_t align){ void* p=NULL; if(posix_memalign(&p,align,size)!=0) return NULL; return p; }
-static void _aligned_free(void* p){ free(p); }
 static uint64_t to_filetime(time_t t){ return ((uint64_t)t*10000000ULL)+116444736000000000ULL; }
 #endif
 
@@ -75,7 +74,7 @@ static void scan(void){
         _snwprintf(full, MAX_PATH, L"%s\\%s", root, fd.cFileName);
         wchar_t* text = ocr_file(full);
         if(!text) continue;
-        DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+        DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
         if(!wi){ free(text); continue; }
         wi->content = text;
         wi->preview = NULL;
@@ -93,7 +92,7 @@ static void scan(void){
         while(!MPMC_Push(g_host.queue, wi)){
             if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
                 free(wi->content);
-                _aligned_free(wi);
+                aligned_free(wi);
                 FindClose(h);
                 return;
             }
@@ -126,7 +125,7 @@ static void scan(void){
         for(wchar_t* p=full; *p; ++p) if(*p==L'/') *p=L'\\';
         wchar_t* text = ocr_file(full);
         if(!text) continue;
-        DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+        DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
         if(!wi){ free(text); continue; }
         wi->content = text;
         wi->preview = NULL;
@@ -146,7 +145,7 @@ static void scan(void){
         while(!MPMC_Push(g_host.queue, wi)){
             if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
                 free(wi->content);
-                _aligned_free(wi);
+                aligned_free(wi);
                 closedir(d);
                 return;
             }

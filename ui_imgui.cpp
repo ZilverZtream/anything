@@ -37,6 +37,7 @@
  #include <stdlib.h>
  #include <thread>
  #include <mutex>
+ #include <memory>
  extern "C" {
  #include "lmdb.h"
  #include "database.h"
@@ -411,16 +412,9 @@ struct Node {
     int type;
     TermType ttype;
     std::string text;
-    Node* left = nullptr;
-    Node* right = nullptr;
+    std::unique_ptr<Node> left;
+    std::unique_ptr<Node> right;
 };
-
-void free_node(Node* n) {
-    if (!n) return;
-    free_node(n->left);
-    free_node(n->right);
-    delete n;
-}
 
 int precedence(TokType t) {
     if (t == TOK_NOT) return 3;
@@ -429,34 +423,37 @@ int precedence(TokType t) {
     return 0;
 }
 
-Node* make_leaf(const Token& t) {
-    Node* n = new Node();
+std::unique_ptr<Node> make_leaf(const Token& t) {
+    auto n = std::make_unique<Node>();
     n->type = TOK_TERM;
     n->ttype = t.ttype;
     n->text = t.text;
     return n;
 }
 
-void apply_op(TokType op, std::vector<Node*>& stack) {
-    Node* n = new Node();
+void apply_op(TokType op, std::vector<std::unique_ptr<Node>>& stack) {
     if (op == TOK_NOT) {
-        if (stack.empty()) { delete n; return; }
+        if (stack.empty()) return;
+        auto n = std::make_unique<Node>();
         n->type = TOK_NOT;
-        n->left = stack.back(); stack.pop_back();
+        n->left = std::move(stack.back());
+        stack.pop_back();
+        stack.push_back(std::move(n));
     } else {
-        if (stack.size() < 2) { delete n; return; }
-        Node* r = stack.back(); stack.pop_back();
-        Node* l = stack.back(); stack.pop_back();
+        if (stack.size() < 2) return;
+        auto r = std::move(stack.back()); stack.pop_back();
+        auto l = std::move(stack.back()); stack.pop_back();
+        auto n = std::make_unique<Node>();
         n->type = op;
-        n->left = l;
-        n->right = r;
+        n->left = std::move(l);
+        n->right = std::move(r);
+        stack.push_back(std::move(n));
     }
-    stack.push_back(n);
 }
 
-Node* parse_tokens(const TokenList& toks) {
+std::unique_ptr<Node> parse_tokens(const TokenList& toks) {
     std::vector<Token> opstack;
-    std::vector<Node*> nodestack;
+    std::vector<std::unique_ptr<Node>> nodestack;
     for (const auto& tk : toks.items) {
         if (tk.type == TOK_TERM) {
             nodestack.push_back(make_leaf(tk));
@@ -482,7 +479,7 @@ Node* parse_tokens(const TokenList& toks) {
         opstack.pop_back();
     }
     if (nodestack.size() != 1) return nullptr;
-    return nodestack[0];
+    return std::move(nodestack[0]);
 }
 
 void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const std::string& term, IdVec* out) {
@@ -682,7 +679,7 @@ static void collect_record(uint64_t id, void* ctx) {
     idvec_push((IdVec*)ctx, id);
 }
 
-void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MDB_dbi dbi_trigram, MDB_dbi dbi_smeta, MDB_dbi dbi_content, MDB_dbi dbi_author, MDB_dbi dbi_ext, MDB_dbi dbi_strrev, MDB_dbi dbi_date, IdVec* out) {
+void eval_node(const Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MDB_dbi dbi_trigram, MDB_dbi dbi_smeta, MDB_dbi dbi_content, MDB_dbi dbi_author, MDB_dbi dbi_ext, MDB_dbi dbi_strrev, MDB_dbi dbi_date, IdVec* out) {
     if (!n) return;
     if (n->type == TOK_TERM) {
         switch (n->ttype) {
@@ -697,8 +694,8 @@ void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MD
     if (n->type == TOK_AND || n->type == TOK_OR) {
         IdVec L; idvec_init(&L);
         IdVec R; idvec_init(&R);
-        eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &L);
-        eval_node(n->right, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &R);
+        eval_node(n->left.get(), txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &L);
+        eval_node(n->right.get(), txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &R);
         sort_unique(&L); sort_unique(&R);
         if (n->type == TOK_AND) { intersect_inplace(&L, &R); } else { union_inplace(&L, &R); sort_unique(&L); }
         idvec_free(&R);
@@ -707,7 +704,7 @@ void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MD
     }
     if (n->type == TOK_NOT) {
         IdVec B; idvec_init(&B);
-        eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &B);
+        eval_node(n->left.get(), txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &B);
         sort_unique(&B);
         IdVec All; idvec_init(&All);
         DiffCtx ctx{ &B, &All };
@@ -745,11 +742,10 @@ static void search_thread(SearchThreadArgs* sta) {
     mdb_dbi_open(txn, "strrev", 0, &dbi_strrev);
     TokenList tokens;
     parse_query(sta->query, &tokens);
-    Node* root = parse_tokens(tokens);
+    auto root = parse_tokens(tokens);
     IdVec rec_ids; idvec_init(&rec_ids);
     if (root) {
-        eval_node(root, txn, dbi_strings, dbi_fname_index, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &rec_ids);
-        free_node(root);
+        eval_node(root.get(), txn, dbi_strings, dbi_fname_index, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &rec_ids);
     } else {
         stream_all_records(txn, dbi_date, collect_record, &rec_ids);
     }

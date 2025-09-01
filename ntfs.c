@@ -205,7 +205,7 @@ static DWORD WINAPI usn_thread(void* p){
         // rel begins with \Dir\Sub; build absolute parent path: e.g., "C:\Dir\Sub"
         wchar_t parent[MAX_LONG_PATH];
         swprintf(parent, MAX_LONG_PATH, L"%c:%s", s->volRoot[0], rel);
-        DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+        DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
         wi->content = NULL;
         wi->preview = NULL;
         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
@@ -291,7 +291,7 @@ static DWORD WINAPI tail_thread(void* p){
                     CloseHandle(hPar);
                     if(got>0 && got<MAX_LONG_PATH){
                         if(wcsncmp(parent, L"\\?\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
-                        DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                        DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
                         wi->content = NULL;
                         wi->preview = NULL;
                         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
@@ -316,7 +316,7 @@ static DWORD WINAPI tail_thread(void* p){
                         wchar_t parent[MAX_LONG_PATH]; wcscpy_s(parent, MAX_LONG_PATH, full);
                         if(wcsncmp(parent, L"\\?\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
                         wchar_t* p = wcsrchr(parent, L'\'); if(p){ *p=0; }
-                        DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                        DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
                         wi->content = NULL;
                         wi->preview = NULL;
                         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);

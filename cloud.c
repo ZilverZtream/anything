@@ -1,5 +1,6 @@
 // cloud.c - basic cloud drive implementations using public APIs
 #include "cloud.h"
+#include "util.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,13 +130,8 @@ static uint64_t parse_rfc3339(const char* s){
 static void enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_utf8,
                          uint64_t size, uint64_t ctime, uint64_t mtime, BOOL is_dir){
     if(!q) return;
-    DbWorkItem* wi;
-#ifdef _WIN32
-    wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+    DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
     if(!wi) return;
-#else
-    if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
-#endif
     wi->content = NULL;
     wi->preview = NULL;
     wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
