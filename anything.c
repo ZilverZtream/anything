@@ -31,6 +31,7 @@
 #include "plugin.h"
 #include "scanner.h"
 #include "enterprise.h"
+#include "config.h"
 
 #include <stdbool.h>
 #include <zip.h>
@@ -775,7 +776,9 @@ static void usage(void){
 
 static BOOL parse_args(int argc, wchar_t** argv, Args* a){
     ZeroMemory(a, sizeof(*a));
-    a->threads = 8; a->batch=50000; a->use_ntfs=FALSE; a->tail_changes=FALSE; a->all_drives=FALSE;
+    a->threads = g_config.default_index_threads;
+    a->batch = g_config.default_batch;
+    a->use_ntfs=FALSE; a->tail_changes=FALSE; a->all_drives=FALSE;
     for(int i=1;i<argc;i++){
         if(wcscmp(argv[i], L"index")==0){ continue; }
         else if(wcscmp(argv[i], L"--db")==0 && i+1<argc){ wcscpy_s(a->dbPath, MAX_PATH, argv[++i]); }
@@ -788,7 +791,8 @@ static BOOL parse_args(int argc, wchar_t** argv, Args* a){
         else { usage(); return FALSE; }
     }
     if(!a->dbPath[0] || (!a->rootPath[0] && !a->all_drives)){ usage(); return FALSE; }
-    if(a->threads<1) a->threads=1; if(a->threads>MAX_THREADS) a->threads=MAX_THREADS;
+    if(a->threads<1) a->threads=1;
+    if(a->threads>g_config.max_index_threads) a->threads=g_config.max_index_threads;
     if(a->batch<1000) a->batch=1000;
     return TRUE;
 }
@@ -806,6 +810,8 @@ static DWORD WINAPI scan_drive_thread(void* p){
 }
 
 int wmain(int argc, wchar_t** argv){
+    config_init_default();
+    config_load_file(L"anything.conf");
     enterprise_deploy_msi();
     if(argc>1 && wcscmp(argv[1], L"compress")==0){
         const wchar_t* dbPath=NULL; const wchar_t* outPath=NULL;

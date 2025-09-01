@@ -22,6 +22,7 @@
 #include "util.h"
 #include "lmdb.h"
 #include "enterprise.h"
+#include "config.h"
 
 #ifdef HAS_PCRE2
 #include <pcre2.h>
@@ -864,6 +865,8 @@ static void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fn
 
 // Main search
 int wmain(int argc, wchar_t** argv){
+    config_init_default();
+    config_load_file(L"anything.conf");
     // Build canonical query string (all args except --db <path>)
     char qcanon[4096]={0}; size_t qpos=0;
     for(int i=1;i<argc;i++){
@@ -878,15 +881,16 @@ int wmain(int argc, wchar_t** argv){
     enterprise_ad_authenticate("user", "");
     wchar_t dbPath[MAX_PATH];
     SearchQuery q; TokenList tokens;
-    int workers=1; bool json_output=false;
+    int workers = g_config.default_search_workers; bool json_output=false;
     for(int ai=1; ai<argc; ++ai){
         if(wcscmp(argv[ai], L"--workers")==0 && ai+1<argc){
             workers = _wtoi(argv[++ai]);
-            if(workers<1)workers=1; if(workers>4)workers=4;
         } else if(wcscmp(argv[ai], L"--json")==0){
             json_output=true;
         }
     }
+    if(workers<1) workers=1;
+    if(workers>g_config.max_search_workers) workers=g_config.max_search_workers;
     parse_query(argc, argv, dbPath, &q, &tokens);
     if(!dbPath[0]){ usage(); return 1; }
     if(!enterprise_check_permission("user", "db")){
