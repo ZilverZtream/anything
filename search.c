@@ -1086,6 +1086,9 @@ int wmain(int argc, wchar_t** argv){
         const char *pstr="?", *nstr="?";
         if(mdb_get(txnprint, dbi_stringsP, &pk, &pv)==0) pstr=(const char*)pv.mv_data;
         if(mdb_get(txnprint, dbi_stringsP, &nk, &nv)==0) nstr=(const char*)nv.mv_data;
+        char full_path[MAX_PATH*3];
+        snprintf(full_path, sizeof(full_path), "%s\\%s", pstr, nstr);
+        if(!enterprise_check_permission("user", full_path)) continue;
         if(json_output){
             printf("  {\"path\":");
             print_json_path(pstr, nstr);

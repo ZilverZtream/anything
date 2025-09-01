@@ -1,7 +1,9 @@
 #include "enterprise.h"
 #include "util.h"
+#include "anything.h"
 #include <stdio.h>
 #include <windows.h>
+#include <aclapi.h>
 
 #ifdef ENTERPRISE
 
@@ -31,15 +33,33 @@ void enterprise_index_network(const char *share){
 }
 
 int enterprise_check_permission(const char *user, const char *path){
-    (void)user;
+    (void)user; // In a full implementation we would evaluate this specific user's token
     if(!path) return 0;
-    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if(h==INVALID_HANDLE_VALUE){
+
+    PSECURITY_DESCRIPTOR sd = NULL;
+    DWORD err = GetNamedSecurityInfoA(path, SE_FILE_OBJECT,
+                                      DACL_SECURITY_INFORMATION,
+                                      NULL, NULL, NULL, NULL, &sd);
+    if(err != ERROR_SUCCESS) return 0;
+
+    HANDLE token = NULL;
+    if(!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)){
+        LocalFree(sd);
         return 0;
     }
-    CloseHandle(h);
-    return 1;
+
+    DWORD desired = FILE_GENERIC_READ;
+    GENERIC_MAPPING mapping = { FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+                                FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS };
+    MapGenericMask(&desired, &mapping);
+    PRIVILEGE_SET privs; DWORD privs_len = sizeof(privs); DWORD granted = 0; BOOL access = FALSE;
+    if(!AccessCheck(sd, token, desired, &mapping, &privs, &privs_len, &granted, &access)){
+        access = FALSE;
+    }
+
+    CloseHandle(token);
+    LocalFree(sd);
+    return access ? 1 : 0;
 }
 
 void enterprise_audit_log(const char *user, const char *query){
