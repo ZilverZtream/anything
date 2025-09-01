@@ -280,6 +280,10 @@ static DWORD WINAPI tail_thread(void* p){
         while(pRec + sizeof(USN_RECORD_V2) <= (DWORD_PTR)buf + bytes){
             USN_RECORD_V2* r = (USN_RECORD_V2*)pRec;
             if(r->RecordLength < sizeof(USN_RECORD_V2)) break;
+            if((DWORD)r->FileNameOffset + (DWORD)r->FileNameLength > r->RecordLength){
+                pRec += r->RecordLength;
+                continue;
+            }
             // Build parent path best-effort: we don't maintain a full FRN map here; do a stat to reconstruct
             wchar_t name[MAX_PATH];
             wcsncpy_s(name, MAX_PATH, (const wchar_t*)((BYTE*)r + r->FileNameOffset), r->FileNameLength/2);
