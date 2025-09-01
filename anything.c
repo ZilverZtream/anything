@@ -202,6 +202,17 @@ static ContentMode get_content_mode(const wchar_t* name){
     return CONTENT_NONE;
 }
 
+static BOOL needs_thumbnail(const wchar_t* name){
+    const wchar_t* ext = wcsrchr(name, L'.');
+    if(!ext) return FALSE;
+    ext++;
+    const wchar_t* exts[] = {L"pdf", L"doc", L"docx", L"ppt", L"pptx", L"xls", L"xlsx"};
+    for(size_t i=0;i<sizeof(exts)/sizeof(exts[0]);i++){
+        if(_wcsicmp(ext, exts[i])==0) return TRUE;
+    }
+    return FALSE;
+}
+
 static BOOL is_archive_file(const wchar_t* name){
     const wchar_t* ext = wcsrchr(name, L'.');
     if(!ext) return FALSE;
@@ -745,6 +756,12 @@ static DWORD WINAPI DbWriterThread(void* p){
                     if(wi->preview){
                         r.preview_str_id = db_intern_wstring(ctx->db, wi->preview);
                         free(wi->preview);
+                    } else if(needs_thumbnail(wi->name)){
+                        wchar_t* thumb = GenerateThumbnail(fpath);
+                        if(thumb){
+                            r.preview_str_id = db_intern_wstring(ctx->db, thumb);
+                            free(thumb);
+                        }
                     }
                     extract_exif_metadata(ctx->db, fpath, &r);
                     extract_id3_metadata(ctx->db, fpath, &r);

@@ -1,7 +1,10 @@
 #ifdef _WIN32
 #include <stdlib.h>
 #include <shlwapi.h>
+#include <shobjidl.h>
+#include <gdiplus.h>
 #include "scanner.h"
+#pragma comment(lib, "gdiplus.lib")
 
 typedef enum { FS_NTFS, FS_GENERIC, FS_NETWORK } ScannerKind;
 
@@ -54,5 +57,54 @@ void FileScanner_Free(FileScanner* s){
     case FS_NETWORK: NetworkScanner_Free(s->u.net); break;
     }
     free(s);
+}
+
+static BOOL save_hbitmap_png(HBITMAP hbmp, const wchar_t* path){
+    Gdiplus::GdiplusStartupInput input;
+    ULONG_PTR token;
+    if(Gdiplus::GdiplusStartup(&token, &input, NULL) != Gdiplus::Ok) return FALSE;
+    Gdiplus::Bitmap bmp(hbmp, NULL);
+    UINT num=0, size=0;
+    Gdiplus::GetImageEncodersSize(&num, &size);
+    if(size==0){ Gdiplus::GdiplusShutdown(token); return FALSE; }
+    Gdiplus::ImageCodecInfo* codecs = (Gdiplus::ImageCodecInfo*)malloc(size);
+    if(!codecs){ Gdiplus::GdiplusShutdown(token); return FALSE; }
+    Gdiplus::GetImageEncoders(num, size, codecs);
+    CLSID pngClsid={0};
+    for(UINT i=0;i<num;i++) if(wcscmp(codecs[i].MimeType, L"image/png")==0){ pngClsid = codecs[i].Clsid; break; }
+    free(codecs);
+    BOOL ok = bmp.Save(path, &pngClsid, NULL) == Gdiplus::Ok;
+    Gdiplus::GdiplusShutdown(token);
+    return ok;
+}
+
+wchar_t* GenerateThumbnail(const wchar_t* path){
+    CoInitialize(NULL);
+    IShellItemImageFactory* factory = NULL;
+    if(FAILED(SHCreateItemFromParsingName(path, NULL, &IID_IShellItemImageFactory, (void**)&factory))){
+        CoUninitialize();
+        return NULL;
+    }
+    SIZE sz = {256,256};
+    HBITMAP hbmp;
+    HRESULT hr = factory->lpVtbl->GetImage(factory, sz, SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT, &hbmp);
+    factory->lpVtbl->Release(factory);
+    if(FAILED(hr)){ CoUninitialize(); return NULL; }
+    wchar_t tmp[MAX_PATH];
+    if(!GetTempFileNameW(L"", L"ath", 0, tmp)){
+        DeleteObject(hbmp);
+        CoUninitialize();
+        return NULL;
+    }
+    DeleteFileW(tmp);
+    wcscat_s(tmp, MAX_PATH, L".png");
+    if(!save_hbitmap_png(hbmp, tmp)){
+        DeleteObject(hbmp);
+        CoUninitialize();
+        return NULL;
+    }
+    DeleteObject(hbmp);
+    CoUninitialize();
+    return _wcsdup(tmp);
 }
 #endif
