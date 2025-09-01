@@ -1,7 +1,6 @@
 #ifndef PLUGIN_H
 #define PLUGIN_H
 
-#include <windows.h>
 #include "anything.h"
 
 #define ANYTHING_PLUGIN_API_VERSION 1
