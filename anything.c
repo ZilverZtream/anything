@@ -175,7 +175,13 @@ static ContentMode get_content_mode(const wchar_t* name){
        _wcsicmp(ext,L"cpp")==0 || _wcsicmp(ext,L"hpp")==0 ||
        _wcsicmp(ext,L"py")==0  || _wcsicmp(ext,L"js")==0  ||
        _wcsicmp(ext,L"cs")==0  || _wcsicmp(ext,L"vb")==0  ||
-       _wcsicmp(ext,L"r")==0   || _wcsicmp(ext,L"java")==0)
+       _wcsicmp(ext,L"r")==0   || _wcsicmp(ext,L"java")==0 ||
+       _wcsicmp(ext,L"json")==0 || _wcsicmp(ext,L"xml")==0 ||
+       _wcsicmp(ext,L"yaml")==0 || _wcsicmp(ext,L"yml")==0 ||
+       _wcsicmp(ext,L"toml")==0 || _wcsicmp(ext,L"csv")==0 ||
+       _wcsicmp(ext,L"nfo")==0  || _wcsicmp(ext,L"ini")==0 ||
+       _wcsicmp(ext,L"log")==0  || _wcsicmp(ext,L"rtf")==0 ||
+       _wcsicmp(ext,L"sql")==0)
         return CONTENT_TEXT;
 
     if(_wcsicmp(ext,L"pdf")==0  || _wcsicmp(ext,L"doc")==0  ||
