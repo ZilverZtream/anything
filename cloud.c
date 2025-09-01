@@ -1,69 +1,113 @@
 // cloud.c - basic cloud drive implementations using public APIs
 #include "cloud.h"
-#include "util.h"
-#include <windows.h>
-#include <winhttp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <curl/curl.h>
+#ifdef _WIN32
+#include <windows.h>
 #include <malloc.h>
-#pragma comment(lib, "winhttp.lib")
+#else
+#include <wchar.h>
+#include <sched.h>
+#include <malloc.h>
+#endif
 
-// Simple helper to perform HTTPS requests using WinHTTP. Returns heap-allocated
+#ifndef FILE_ATTRIBUTE_DIRECTORY
+#define FILE_ATTRIBUTE_DIRECTORY 0x10
+#endif
+#ifndef FILE_ATTRIBUTE_ARCHIVE
+#define FILE_ATTRIBUTE_ARCHIVE 0x20
+#endif
+
+#ifndef _WIN32
+static void wcscpy_s(wchar_t* dst, size_t dstsz, const wchar_t* src){
+    if(dstsz==0) return; wcsncpy(dst, src, dstsz); dst[dstsz-1]=0; }
+static void strcpy_s(char* dst, size_t dstsz, const char* src){
+    if(dstsz==0) return; strncpy(dst, src, dstsz); dst[dstsz-1]=0; }
+#endif
+
+static BOOL path_join(wchar_t* dst, size_t dstcch, const wchar_t* a, const wchar_t* b){
+    if(!dst || !a || !b) return FALSE;
+    wcscpy_s(dst,dstcch,a);
+    size_t n=wcslen(dst);
+    if(n>0 && dst[n-1]!=L'\\'){
+        if(n+1>=dstcch) return FALSE; dst[n++]=L'\\'; dst[n]=0;
+    }
+    wcsncat(dst,b,dstcch-n-1);
+    dst[dstcch-1]=0;
+    return TRUE;
+}
+
+static BOOL path_dirname(const wchar_t* path, wchar_t* out, size_t outcch){
+    if(!path || !out) return FALSE;
+    wcscpy_s(out,outcch,path);
+    wchar_t* p=wcsrchr(out,L'\\');
+    if(!p) p=wcsrchr(out,L'/');
+    if(!p) return FALSE; *p=0; return TRUE;
+}
+
+static void to_wide(const char* u8, wchar_t* w, size_t wcap){
+    if(!u8 || !w || wcap==0){ if(w) w[0]=0; return; }
+#ifdef _WIN32
+    MultiByteToWideChar(CP_UTF8,0,u8,-1,w,(int)wcap);
+#else
+    mbstowcs(w,u8,wcap);
+#endif
+    w[wcap-1]=0;
+}
+
+struct curl_buf { char* data; size_t size; };
+static size_t curl_write_cb(void* contents, size_t size, size_t nmemb, void* userp){
+    size_t realsize = size * nmemb;
+    struct curl_buf* mem = (struct curl_buf*)userp;
+    char* ptr = (char*)realloc(mem->data, mem->size + realsize + 1);
+    if(!ptr) return 0;
+    mem->data = ptr;
+    memcpy(&mem->data[mem->size], contents, realsize);
+    mem->size += realsize;
+    mem->data[mem->size] = 0;
+    return realsize;
+}
+
+// Simple helper to perform HTTPS requests using libcurl. Returns heap-allocated
 // response buffer (caller frees via free()).
-static BOOL http_request(const wchar_t* host, const wchar_t* path,
-                         const wchar_t* method, const wchar_t* headers,
+static BOOL http_request(const char* host, const char* path,
+                         const char* method, const char* headers,
                          const char* body, char** out_buf){
     if(out_buf) *out_buf = NULL;
-    HINTERNET hSession = WinHttpOpen(L"AnythingCloud/1.0",
-                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                     WINHTTP_NO_PROXY_NAME,
-                                     WINHTTP_NO_PROXY_BYPASS, 0);
-    if(!hSession) return FALSE;
-
-    HINTERNET hConnect = WinHttpConnect(hSession, host,
-                                       INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if(!hConnect){ WinHttpCloseHandle(hSession); return FALSE; }
-
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, method, path,
-                                           NULL, WINHTTP_NO_REFERER,
-                                           WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                           WINHTTP_FLAG_SECURE);
-    if(!hRequest){
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return FALSE;
+    static int curl_inited = 0;
+    if(!curl_inited){ if(curl_global_init(CURL_GLOBAL_DEFAULT)!=0) return FALSE; curl_inited=1; }
+    CURL* curl = curl_easy_init();
+    if(!curl) return FALSE;
+    char url[1024];
+    snprintf(url,sizeof(url),"https://%s%s",host,path);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+    struct curl_slist* hdr_list=NULL;
+    if(headers && headers[0]){
+        const char* h=headers;
+        while(*h){
+            const char* e=strstr(h,"\r\n");
+            size_t len=e? (size_t)(e-h) : strlen(h);
+            char line[512]; if(len>=sizeof(line)) len=sizeof(line)-1;
+            memcpy(line,h,len); line[len]=0;
+            hdr_list=curl_slist_append(hdr_list,line);
+            if(!e) break; h=e+2;
+        }
+        if(hdr_list) curl_easy_setopt(curl,CURLOPT_HTTPHEADER,hdr_list);
     }
-
-    DWORD body_size = body ? (DWORD)strlen(body) : 0;
-    BOOL ok = WinHttpSendRequest(hRequest, headers, (DWORD)-1L,
-                                 (LPVOID)body, body_size, body_size, 0);
-    if(!ok){
-        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession); return FALSE;
-    }
-    if(!WinHttpReceiveResponse(hRequest, NULL)){
-        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession); return FALSE;
-    }
-
-    DWORD dwSize = 0, dwDownloaded = 0; char* buffer = NULL; DWORD total = 0;
-    do {
-        if(!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
-        if(dwSize == 0) break;
-        char* tmp = (char*)realloc(buffer, total + dwSize + 1);
-        if(!tmp){ free(buffer); buffer=NULL; break; }
-        buffer = tmp;
-        if(!WinHttpReadData(hRequest, buffer + total, dwSize, &dwDownloaded)) break;
-        total += dwDownloaded;
-    } while(dwSize > 0);
-
-    if(buffer) buffer[total] = '\0';
-    if(out_buf) *out_buf = buffer; else free(buffer);
-
-    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
-    return buffer != NULL;
+    if(body) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    struct curl_buf buf={0};
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    CURLcode res = curl_easy_perform(curl);
+    if(hdr_list) curl_slist_free_all(hdr_list);
+    curl_easy_cleanup(curl);
+    if(res != CURLE_OK){ free(buf.data); return FALSE; }
+    if(out_buf) *out_buf = buf.data; else free(buf.data);
+    return TRUE;
 }
 
 // ---- Minimal JSON helpers ----
@@ -104,26 +148,39 @@ static BOOL json_get_number(const char* start, const char* end, const char* key,
     while(p<end && i<31 && ((*p>='0'&&*p<='9')||*p=='-'||*p=='+')) buf[i++]=*p++;
     buf[i]=0;
     if(i==0) return FALSE;
+#ifdef _WIN32
     *out = _strtoui64(buf,NULL,10);
+#else
+    *out = strtoull(buf,NULL,10);
+#endif
     return TRUE;
 }
 
 static uint64_t parse_rfc3339(const char* s){
     int Y,M,D,h,m; float sf;
     if(!s || sscanf(s, "%d-%d-%dT%d:%d:%f", &Y,&M,&D,&h,&m,&sf)!=6) return 0;
-    SYSTEMTIME st={0};
-    st.wYear=Y; st.wMonth=M; st.wDay=D;
-    st.wHour=h; st.wMinute=m; st.wSecond=(WORD)sf;
-    FILETIME ft; if(!SystemTimeToFileTime(&st,&ft)) return 0;
-    ULARGE_INTEGER uli; uli.LowPart=ft.dwLowDateTime; uli.HighPart=ft.dwHighDateTime;
-    return uli.QuadPart;
+    struct tm tm={0};
+    tm.tm_year=Y-1900; tm.tm_mon=M-1; tm.tm_mday=D;
+    tm.tm_hour=h; tm.tm_min=m; tm.tm_sec=(int)sf;
+#ifdef _WIN32
+    time_t t=_mkgmtime(&tm);
+#else
+    time_t t=timegm(&tm);
+#endif
+    if(t<0) return 0;
+    return (uint64_t)t;
 }
 
 static void enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_utf8,
                          uint64_t size, uint64_t ctime, uint64_t mtime, BOOL is_dir){
     if(!q) return;
-    DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+    DbWorkItem* wi;
+#ifdef _WIN32
+    wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
     if(!wi) return;
+#else
+    if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
+#endif
     wi->content = NULL;
     wi->preview = NULL;
     wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
@@ -137,41 +194,48 @@ static void enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_u
     wi->clone_id = 0;
     wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
+#ifdef _WIN32
     while(!MPMC_Push(q, wi)) { SwitchToThread(); }
+#else
+    while(!MPMC_Push(q, wi)) { sched_yield(); }
+#endif
 }
 
 // Obtain OAuth2 token using refresh_token flow. Credentials are taken from environment variables.
 static BOOL obtain_token(CloudProvider p, char** out_token){
     if(out_token) *out_token=NULL;
-    char client[256]={0}, secret[256]={0}, refresh[512]={0};
-    const wchar_t *env_client=NULL, *env_secret=NULL, *env_refresh=NULL;
-    const wchar_t *host=NULL, *path=NULL;
+    const char *env_client=NULL, *env_secret=NULL, *env_refresh=NULL;
+    const char *host=NULL, *path=NULL;
     switch(p){
     case CLOUD_ONEDRIVE:
-        env_client=L"ONEDRIVE_CLIENT_ID"; env_secret=L"ONEDRIVE_CLIENT_SECRET"; env_refresh=L"ONEDRIVE_REFRESH_TOKEN";
-        host=L"login.microsoftonline.com"; path=L"/common/oauth2/v2.0/token"; break;
+        env_client="ONEDRIVE_CLIENT_ID"; env_secret="ONEDRIVE_CLIENT_SECRET"; env_refresh="ONEDRIVE_REFRESH_TOKEN";
+        host="login.microsoftonline.com"; path="/common/oauth2/v2.0/token"; break;
     case CLOUD_GOOGLE_DRIVE:
-        env_client=L"GDRIVE_CLIENT_ID"; env_secret=L"GDRIVE_CLIENT_SECRET"; env_refresh=L"GDRIVE_REFRESH_TOKEN";
-        host=L"oauth2.googleapis.com"; path=L"/token"; break;
+        env_client="GDRIVE_CLIENT_ID"; env_secret="GDRIVE_CLIENT_SECRET"; env_refresh="GDRIVE_REFRESH_TOKEN";
+        host="oauth2.googleapis.com"; path="/token"; break;
     case CLOUD_PCLOUD:
-        env_client=L"PCLOUD_CLIENT_ID"; env_secret=L"PCLOUD_CLIENT_SECRET"; env_refresh=L"PCLOUD_REFRESH_TOKEN";
-        host=L"eapi.pcloud.com"; path=L"/oauth2_token"; break;
+        env_client="PCLOUD_CLIENT_ID"; env_secret="PCLOUD_CLIENT_SECRET"; env_refresh="PCLOUD_REFRESH_TOKEN";
+        host="eapi.pcloud.com"; path="/oauth2_token"; break;
     case CLOUD_DROPBOX:
-        env_client=L"DROPBOX_CLIENT_ID"; env_secret=L"DROPBOX_CLIENT_SECRET"; env_refresh=L"DROPBOX_REFRESH_TOKEN";
-        host=L"api.dropboxapi.com"; path=L"/oauth2/token"; break;
+        env_client="DROPBOX_CLIENT_ID"; env_secret="DROPBOX_CLIENT_SECRET"; env_refresh="DROPBOX_REFRESH_TOKEN";
+        host="api.dropboxapi.com"; path="/oauth2/token"; break;
     default: return FALSE;
     }
-    DWORD n;
-    n = GetEnvironmentVariableA(env_client, client, sizeof(client)); if(n==0 || n>=sizeof(client)) return FALSE;
-    n = GetEnvironmentVariableA(env_secret, secret, sizeof(secret)); if(n==0 || n>=sizeof(secret)) return FALSE;
-    n = GetEnvironmentVariableA(env_refresh, refresh, sizeof(refresh)); if(n==0 || n>=sizeof(refresh)) return FALSE;
+    const char* client=getenv(env_client);
+    const char* secret=getenv(env_secret);
+    const char* refresh=getenv(env_refresh);
+    if(!client || !secret || !refresh) return FALSE;
     char body[1024];
-    sprintf(body, "client_id=%s&client_secret=%s&refresh_token=%s&grant_type=refresh_token", client, secret, refresh);
-    wchar_t headers[128]; wcscpy(headers, L"Content-Type: application/x-www-form-urlencoded\r\n");
+    snprintf(body, sizeof(body), "client_id=%s&client_secret=%s&refresh_token=%s&grant_type=refresh_token", client, secret, refresh);
+    char headers[128]; strcpy(headers, "Content-Type: application/x-www-form-urlencoded\r\n");
     char* resp=NULL;
-    if(!http_request(host, path, L"POST", headers, body, &resp)) return FALSE;
+    if(!http_request(host, path, "POST", headers, body, &resp)) return FALSE;
     char tok[1024]; if(!json_get_string(resp, resp+strlen(resp), "access_token", tok, sizeof(tok))){ free(resp); return FALSE; }
+#ifdef _WIN32
     *out_token = _strdup(tok);
+#else
+    *out_token = strdup(tok);
+#endif
     free(resp);
     return *out_token!=NULL;
 }
@@ -192,20 +256,20 @@ static void onedrive_walk(const char* token, const wchar_t* root, const char* ro
     start->next=NULL;
     head=tail=start;
 
-    wchar_t headers[512];
-    swprintf(headers,512,L"Authorization: Bearer %S\r\n", token);
+    char headers[512];
+    snprintf(headers,512,"Authorization: Bearer %s\r\n", token);
 
     while(head){
         ODriveNode* curr=head; head=head->next; if(!head) tail=NULL;
 
-        wchar_t path[512];
+        char path[512];
         if(curr->id[0])
-            swprintf(path,512,L"/v1.0/me/drive/items/%S/children?select=id,name,size,folder,fileSystemInfo", curr->id);
+            snprintf(path,512,"/v1.0/me/drive/items/%s/children?select=id,name,size,folder,fileSystemInfo", curr->id);
         else
-            wcscpy(path,L"/v1.0/me/drive/root/children?select=id,name,size,folder,fileSystemInfo");
+            strcpy(path,"/v1.0/me/drive/root/children?select=id,name,size,folder,fileSystemInfo");
 
         char* resp=NULL;
-        if(http_request(L"graph.microsoft.com", path, L"GET", headers, NULL, &resp)){
+        if(http_request("graph.microsoft.com", path, "GET", headers, NULL, &resp)){
             const char* p=resp; const char* end=resp+strlen(resp);
             while((p=strchr(p,'{'))){
                 const char* obj=p; int depth=1; p++;
@@ -253,20 +317,20 @@ static void google_drive_walk(const char* token, const wchar_t* root, const char
     start->next=NULL;
     head=tail=start;
 
-    wchar_t headers[512];
-    swprintf(headers,512,L"Authorization: Bearer %S\r\n", token);
+    char headers[512];
+    snprintf(headers,512,"Authorization: Bearer %s\r\n", token);
 
     while(head){
         GDriveNode* curr=head; head=head->next; if(!head) tail=NULL;
 
-        wchar_t path[1024];
+        char path[1024];
         if(curr->id[0])
-            swprintf(path,1024,L"/drive/v3/files?q='%S'+in+parents&fields=files(id,name,mimeType,modifiedTime,size)", curr->id);
+            snprintf(path,1024,"/drive/v3/files?q='%s'+in+parents&fields=files(id,name,mimeType,modifiedTime,size)", curr->id);
         else
-            wcscpy(path,L"/drive/v3/files?q='root'+in+parents&fields=files(id,name,mimeType,modifiedTime,size)");
+            strcpy(path,"/drive/v3/files?q='root'+in+parents&fields=files(id,name,mimeType,modifiedTime,size)");
 
         char* resp=NULL;
-        if(http_request(L"www.googleapis.com", path, L"GET", headers,NULL,&resp)){
+        if(http_request("www.googleapis.com", path, "GET", headers,NULL,&resp)){
             const char* p=resp; const char* end=resp+strlen(resp);
             while((p=strchr(p,'{'))){
                 const char* obj=p; int depth=1; p++;
@@ -300,9 +364,9 @@ static void google_drive_walk(const char* token, const wchar_t* root, const char
 }
 
 static void pcloud_walk(const char* token, const wchar_t* parent, MPMCQueue* q){
-    wchar_t path[512];
-    swprintf(path,512,L"/listfolder?auth=%S&folderid=0&recursive=1", token);
-    char* resp=NULL; if(!http_request(L"api.pcloud.com", path, L"GET", L"", NULL,&resp)) return;
+    char path[512];
+    snprintf(path,512,"/listfolder?auth=%s&folderid=0&recursive=1", token);
+    char* resp=NULL; if(!http_request("api.pcloud.com", path, "GET", "", NULL,&resp)) return;
     const char* p=resp; const char* end=resp+strlen(resp);
     while((p=strchr(p,'{'))){
         const char* obj=p; int depth=1; p++;
@@ -317,10 +381,10 @@ static void pcloud_walk(const char* token, const wchar_t* parent, MPMCQueue* q){
 }
 
 static void dropbox_walk(const char* token, const wchar_t* parent, MPMCQueue* q){
-    wchar_t headers[512];
-    swprintf(headers,512,L"Authorization: Bearer %S\r\nContent-Type: application/json\r\n", token);
+    char headers[512];
+    snprintf(headers,512,"Authorization: Bearer %s\r\nContent-Type: application/json\r\n", token);
     const char* body="{\"path\":\"\",\"recursive\":true}";
-    char* resp=NULL; if(!http_request(L"api.dropboxapi.com", L"/2/files/list_folder", L"POST", headers, body, &resp)) return;
+    char* resp=NULL; if(!http_request("api.dropboxapi.com", "/2/files/list_folder", "POST", headers, body, &resp)) return;
     const char* p=resp; const char* end=resp+strlen(resp);
     while((p=strchr(p,'{'))){
         const char* obj=p; int depth=1; p++;
@@ -345,16 +409,16 @@ BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
     wchar_t root[MAX_LONG_PATH]; root[0]=0;
     switch(provider){
     case CLOUD_ONEDRIVE:
-        wcscpy(root,L"OneDrive:");
+        wcscpy_s(root,MAX_LONG_PATH,L"OneDrive:");
         onedrive_walk(token,root,NULL,out_queue); break;
     case CLOUD_GOOGLE_DRIVE:
-        wcscpy(root,L"GDrive:");
+        wcscpy_s(root,MAX_LONG_PATH,L"GDrive:");
         google_drive_walk(token,root,NULL,out_queue); break;
     case CLOUD_PCLOUD:
-        wcscpy(root,L"pCloud:");
+        wcscpy_s(root,MAX_LONG_PATH,L"pCloud:");
         pcloud_walk(token,root,out_queue); break;
     case CLOUD_DROPBOX:
-        wcscpy(root,L"Dropbox:");
+        wcscpy_s(root,MAX_LONG_PATH,L"Dropbox:");
         dropbox_walk(token,root,out_queue); break;
     default:
         free(token); return FALSE;
@@ -364,9 +428,8 @@ BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
     IndexState st={0};
     db_get_index_state(db, &st);
     if(st.indexing_level == 0) st.indexing_level = INDEX_FULL_CONTENT;
-    FILETIME now; GetSystemTimeAsFileTime(&now);
-    ULARGE_INTEGER uli; uli.LowPart = now.dwLowDateTime; uli.HighPart = now.dwHighDateTime;
-    st.last_scan_time = uli.QuadPart;
+    uint64_t now = (uint64_t)time(NULL);
+    st.last_scan_time = now;
     if(db_begin_write(db)){
         db_set_index_state(db, &st);
         db_commit_write(db);
