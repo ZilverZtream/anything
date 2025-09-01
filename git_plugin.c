@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <errno.h>
 #include <git2.h>
 
 #ifdef _WIN32
@@ -130,7 +131,10 @@ static void scan_dir(const wchar_t* dir){
     wchar_t pattern[MAX_LONG_PATH];
     _snwprintf(pattern, MAX_LONG_PATH, L"%s\\*.*", dir);
     WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pattern, &fd);
-    if(h==INVALID_HANDLE_VALUE) return;
+    if(h==INVALID_HANDLE_VALUE){
+        fwprintf(stderr,L"[git] failed to open %ls: %lu\n",dir,GetLastError());
+        return;
+    }
     do{
         if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
         if(fd.cFileName[0]==L'.' && (fd.cFileName[1]==0 || (fd.cFileName[1]==L'.' && fd.cFileName[2]==0))) continue;
@@ -154,6 +158,9 @@ static void scan_dir(const wchar_t* dir){
                                 git_reference_free(ref);
                             }
                             git_reference_iterator_free(iter);
+                        }else{
+                            const git_error* e = git_error_last();
+                            fprintf(stderr,"[git] reference_iterator_new failed %s: %s\n", repo_mb, e && e->message ? e->message : "");
                         }
                         git_oid oid;
                         while(git_revwalk_next(&oid, walk)==0){
@@ -161,8 +168,14 @@ static void scan_dir(const wchar_t* dir){
                             process_commit(dir, repo, &oid);
                         }
                         git_revwalk_free(walk);
+                    }else{
+                        const git_error* e = git_error_last();
+                        fprintf(stderr,"[git] revwalk_new failed %s: %s\n", repo_mb, e && e->message ? e->message : "");
                     }
                     git_repository_free(repo);
+                }else{
+                    const git_error* e = git_error_last();
+                    fprintf(stderr,"[git] repository_open failed %s: %s\n", repo_mb, e && e->message ? e->message : "");
                 }
             }else{
                 scan_dir(full);
@@ -177,7 +190,10 @@ static void scan_dir(const wchar_t* dir){
     char dir_mb[PATH_MAX];
     wcstombs(dir_mb, dir, sizeof(dir_mb));
     DIR* d = opendir(dir_mb);
-    if(!d) return;
+    if(!d){
+        fprintf(stderr,"[git] failed to open %s: %s\n", dir_mb, strerror(errno));
+        return;
+    }
     struct dirent* ent;
     while((ent = readdir(d))){
         if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
@@ -185,7 +201,10 @@ static void scan_dir(const wchar_t* dir){
         char full_mb[PATH_MAX];
         snprintf(full_mb, sizeof(full_mb), "%s/%s", dir_mb, ent->d_name);
         struct stat st;
-        if(stat(full_mb, &st)!=0) continue;
+        if(stat(full_mb, &st)!=0){
+            fprintf(stderr,"[git] stat failed %s: %s\n", full_mb, strerror(errno));
+            continue;
+        }
         wchar_t full[MAX_LONG_PATH];
         mbstowcs(full, full_mb, MAX_LONG_PATH);
         for(wchar_t* p=full; *p; ++p) if(*p==L'/') *p=L'\\';
@@ -207,6 +226,9 @@ static void scan_dir(const wchar_t* dir){
                                 git_reference_free(ref);
                             }
                             git_reference_iterator_free(iter);
+                        }else{
+                            const git_error* e = git_error_last();
+                            fprintf(stderr,"[git] reference_iterator_new failed %s: %s\n", repo_mb, e && e->message ? e->message : "");
                         }
                         git_oid oid;
                         while(git_revwalk_next(&oid, walk)==0){
@@ -214,8 +236,14 @@ static void scan_dir(const wchar_t* dir){
                             process_commit(dir, repo, &oid);
                         }
                         git_revwalk_free(walk);
+                    }else{
+                        const git_error* e = git_error_last();
+                        fprintf(stderr,"[git] revwalk_new failed %s: %s\n", repo_mb, e && e->message ? e->message : "");
                     }
                     git_repository_free(repo);
+                }else{
+                    const git_error* e = git_error_last();
+                    fprintf(stderr,"[git] repository_open failed %s: %s\n", repo_mb, e && e->message ? e->message : "");
                 }
             }else{
                 scan_dir(full);

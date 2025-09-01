@@ -69,7 +69,10 @@ static void scan_dir(const wchar_t* dir){
     wchar_t pattern[MAX_LONG_PATH];
     _snwprintf(pattern, MAX_LONG_PATH, L"%s\\*.*", dir);
     WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pattern,&fd);
-    if(h==INVALID_HANDLE_VALUE) return;
+    if(h==INVALID_HANDLE_VALUE){
+        fwprintf(stderr,L"[duplicates] failed to open %ls: %lu\n",dir,GetLastError());
+        return;
+    }
     do{
         if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
         if(fd.cFileName[0]==L'.' && (fd.cFileName[1]==0 || (fd.cFileName[1]==L'.' && fd.cFileName[2]==0))) continue;
@@ -98,7 +101,10 @@ static void scan_dir(const wchar_t* dir){
     char dir_mb[PATH_MAX];
     wcstombs(dir_mb, dir, sizeof(dir_mb));
     DIR* d = opendir(dir_mb);
-    if(!d) return;
+    if(!d){
+        fprintf(stderr,"[duplicates] failed to open %s: %s\n", dir_mb, strerror(errno));
+        return;
+    }
     struct dirent* ent;
     while((ent = readdir(d))){
         if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
@@ -106,7 +112,10 @@ static void scan_dir(const wchar_t* dir){
         char full_mb[PATH_MAX];
         snprintf(full_mb, sizeof(full_mb), "%s/%s", dir_mb, ent->d_name);
         struct stat st;
-        if(stat(full_mb, &st)!=0) continue;
+        if(stat(full_mb, &st)!=0){
+            fprintf(stderr,"[duplicates] stat failed %s: %s\n", full_mb, strerror(errno));
+            continue;
+        }
         wchar_t full[MAX_LONG_PATH];
         mbstowcs(full, full_mb, MAX_LONG_PATH);
         for(wchar_t* p=full; *p; ++p) if(*p==L'/') *p=L'\\';

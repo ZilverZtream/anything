@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 #include <time.h>
 #include <curl/curl.h>
 #include "cJSON.h"
@@ -118,12 +119,13 @@ static BOOL load_token(void){
         if(!home) return FALSE; snprintf(path_u8,sizeof(path_u8),"%s/.anything/ms_mail_token",home);
 #endif
     }
-    FILE* f=fopen(path_u8,"rb"); if(!f) return FALSE;
+    FILE* f=fopen(path_u8,"rb");
+    if(!f){ fprintf(stderr,"[msmail] failed to open token file %s: %s\n",path_u8,strerror(errno)); return FALSE; }
 #ifndef _WIN32
-    struct stat st; if(stat(path_u8,&st)!=0){ fclose(f); return FALSE; }
-    if((st.st_mode&0777)!=0600){ fclose(f); return FALSE; }
+    struct stat st; if(stat(path_u8,&st)!=0){ fprintf(stderr,"[msmail] stat failed for %s: %s\n",path_u8,strerror(errno)); fclose(f); return FALSE; }
+    if((st.st_mode&0777)!=0600){ fprintf(stderr,"[msmail] insecure permissions on %s\n",path_u8); fclose(f); return FALSE; }
 #endif
-    char buf[256]; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f); if(n==0) return FALSE;
+    char buf[256]; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f); if(n==0){ fprintf(stderr,"[msmail] token file %s empty or unreadable\n",path_u8); return FALSE; }
     buf[n]=0; char* nl=strpbrk(buf,"\r\n"); if(nl) *nl=0;
     to_wide(buf,g_token,256);
     return g_token[0]!=L'\0';
@@ -162,7 +164,9 @@ static BOOL init(const PluginHost* host){
     if(store_path){
         char tok_u8[256]; to_utf8(g_token,tok_u8,sizeof(tok_u8));
         FILE* f=fopen(store_path,"wb");
-        if(f){
+        if(!f){
+            fprintf(stderr,"[msmail] cannot write token store %s: %s\n",store_path,strerror(errno));
+        }else{
 #ifndef _WIN32
             fchmod(fileno(f),0600);
 #endif

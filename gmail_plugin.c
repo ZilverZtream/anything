@@ -71,8 +71,18 @@ static size_t curl_write_cb(void* contents,size_t size,size_t nmemb,void* userp)
 
 static BOOL http_get(const char* url, const char* token, char** out){
     if(out) *out=NULL; static int curl_inited=0;
-    if(!curl_inited){ if(curl_global_init(CURL_GLOBAL_DEFAULT)!=0) return FALSE; curl_inited=1; }
-    CURL* curl=curl_easy_init(); if(!curl) return FALSE;
+    if(!curl_inited){
+        if(curl_global_init(CURL_GLOBAL_DEFAULT)!=0){
+            fprintf(stderr,"[gmail] curl_global_init failed\n");
+            return FALSE;
+        }
+        curl_inited=1;
+    }
+    CURL* curl=curl_easy_init();
+    if(!curl){
+        fprintf(stderr,"[gmail] curl_easy_init failed\n");
+        return FALSE;
+    }
     curl_easy_setopt(curl, CURLOPT_URL, url);
     struct curl_slist* hdr=NULL; char auth[512];
     snprintf(auth,sizeof(auth),"Authorization: Bearer %s",token);
@@ -82,7 +92,11 @@ static BOOL http_get(const char* url, const char* token, char** out){
     curl_easy_setopt(curl,CURLOPT_WRITEDATA,&buf);
     CURLcode res=curl_easy_perform(curl);
     if(hdr) curl_slist_free_all(hdr); curl_easy_cleanup(curl);
-    if(res!=CURLE_OK){ free(buf.data); return FALSE; }
+    if(res!=CURLE_OK){
+        fprintf(stderr,"[gmail] curl_easy_perform failed: %s\n", curl_easy_strerror(res));
+        free(buf.data);
+        return FALSE;
+    }
     if(out) *out=buf.data; else free(buf.data); return TRUE;
 }
 
@@ -92,8 +106,14 @@ static uint64_t to_filetime(uint64_t unix_secs){
 
 static void process_message(const char* id, const char* token_utf8){
     char url[512]; snprintf(url,sizeof(url),"https://gmail.googleapis.com/gmail/v1/users/me/messages/%s?format=full",id);
-    char* resp=NULL; if(!http_get(url,token_utf8,&resp)) return;
-    cJSON* root=cJSON_Parse(resp); free(resp); if(!root) return;
+    char* resp=NULL; if(!http_get(url,token_utf8,&resp)){
+        fprintf(stderr,"[gmail] failed to fetch message %s\n", id);
+        return;
+    }
+    cJSON* root=cJSON_Parse(resp); free(resp); if(!root){
+        fprintf(stderr,"[gmail] failed to parse message JSON %s\n", id);
+        return;
+    }
     const char* snippet=""; const char* subject=NULL; const char* internal=NULL;
     cJSON* sn=cJSON_GetObjectItem(root,"snippet"); if(cJSON_IsString(sn)) snippet=sn->valuestring;
     cJSON* in=cJSON_GetObjectItem(root,"internalDate"); if(cJSON_IsString(in)) internal=in->valuestring;
@@ -130,14 +150,21 @@ static void process_message(const char* id, const char* token_utf8){
 
 static BOOL init(const PluginHost* host){
     if(!host) return FALSE; g_host=*host; const char* env=getenv("GMAIL_TOKEN");
-    if(env) to_wide(env,g_oauth_token,256); return TRUE;
+    if(env) to_wide(env,g_oauth_token,256); else fprintf(stderr,"[gmail] GMAIL_TOKEN not set\n");
+    return TRUE;
 }
 
 static void scan(void){
     if(g_oauth_token[0]==L'\0') return; char token_utf8[256];
     to_utf8(g_oauth_token,token_utf8,sizeof(token_utf8));
-    char* resp=NULL; if(!http_get("https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=5",token_utf8,&resp)) return;
-    cJSON* root=cJSON_Parse(resp); free(resp); if(!root) return;
+    char* resp=NULL; if(!http_get("https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=5",token_utf8,&resp)){
+        fprintf(stderr,"[gmail] failed to list messages\n");
+        return;
+    }
+    cJSON* root=cJSON_Parse(resp); free(resp); if(!root){
+        fprintf(stderr,"[gmail] failed to parse message list JSON\n");
+        return;
+    }
     cJSON* msgs=cJSON_GetObjectItem(root,"messages");
     if(cJSON_IsArray(msgs)){
         cJSON* m=NULL; cJSON_ArrayForEach(m,msgs){

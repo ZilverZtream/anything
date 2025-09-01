@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 #include <time.h>
 #include <sqlite3.h>
 #include <curl/curl.h>
@@ -97,17 +98,23 @@ static void seen_add_mem(const char* url){
 
 static void seen_add(const char* url){
     if(!url) return; seen_add_mem(url);
-    FILE* f=fopen(g_state_file,"a"); if(f){ fprintf(f,"%s\n",url); fclose(f);} }
+    FILE* f=fopen(g_state_file,"a");
+    if(!f){ fprintf(stderr,"[web_archive] failed to open %s for append: %s\n",g_state_file,strerror(errno)); }
+    else { fprintf(f,"%s\n",url); fclose(f); }
+}
 
 static int seen_has(const char* url){
     if(!url) return 1; for(size_t i=0;i<g_seen_count;i++) if(strcmp(g_seen[i].url,url)==0) return 1; return 0; }
 
 static void load_state(void){
-    FILE* f=fopen(g_state_file,"r"); if(!f) return; char line[4096];
+    FILE* f=fopen(g_state_file,"r");
+    if(!f){ fprintf(stderr,"[web_archive] unable to open state file %s: %s\n",g_state_file,strerror(errno)); return; }
+    char line[4096];
     while(fgets(line,sizeof(line),f)){
         size_t len=strlen(line); while(len&&(line[len-1]=='\n'||line[len-1]=='\r')) line[--len]=0;
         if(len>0) seen_add_mem(line);
-    } fclose(f);
+    }
+    fclose(f);
 }
 
 static void init_state_path(void){
@@ -227,10 +234,27 @@ static void scan_chromium_variant(const char* hist,const char* bm){
         }
         sqlite3_close(db);
     }
-    FILE* fb=fopen(bm,"rb"); if(fb){ fseek(fb,0,SEEK_END); long sz=ftell(fb); fseek(fb,0,SEEK_SET);
-        char* data=(char*)malloc(sz+1); if(data){ fread(data,1,sz,fb); data[sz]=0; cJSON* root=cJSON_Parse(data);
-            if(root){ cJSON* roots=cJSON_GetObjectItem(root,"roots"); if(roots){ cJSON* child=roots->child; while(child){ parse_chrome_bm(child); child=child->next; } }
-                cJSON_Delete(root); } free(data);} fclose(fb); }
+    FILE* fb=fopen(bm,"rb");
+    if(!fb){
+        fprintf(stderr,"[web_archive] failed to open %s: %s\n",bm,strerror(errno));
+    }else{
+        fseek(fb,0,SEEK_END); long sz=ftell(fb); fseek(fb,0,SEEK_SET);
+        char* data=(char*)malloc(sz+1);
+        if(data){
+            if(fread(data,1,sz,fb)!=(size_t)sz){
+                fprintf(stderr,"[web_archive] failed to read %s\n",bm);
+                free(data); fclose(fb); return;
+            }
+            data[sz]=0; cJSON* root=cJSON_Parse(data);
+            if(root){
+                cJSON* roots=cJSON_GetObjectItem(root,"roots");
+                if(roots){ cJSON* child=roots->child; while(child){ parse_chrome_bm(child); child=child->next; } }
+                cJSON_Delete(root);
+            }
+            free(data);
+        }
+        fclose(fb);
+    }
 }
 
 static void scan_chrome(void){
@@ -336,8 +360,13 @@ static void scan_firefox(void){
 // ---- Safari (macOS only) ----
 #ifdef __APPLE__
 static void parse_safari_bookmarks(const char* path){
-    FILE* f=fopen(path,"rb"); if(!f) return; fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
-    char* data=(char*)malloc(sz+1); if(!data){ fclose(f); return; } fread(data,1,sz,f); data[sz]=0; fclose(f);
+    FILE* f=fopen(path,"rb");
+    if(!f){ fprintf(stderr,"[web_archive] failed to open %s: %s\n",path,strerror(errno)); return; }
+    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+    char* data=(char*)malloc(sz+1);
+    if(!data){ fclose(f); return; }
+    if(fread(data,1,sz,f)!=(size_t)sz){ fprintf(stderr,"[web_archive] failed to read %s\n",path); free(data); fclose(f); return; }
+    data[sz]=0; fclose(f);
     char* p=data; while((p=strstr(p,"<key>URLString</key>"))){ char* s=strstr(p,"<string>"); if(!s) break; s+=8; char* e=strstr(s,"</string>"); if(!e) break; char url[4096]; size_t l=e-s; if(l>4095) l=4095; memcpy(url,s,l); url[l]=0; char* tkey=strstr(p,"<key>title</key>"); const char* title=NULL; char tbuf[1024]; if(tkey && tkey<e){ char* ts=strstr(tkey,"<string>"); if(ts){ ts+=8; char* te=strstr(ts,"</string>"); if(te){ size_t tl=te-ts; if(tl>1023) tl=1023; memcpy(tbuf,ts,tl); tbuf[tl]=0; title=tbuf; } }} process_url(url,title); p=e; }
     free(data);
 }
