@@ -23,8 +23,6 @@ static int wcscpy_s(wchar_t* dst, size_t dstcch, const wchar_t* src){
     dst[dstcch-1] = 0;
     return 0;
 }
-static void* _aligned_malloc(size_t size, size_t align){ void* p=NULL; if(posix_memalign(&p,align,size)!=0) return NULL; return p; }
-static void _aligned_free(void* p){ free(p); }
 static uint64_t to_filetime(time_t t){ return ((uint64_t)t*10000000ULL)+116444736000000000ULL; }
 #endif
 #include <stdint.h>
@@ -151,7 +149,7 @@ static void emit_duplicates(void){
               g_files[j].hash == g_files[i].hash) j++;
         if(j - i > 1){
             for(size_t k=i; k<j; k++){
-                DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
                 if(!wi) continue;
                 const wchar_t* path = g_files[k].path;
                 wchar_t parent[MAX_LONG_PATH];
@@ -172,7 +170,7 @@ static void emit_duplicates(void){
                 wi->preview = NULL;
                 while(!MPMC_Push(g_host.queue, wi)){
                     if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0){
-                        _aligned_free(wi);
+                        aligned_free(wi);
                         return;
                     }
                     Sleep(0);

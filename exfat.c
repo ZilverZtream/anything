@@ -25,7 +25,7 @@ typedef struct GenericScanner {
 
 static void emit(MPMCQueue* q, const wchar_t* parent, const WIN32_FIND_DATAW* f){
     if(wcscmp(f->cFileName, L".")==0 || wcscmp(f->cFileName, L"..")==0) return;
-    DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+    DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
     wi->content = NULL;
     wi->preview = NULL;
     wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
@@ -44,7 +44,7 @@ static void emit(MPMCQueue* q, const wchar_t* parent, const WIN32_FIND_DATAW* f)
     }
     if(!tries){
         fwprintf(stderr, L"emit: dropping %ls\\%ls (queue full)\n", parent, wi->name);
-        _aligned_free(wi);
+        aligned_free(wi);
         return;
     }
 }

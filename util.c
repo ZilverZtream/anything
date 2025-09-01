@@ -25,6 +25,24 @@ size_t dynamic_work_mem(void){
     return avail;
 }
 
+void* aligned_malloc(size_t size, size_t alignment){
+#ifdef _WIN32
+    return _aligned_malloc(size, alignment);
+#else
+    void* p = NULL;
+    if(posix_memalign(&p, alignment, size) != 0) return NULL;
+    return p;
+#endif
+}
+
+void aligned_free(void* p){
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
+
 static BOOL sb_reserve(SortBuffer* sb, size_t add){
     size_t need = sb->len + add;
     if(need > sb->cap){
