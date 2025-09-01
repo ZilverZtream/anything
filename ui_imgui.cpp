@@ -102,6 +102,7 @@ struct Result {
     std::string filename;
     std::string path;
     std::string snippet;
+    std::string preview_path;
     int64_t size;
     time_t modified;
     std::string type;
@@ -299,7 +300,7 @@ static void delete_path_os(const std::string& p){
 }
 
 static void load_result_texture(Result& r) {
-    std::string full = r.path + "\\" + r.filename;
+    std::string full = r.preview_path.empty() ? r.path + "\\" + r.filename : r.preview_path;
     int channels;
     unsigned char* data = stbi_load(full.c_str(), &r.width, &r.height, &channels, 0);
     if (!data) return;
@@ -840,6 +841,14 @@ static void search_thread(SearchThreadArgs* sta) {
                 mdb_get(txn, dbi_strings, &ck, &cv);
                 snippet = std::string((char*)cv.mv_data, cv.mv_size).substr(0, 500);
             }
+            std::string preview_img = "";
+            if (r->preview_str_id) {
+                MDB_val pk = {.mv_data = &r->preview_str_id, .mv_size = sizeof(r->preview_str_id)};
+                MDB_val pvimg;
+                if (mdb_get(txn, dbi_strings, &pk, &pvimg) == 0) {
+                    preview_img = std::string((char*)pvimg.mv_data, pvimg.mv_size);
+                }
+            }
             std::string type = "text";
             size_t dot = filename.rfind('.');
             if (dot != std::string::npos) {
@@ -849,7 +858,7 @@ static void search_thread(SearchThreadArgs* sta) {
                 else if (e == "md" || e == "markdown") type = "markdown";
                 else if (e == "c" || e == "h" || e == "cpp" || e == "cc" || e == "hpp" || e == "rs" || e == "go" || e == "cs" || e == "vb" || e == "java" || e == "py") type = "code";
             }
-            sta->results->push_back({filename, path, snippet, (int64_t)r->file_size, (time_t)(r->modified_time / 10000000 - 11644473600LL), type, ranked[i].score});
+            sta->results->push_back({filename, path, snippet, preview_img, (int64_t)r->file_size, (time_t)(r->modified_time / 10000000 - 11644473600LL), type, ranked[i].score});
         }
         *sta->done = true;
     }
@@ -1002,7 +1011,7 @@ int run_ui(void){
                                 selected = (int)i;
                             }
                             bool hovered = ImGui::IsItemHovered();
-                            if ((hovered || is_selected) && r.type == "image" && r.texture == 0) {
+                            if ((hovered || is_selected) && r.texture == 0 && (r.type == "image" || !r.preview_path.empty())) {
                                 load_result_texture(r);
                             }
                             if (ImGui::BeginPopupContextItem()) {
@@ -1014,7 +1023,7 @@ int run_ui(void){
                                 ImGui::EndPopup();
                             }
                             ImGui::TableSetColumnIndex(0);
-                            if (r.type == "image" && r.texture != 0) {
+                            if ((r.type == "image" || !r.preview_path.empty()) && r.texture != 0) {
                                 ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(48, 48));
                             }
                             ImGui::TableSetColumnIndex(2);
@@ -1071,7 +1080,16 @@ int run_ui(void){
                                 ImGui::EndTabItem();
                             }
                             if (ImGui::BeginTabItem("Preview")) {
-                                if (r.type == "text" || r.type == "pdf") {
+                                if (!r.preview_path.empty()) {
+                                    if (r.texture == 0) load_result_texture(const_cast<Result&>(r));
+                                    if (r.texture != 0) {
+                                        float aspect = static_cast<float>(r.height) / static_cast<float>(r.width);
+                                        float preview_width = ImGui::GetContentRegionAvail().x;
+                                        ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(preview_width, preview_width * aspect));
+                                    } else {
+                                        ImGui::Text("No thumbnail loaded.");
+                                    }
+                                } else if (r.type == "text" || r.type == "pdf") {
                                     draw_highlighted(r.snippet, query_str);
                                 } else if (r.type == "markdown") {
                                     render_markdown(r.snippet);

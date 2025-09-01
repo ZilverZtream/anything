@@ -3,6 +3,9 @@
 #include "apfs.h"
 #include <CoreServices/CoreServices.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <QuickLook/QuickLook.h>
+#include <ImageIO/ImageIO.h>
+#include <uuid/uuid.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
@@ -43,6 +46,35 @@ static BOOL is_cancelled(HANDLE h){
     if(!h) return FALSE;
     return *(volatile BOOL*)(uintptr_t)h;
 #endif
+}
+
+wchar_t* GenerateThumbnail(const wchar_t* path){
+    CFStringRef cfPath = CFStringCreateWithCharacters(NULL, path, wcslen(path));
+    if(!cfPath) return NULL;
+    CFURLRef url = CFURLCreateWithFileSystemPath(NULL, cfPath, kCFURLPOSIXPathStyle, false);
+    CFRelease(cfPath);
+    if(!url) return NULL;
+    CGSize size = {256,256};
+    CGImageRef img = QLThumbnailImageCreate(NULL, url, size, NULL);
+    CFRelease(url);
+    if(!img) return NULL;
+    uuid_t id; uuid_generate(id);
+    char idstr[37]; uuid_unparse_lower(id, idstr);
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "/tmp/%s.png", idstr);
+    CFURLRef dst = CFURLCreateFromFileSystemRepresentation(NULL, (UInt8*)tmp, strlen(tmp), false);
+    if(!dst){ CGImageRelease(img); return NULL; }
+    CGImageDestinationRef dest = CGImageDestinationCreateWithURL(dst, kUTTypePNG, 1, NULL);
+    if(!dest){ CFRelease(dst); CGImageRelease(img); return NULL; }
+    CGImageDestinationAddImage(dest, img, NULL);
+    bool ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    CFRelease(dst);
+    CGImageRelease(img);
+    if(!ok) return NULL;
+    wchar_t wtmp[PATH_MAX];
+    mbstowcs(wtmp, tmp, PATH_MAX);
+    return wcsdup(wtmp);
 }
 
 static void fs_to_wide(wchar_t* dst, const char* src, size_t dstlen){
