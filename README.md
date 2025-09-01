@@ -18,7 +18,7 @@ It scans drives (via NTFS USN journal, generic directory walking, or native Linu
   - Full content extraction for text and common document formats (TXT, source code, PDF, DOCX, etc.), plus native parsing for email (.eml), Outlook archives (.pst) and ebook (.epub) files
   - Native parsers for email, Outlook archives and ebook formats extract sender, subject, author and title without relying on system IFilters
   - Optional content snippets and rich metadata extraction (author, photo EXIF camera/lens, music ID3 artist/album, document title) with bundled cross-platform parsers
-- Archive content indexing (ZIP/RAR/7z) via libzip.
+  - Archive content indexing (tar, cpio, zip, ar, iso, cab, rar, 7z, xar, lha, and compressed formats like gz/bz2/xz/Z/lzma/lz4/zst) via libarchive.
 - Pluggable scanners for cloud drives (OneDrive/Google Drive/pCloud/Dropbox).
 - Native WSL filesystem indexing without wsl.exe overhead.
 - Experimental macOS virtualization disk indexing for Docker, Parallels and VMware images.
@@ -45,7 +45,7 @@ Define the `ENTERPRISE` macro at build time to enable the stubs:
 - Centralized deployment helpers
 
 ## Archive Content Indexing
-Anything can open common archives and index contained filenames so a search result can point directly to a file inside a ZIP, RAR, or 7z archive.
+Anything can open a wide range of archives and index contained filenames so a search result can point directly to a file inside formats such as tar, cpio, zip, ar, iso, cab, rar, 7z, xar, and lha, including compressed variants (gz, bz2, xz, Z, lzma, lz4, zst).
 
 ## Cloud Drive Integration
 Stub scanners exist for OneDrive, Google Drive, and Dropbox. They will use official APIs to pull file listings and merge them into the local database.

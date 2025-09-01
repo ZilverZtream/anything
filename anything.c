@@ -200,7 +200,15 @@ static BOOL is_archive_file(const wchar_t* name){
     const wchar_t* ext = wcsrchr(name, L'.');
     if(!ext) return FALSE;
     ext++;
-    return _wcsicmp(ext, L"zip")==0 || _wcsicmp(ext,L"rar")==0 || _wcsicmp(ext,L"7z")==0;
+    static const wchar_t* exts[] = {
+        L"zip", L"rar", L"7z", L"tar", L"cpio", L"ar", L"iso", L"cab", L"xar", L"lha", L"lzh",
+        L"gz", L"bz2", L"xz", L"z", L"lzma", L"lz4", L"zst", L"tgz", L"tbz", L"tbz2", L"txz",
+        L"tlz", L"tzst"
+    };
+    for(size_t i=0;i<sizeof(exts)/sizeof(exts[0]);i++){
+        if(_wcsicmp(ext, exts[i])==0) return TRUE;
+    }
+    return FALSE;
 }
 
 #define MAX_INDEXED_CONTENT (1024*1024) // 1MB
