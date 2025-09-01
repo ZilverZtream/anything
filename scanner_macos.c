@@ -272,8 +272,12 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
 
 void FileScanner_Wait(FileScanner* s){
     if(!s) return;
-    if(s->is_network) NetworkScanner_Wait(s->net);
-    else pthread_join(s->enum_thread, NULL);
+    if(s->is_network){
+        NetworkScanner_Wait(s->net);
+    } else {
+        pthread_join(s->enum_thread, NULL);
+        s->enum_thread = 0;
+    }
 }
 
 void FileScanner_Free(FileScanner* s){
@@ -285,6 +289,7 @@ void FileScanner_Free(FileScanner* s){
     }
     s->stop = TRUE;
     CFRunLoopStop(s->run_loop);
+    if(s->enum_thread) pthread_join(s->enum_thread, NULL);
     pthread_join(s->loop_thread, NULL);
     FSEventStreamStop(s->stream);
     FSEventStreamInvalidate(s->stream);
