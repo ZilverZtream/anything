@@ -27,18 +27,19 @@
  #include <algorithm>
  #include <vector>
  #include <string>
- #include <unordered_set>
- #include <cctype>
- #include <ctime>
- #include <cmath>
- #include <limits.h>
- #include <inttypes.h>
- #include <ctype.h>
- #include <string.h>
- #include <stdlib.h>
- #include <thread>
- #include <mutex>
- #include <memory>
+#include <unordered_set>
+#include <cctype>
+#include <ctime>
+#include <cmath>
+#include <limits.h>
+#include <inttypes.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
+#include <thread>
+#include <mutex>
+#include <memory>
+#include <sstream>
  extern "C" {
  #include "lmdb.h"
  #include "database.h"
@@ -222,6 +223,25 @@ void draw_highlighted(const std::string& text, const std::string& q) {
         ImGui::SameLine(0.0f, 0.0f);
         start = found + lower_q.size();
     }
+}
+
+static void render_markdown(const std::string& text) {
+    std::istringstream stream(text);
+    std::string line;
+    ImGui::PushTextWrapPos(0.0f);
+    while (std::getline(stream, line)) {
+        size_t level = 0;
+        while (level < line.size() && line[level] == '#') level++;
+        if (level > 0 && line.size() > level && line[level] == ' ') {
+            float scale = 1.0f + (6 - (level > 6 ? 6 : level)) * 0.1f;
+            ImGui::SetWindowFontScale(scale);
+            ImGui::TextWrapped("%s", line.c_str() + level + 1);
+            ImGui::SetWindowFontScale(1.0f);
+        } else {
+            ImGui::TextWrapped("%s", line.c_str());
+        }
+    }
+    ImGui::PopTextWrapPos();
 }
 
 enum ResultColumn { COL_NAME, COL_PATH, COL_SIZE, COL_MOD, COL_SCORE };
@@ -826,6 +846,7 @@ static void search_thread(SearchThreadArgs* sta) {
                 std::string e = to_lower(filename.substr(dot + 1));
                 if (e == "jpg" || e == "png" || e == "gif" || e == "bmp") type = "image";
                 else if (e == "pdf") type = "pdf";
+                else if (e == "md" || e == "markdown") type = "markdown";
                 else if (e == "c" || e == "h" || e == "cpp" || e == "cc" || e == "hpp" || e == "rs" || e == "go" || e == "cs" || e == "vb" || e == "java" || e == "py") type = "code";
             }
             sta->results->push_back({filename, path, snippet, (int64_t)r->file_size, (time_t)(r->modified_time / 10000000 - 11644473600LL), type, ranked[i].score});
@@ -1052,6 +1073,8 @@ int run_ui(void){
                             if (ImGui::BeginTabItem("Preview")) {
                                 if (r.type == "text" || r.type == "pdf") {
                                     draw_highlighted(r.snippet, query_str);
+                                } else if (r.type == "markdown") {
+                                    render_markdown(r.snippet);
                                 } else if (r.type == "code") {
                                     std::string full = r.path + "\\" + r.filename;
                                     if (g_code_preview_file != full) {
