@@ -5,7 +5,28 @@
 #include "plugin.h"
 #include "util.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <limits.h>
+#include <errno.h>
+#define _snwprintf swprintf
+#define WAIT_OBJECT_0 0
+static int WaitForSingleObject(HANDLE h, unsigned int ms){(void)h; (void)ms; return 1;}
+#define Sleep(ms) usleep((ms)*1000)
+static int wcscpy_s(wchar_t* dst, size_t dstcch, const wchar_t* src){
+    if(!dst || !src || dstcch==0) return 1;
+    wcsncpy(dst, src, dstcch);
+    dst[dstcch-1] = 0;
+    return 0;
+}
+static void* _aligned_malloc(size_t size, size_t align){ void* p=NULL; if(posix_memalign(&p,align,size)!=0) return NULL; return p; }
+static void _aligned_free(void* p){ free(p); }
+static uint64_t to_filetime(time_t t){ return ((uint64_t)t*10000000ULL)+116444736000000000ULL; }
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +65,7 @@ static void add_file(const FileEntry* fe){
     g_files[g_file_count++] = *fe;
 }
 
+#ifdef _WIN32
 static void scan_dir(const wchar_t* dir){
     if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) return;
     wchar_t pattern[MAX_LONG_PATH];
@@ -72,6 +94,41 @@ static void scan_dir(const wchar_t* dir){
     }while(FindNextFileW(h,&fd));
     FindClose(h);
 }
+#else
+static void scan_dir(const wchar_t* dir){
+    if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) return;
+    char dir_mb[PATH_MAX];
+    wcstombs(dir_mb, dir, sizeof(dir_mb));
+    DIR* d = opendir(dir_mb);
+    if(!d) return;
+    struct dirent* ent;
+    while((ent = readdir(d))){
+        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+        if(ent->d_name[0]=='.' && (ent->d_name[1]==0 || (ent->d_name[1]=='.' && ent->d_name[2]==0))) continue;
+        char full_mb[PATH_MAX];
+        snprintf(full_mb, sizeof(full_mb), "%s/%s", dir_mb, ent->d_name);
+        struct stat st;
+        if(stat(full_mb, &st)!=0) continue;
+        wchar_t full[MAX_LONG_PATH];
+        mbstowcs(full, full_mb, MAX_LONG_PATH);
+        for(wchar_t* p=full; *p; ++p) if(*p==L'/') *p=L'\\';
+        if(S_ISDIR(st.st_mode)){
+            scan_dir(full);
+        }else{
+            FileEntry fe;
+            wcscpy_s(fe.path, MAX_LONG_PATH, full);
+            fe.size = (uint64_t)st.st_size;
+            fe.attrs = 0;
+            fe.ctime = to_filetime(st.st_ctime);
+            fe.mtime = to_filetime(st.st_mtime);
+            fe.atime = to_filetime(st.st_atime);
+            fe.hash  = crc64_file(full);
+            add_file(&fe);
+        }
+    }
+    closedir(d);
+}
+#endif
 
 static int cmp_file(const void* a, const void* b){
     const FileEntry* fa = (const FileEntry*)a;

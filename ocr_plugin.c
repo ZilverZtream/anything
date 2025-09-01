@@ -4,6 +4,24 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <limits.h>
+#define _snwprintf swprintf
+#define _wcsicmp wcscasecmp
+#define WAIT_OBJECT_0 0
+static int WaitForSingleObject(HANDLE h, unsigned int ms){(void)h;(void)ms;return 1;}
+#define Sleep(ms) usleep((ms)*1000)
+static int wcscpy_s(wchar_t* dst,size_t dstcch,const wchar_t* src){ if(!dst||!src||dstcch==0) return 1; wcsncpy(dst,src,dstcch); dst[dstcch-1]=0; return 0; }
+static void* _aligned_malloc(size_t size,size_t align){ void* p=NULL; if(posix_memalign(&p,align,size)!=0) return NULL; return p; }
+static void _aligned_free(void* p){ free(p); }
+static uint64_t to_filetime(time_t t){ return ((uint64_t)t*10000000ULL)+116444736000000000ULL; }
+#endif
+
 static PluginHost g_host;
 
 static BOOL init(const PluginHost* host){
@@ -16,18 +34,29 @@ static wchar_t* ocr_file(const wchar_t* path){
     if(!api) return NULL;
     if(TessBaseAPIInit3(api, NULL, "eng")!=0){ TessBaseAPIDelete(api); return NULL; }
     char upath[MAX_PATH*4];
+#ifdef _WIN32
     WideCharToMultiByte(CP_UTF8,0,path,-1,upath,sizeof(upath),NULL,NULL);
+#else
+    wcstombs(upath, path, sizeof(upath));
+#endif
     if(!TessBaseAPIProcessPages(api, upath, NULL, 0)){ TessBaseAPIDelete(api); return NULL; }
     char* text = TessBaseAPIGetUTF8Text(api);
     TessBaseAPIDelete(api);
     if(!text) return NULL;
+#ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8,0,text,-1,NULL,0);
     wchar_t* out = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
     if(out) MultiByteToWideChar(CP_UTF8,0,text,-1,out,wlen);
+#else
+    size_t wlen = mbstowcs(NULL, text, 0);
+    wchar_t* out = (wchar_t*)malloc(sizeof(wchar_t)*(wlen+1));
+    if(out) mbstowcs(out, text, wlen+1);
+#endif
     TessDeleteText(text);
     return out;
 }
 
+#ifdef _WIN32
 static void scan(void){
     const wchar_t* root = L"ocr"; // folder to scan
     wchar_t pattern[MAX_PATH];
@@ -73,6 +102,60 @@ static void scan(void){
     }while(FindNextFileW(h,&fd));
     FindClose(h);
 }
+#else
+static void scan(void){
+    const wchar_t* root = L"ocr"; // folder to scan
+    char root_mb[PATH_MAX];
+    wcstombs(root_mb, root, sizeof(root_mb));
+    DIR* d = opendir(root_mb);
+    if(!d) return;
+    struct dirent* ent;
+    while((ent = readdir(d))){
+        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+        char* ext = strrchr(ent->d_name, '.');
+        if(!ext) continue; ext++;
+        wchar_t wext[32]; mbstowcs(wext, ext, 32);
+        if(_wcsicmp(wext,L"png") && _wcsicmp(wext,L"jpg") && _wcsicmp(wext,L"jpeg") &&
+           _wcsicmp(wext,L"bmp") && _wcsicmp(wext,L"tif") && _wcsicmp(wext,L"tiff") &&
+           _wcsicmp(wext,L"pdf")) continue;
+        char full_mb[PATH_MAX];
+        snprintf(full_mb, sizeof(full_mb), "%s/%s", root_mb, ent->d_name);
+        struct stat st; if(stat(full_mb,&st)!=0) continue;
+        if(S_ISDIR(st.st_mode)) continue;
+        wchar_t full[MAX_PATH]; mbstowcs(full, full_mb, MAX_PATH);
+        for(wchar_t* p=full; *p; ++p) if(*p==L'/') *p=L'\\';
+        wchar_t* text = ocr_file(full);
+        if(!text) continue;
+        DbWorkItem* wi = (DbWorkItem*)_aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+        if(!wi){ free(text); continue; }
+        wi->content = text;
+        wi->preview = NULL;
+        wcscpy_s(wi->parent_path, MAX_LONG_PATH, root);
+        wchar_t name_w[MAX_PATH]; mbstowcs(name_w, ent->d_name, MAX_PATH);
+        for(wchar_t* p=name_w; *p; ++p) if(*p==L'/') *p=L'\\';
+        wcscpy_s(wi->name, MAX_PATH, name_w);
+        wi->file_size = (uint64_t)st.st_size;
+        wi->creation_time = to_filetime(st.st_ctime);
+        wi->modified_time = to_filetime(st.st_mtime);
+        wi->access_time   = to_filetime(st.st_atime);
+        wi->attributes = 0;
+        wi->clone_id = 0;
+        wi->stage = INDEX_FULL_CONTENT;
+        wi->op = WI_ADD;
+        int tries = 0;
+        while(!MPMC_Push(g_host.queue, wi)){
+            if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
+                free(wi->content);
+                _aligned_free(wi);
+                closedir(d);
+                return;
+            }
+            Sleep(0);
+        }
+    }
+    closedir(d);
+}
+#endif
 
 static void shutdown(void){
 }
