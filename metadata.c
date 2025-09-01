@@ -27,7 +27,7 @@ static void parse_ifd(const uint8_t* base, size_t len, int be, uint32_t off, Db*
         const uint8_t* val;
         if(type==2){
             if(num<=4) val = p+8;
-            else if(valoff < len) val = base + valoff;
+            else if(valoff + num <= len) val = base + valoff;
             else { p+=12; continue; }
             size_t slen = num < 255 ? num : 255;
             char tmp[256]; memcpy(tmp,val,slen); tmp[slen]=0;
