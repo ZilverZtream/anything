@@ -158,7 +158,13 @@ static void push_live_update(const DbWorkItem* wi){
     wcscpy_s(lu->parent_path, MAX_LONG_PATH, wi->parent_path);
     wcscpy_s(lu->name, MAX_PATH, wi->name);
     lu->op = wi->op;
-    while(!MPMC_Push(&g_live_updates, lu)) Sleep(0);
+    while(!MPMC_Push(&g_live_updates, lu)){
+        if(!g_live_inited){
+            aligned_free(lu);
+            return;
+        }
+        Sleep(0);
+    }
 }
 
 #include "metadata.h"
