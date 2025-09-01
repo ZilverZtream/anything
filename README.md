@@ -70,6 +70,7 @@ This project is written in **C** for Windows.
 ### Requirements
 - **Microsoft Visual Studio** (with C compiler and Windows SDK)
 - **LMDB** library (include and link `lmdb.h`, `lmdb.lib`)
+- **gumbo-parser** library for robust HTML parsing in the web archive plugin
 
 ### Example Build Command (Visual Studio Developer Command Prompt)
 ```bat
