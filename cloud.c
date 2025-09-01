@@ -5,6 +5,7 @@
 #include <string.h>
 #include <time.h>
 #include <curl/curl.h>
+#include "cJSON.h"
 #ifdef _WIN32
 #include <windows.h>
 #include <malloc.h>
@@ -110,52 +111,6 @@ static BOOL http_request(const char* host, const char* path,
     return TRUE;
 }
 
-// ---- Minimal JSON helpers ----
-static const char* find_in_range(const char* start, const char* end, const char* key){
-    const char* p = start;
-    size_t klen = strlen(key);
-    while(p && p < end){
-        const char* q = strstr(p, key);
-        if(!q || q>=end) return NULL;
-        return q;
-    }
-    return NULL;
-}
-
-static BOOL json_get_string(const char* start, const char* end, const char* key, char* out, size_t outcap){
-    char pattern[64];
-    sprintf(pattern, "\"%s\"", key);
-    const char* p = find_in_range(start, end, pattern);
-    if(!p) return FALSE;
-    p = strchr(p, ':'); if(!p || p>=end) return FALSE;
-    p++;
-    while(p<end && (*p==' '||*p=='\"')) p++;
-    size_t i=0;
-    while(p<end && *p!='\"' && i<outcap-1) out[i++]=*p++;
-    out[i]=0;
-    return TRUE;
-}
-
-static BOOL json_get_number(const char* start, const char* end, const char* key, uint64_t* out){
-    char pattern[64];
-    sprintf(pattern, "\"%s\"", key);
-    const char* p = find_in_range(start, end, pattern);
-    if(!p) return FALSE;
-    p = strchr(p, ':'); if(!p || p>=end) return FALSE;
-    p++;
-    while(p<end && (*p==' '||*p=='\"')) p++;
-    char buf[32]; size_t i=0;
-    while(p<end && i<31 && ((*p>='0'&&*p<='9')||*p=='-'||*p=='+')) buf[i++]=*p++;
-    buf[i]=0;
-    if(i==0) return FALSE;
-#ifdef _WIN32
-    *out = _strtoui64(buf,NULL,10);
-#else
-    *out = strtoull(buf,NULL,10);
-#endif
-    return TRUE;
-}
-
 static uint64_t parse_rfc3339(const char* s){
     int Y,M,D,h,m; float sf;
     if(!s || sscanf(s, "%d-%d-%dT%d:%d:%f", &Y,&M,&D,&h,&m,&sf)!=6) return 0;
@@ -230,12 +185,16 @@ static BOOL obtain_token(CloudProvider p, char** out_token){
     char headers[128]; strcpy(headers, "Content-Type: application/x-www-form-urlencoded\r\n");
     char* resp=NULL;
     if(!http_request(host, path, "POST", headers, body, &resp)) return FALSE;
-    char tok[1024]; if(!json_get_string(resp, resp+strlen(resp), "access_token", tok, sizeof(tok))){ free(resp); return FALSE; }
+    cJSON* root = cJSON_Parse(resp);
+    if(!root){ free(resp); return FALSE; }
+    cJSON* tok = cJSON_GetObjectItemCaseSensitive(root, "access_token");
+    if(!cJSON_IsString(tok) || !tok->valuestring){ cJSON_Delete(root); free(resp); return FALSE; }
 #ifdef _WIN32
-    *out_token = _strdup(tok);
+    *out_token = _strdup(tok->valuestring);
 #else
-    *out_token = strdup(tok);
+    *out_token = strdup(tok->valuestring);
 #endif
+    cJSON_Delete(root);
     free(resp);
     return *out_token!=NULL;
 }
@@ -270,31 +229,42 @@ static void onedrive_walk(const char* token, const wchar_t* root, const char* ro
 
         char* resp=NULL;
         if(http_request("graph.microsoft.com", path, "GET", headers, NULL, &resp)){
-            const char* p=resp; const char* end=resp+strlen(resp);
-            while((p=strchr(p,'{'))){
-                const char* obj=p; int depth=1; p++;
-                while(depth>0 && p<end){ if(*p=='{') depth++; else if(*p=='}') depth--; p++; }
-                const char* obj_end=p;
-                char name[256], id[256]; uint64_t size=0; char ctime[64], mtime[64];
-                if(json_get_string(obj,obj_end,"name",name,sizeof(name)) && json_get_string(obj,obj_end,"id",id,sizeof(id))){
-                    BOOL is_dir = find_in_range(obj,obj_end,"\"folder\"")!=NULL;
-                    json_get_number(obj,obj_end,"size",&size);
-                    json_get_string(obj,obj_end,"createdDateTime",ctime,sizeof(ctime));
-                    json_get_string(obj,obj_end,"lastModifiedDateTime",mtime,sizeof(mtime));
-                    uint64_t ct=parse_rfc3339(ctime), mt=parse_rfc3339(mtime);
-                    enqueue_item(q,curr->parent,name,size,ct,mt,is_dir);
-                    if(is_dir){
-                        ODriveNode* child=(ODriveNode*)malloc(sizeof(ODriveNode));
-                        if(child){
-                            wchar_t wname[MAX_PATH]; to_wide(name,wname,MAX_PATH);
-                            path_join(child->parent,MAX_LONG_PATH,curr->parent,wname);
-                            strcpy_s(child->id,sizeof(child->id),id);
-                            child->next=NULL;
-                            if(tail) tail->next=child; else head=child;
-                            tail=child;
+            cJSON* root = cJSON_Parse(resp);
+            if(root){
+                cJSON* value = cJSON_GetObjectItemCaseSensitive(root, "value");
+                if(cJSON_IsArray(value)){
+                    cJSON* item;
+                    cJSON_ArrayForEach(item, value){
+                        cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
+                        cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
+                        if(cJSON_IsString(name) && cJSON_IsString(id)){
+                            uint64_t size=0; uint64_t ct=0, mt=0;
+                            cJSON* sizeItem = cJSON_GetObjectItemCaseSensitive(item, "size");
+                            if(cJSON_IsNumber(sizeItem)) size = (uint64_t)sizeItem->valuedouble;
+                            cJSON* fsi = cJSON_GetObjectItemCaseSensitive(item, "fileSystemInfo");
+                            if(cJSON_IsObject(fsi)){
+                                cJSON* ctime = cJSON_GetObjectItemCaseSensitive(fsi, "createdDateTime");
+                                cJSON* mtime = cJSON_GetObjectItemCaseSensitive(fsi, "lastModifiedDateTime");
+                                if(cJSON_IsString(ctime)) ct = parse_rfc3339(ctime->valuestring);
+                                if(cJSON_IsString(mtime)) mt = parse_rfc3339(mtime->valuestring);
+                            }
+                            BOOL is_dir = cJSON_GetObjectItemCaseSensitive(item, "folder") != NULL;
+                            enqueue_item(q, curr->parent, name->valuestring, size, ct, mt, is_dir);
+                            if(is_dir){
+                                ODriveNode* child=(ODriveNode*)malloc(sizeof(ODriveNode));
+                                if(child){
+                                    wchar_t wname[MAX_PATH]; to_wide(name->valuestring,wname,MAX_PATH);
+                                    path_join(child->parent,MAX_LONG_PATH,curr->parent,wname);
+                                    strcpy_s(child->id,sizeof(child->id),id->valuestring);
+                                    child->next=NULL;
+                                    if(tail) tail->next=child; else head=child;
+                                    tail=child;
+                                }
+                            }
                         }
                     }
                 }
+                cJSON_Delete(root);
             }
             free(resp);
         }
@@ -331,31 +301,44 @@ static void google_drive_walk(const char* token, const wchar_t* root, const char
 
         char* resp=NULL;
         if(http_request("www.googleapis.com", path, "GET", headers,NULL,&resp)){
-            const char* p=resp; const char* end=resp+strlen(resp);
-            while((p=strchr(p,'{'))){
-                const char* obj=p; int depth=1; p++;
-                while(depth>0 && p<end){ if(*p=='{') depth++; else if(*p=='}') depth--; p++; }
-                const char* obj_end=p;
-                char name[256], id[256], mime[128], mtime[64]; uint64_t size=0;
-                if(json_get_string(obj,obj_end,"name",name,sizeof(name)) && json_get_string(obj,obj_end,"id",id,sizeof(id))){
-                    json_get_string(obj,obj_end,"mimeType",mime,sizeof(mime));
-                    BOOL is_dir = strstr(mime,"application/vnd.google-apps.folder")!=NULL;
-                    json_get_number(obj,obj_end,"size",&size);
-                    json_get_string(obj,obj_end,"modifiedTime",mtime,sizeof(mtime));
-                    uint64_t mt=parse_rfc3339(mtime);
-                    enqueue_item(q,curr->parent,name,size,mt,mt,is_dir);
-                    if(is_dir){
-                        GDriveNode* child=(GDriveNode*)malloc(sizeof(GDriveNode));
-                        if(child){
-                            wchar_t wname[MAX_PATH]; to_wide(name,wname,MAX_PATH);
-                            path_join(child->parent,MAX_LONG_PATH,curr->parent,wname);
-                            strcpy_s(child->id,sizeof(child->id),id);
-                            child->next=NULL;
-                            if(tail) tail->next=child; else head=child;
-                            tail=child;
+            cJSON* root = cJSON_Parse(resp);
+            if(root){
+                cJSON* files = cJSON_GetObjectItemCaseSensitive(root, "files");
+                if(cJSON_IsArray(files)){
+                    cJSON* item;
+                    cJSON_ArrayForEach(item, files){
+                        cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
+                        cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
+                        if(cJSON_IsString(name) && cJSON_IsString(id)){
+                            const char* mime = NULL;
+                            cJSON* mimeItem = cJSON_GetObjectItemCaseSensitive(item, "mimeType");
+                            if(cJSON_IsString(mimeItem)) mime = mimeItem->valuestring;
+                            BOOL is_dir = (mime && strstr(mime, "application/vnd.google-apps.folder")!=NULL);
+                            uint64_t size=0;
+                            cJSON* sizeItem = cJSON_GetObjectItemCaseSensitive(item, "size");
+                            if(cJSON_IsString(sizeItem) && sizeItem->valuestring)
+                                size = strtoull(sizeItem->valuestring, NULL, 10);
+                            else if(cJSON_IsNumber(sizeItem))
+                                size = (uint64_t)sizeItem->valuedouble;
+                            uint64_t mt=0;
+                            cJSON* mtime = cJSON_GetObjectItemCaseSensitive(item, "modifiedTime");
+                            if(cJSON_IsString(mtime)) mt = parse_rfc3339(mtime->valuestring);
+                            enqueue_item(q,curr->parent,name->valuestring,size,mt,mt,is_dir);
+                            if(is_dir){
+                                GDriveNode* child=(GDriveNode*)malloc(sizeof(GDriveNode));
+                                if(child){
+                                    wchar_t wname[MAX_PATH]; to_wide(name->valuestring,wname,MAX_PATH);
+                                    path_join(child->parent,MAX_LONG_PATH,curr->parent,wname);
+                                    strcpy_s(child->id,sizeof(child->id),id->valuestring);
+                                    child->next=NULL;
+                                    if(tail) tail->next=child; else head=child;
+                                    tail=child;
+                                }
+                            }
                         }
                     }
                 }
+                cJSON_Delete(root);
             }
             free(resp);
         }
@@ -363,19 +346,40 @@ static void google_drive_walk(const char* token, const wchar_t* root, const char
     }
 }
 
+static void pcloud_process(cJSON* contents, const wchar_t* parent, MPMCQueue* q){
+    if(!cJSON_IsArray(contents)) return;
+    cJSON* item;
+    cJSON_ArrayForEach(item, contents){
+        cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
+        if(!cJSON_IsString(name)) continue;
+        cJSON* sizeItem = cJSON_GetObjectItemCaseSensitive(item, "size");
+        cJSON* isfolder = cJSON_GetObjectItemCaseSensitive(item, "isfolder");
+        uint64_t size=0;
+        if(cJSON_IsNumber(sizeItem)) size = (uint64_t)sizeItem->valuedouble;
+        BOOL is_dir = cJSON_IsNumber(isfolder) && isfolder->valueint==1;
+        enqueue_item(q,parent,name->valuestring,size,0,0,is_dir);
+        if(is_dir){
+            wchar_t child_parent[MAX_LONG_PATH];
+            wchar_t wname[MAX_PATH]; to_wide(name->valuestring,wname,MAX_PATH);
+            path_join(child_parent,MAX_LONG_PATH,parent,wname);
+            cJSON* sub = cJSON_GetObjectItemCaseSensitive(item, "contents");
+            if(sub) pcloud_process(sub, child_parent, q);
+        }
+    }
+}
+
 static void pcloud_walk(const char* token, const wchar_t* parent, MPMCQueue* q){
     char path[512];
     snprintf(path,512,"/listfolder?auth=%s&folderid=0&recursive=1", token);
     char* resp=NULL; if(!http_request("api.pcloud.com", path, "GET", "", NULL,&resp)) return;
-    const char* p=resp; const char* end=resp+strlen(resp);
-    while((p=strchr(p,'{'))){
-        const char* obj=p; int depth=1; p++;
-        while(depth>0 && p<end){ if(*p=='{') depth++; else if(*p=='}') depth--; p++; }
-        const char* obj_end=p;
-        char name[256]; uint64_t size=0; if(!json_get_string(obj,obj_end,"name",name,sizeof(name))) continue;
-        BOOL is_dir = find_in_range(obj,obj_end,"\"isfolder\":1")!=NULL;
-        json_get_number(obj,obj_end,"size",&size);
-        enqueue_item(q,parent,name,size,0,0,is_dir);
+    cJSON* root = cJSON_Parse(resp);
+    if(root){
+        cJSON* metadata = cJSON_GetObjectItemCaseSensitive(root, "metadata");
+        if(metadata){
+            cJSON* contents = cJSON_GetObjectItemCaseSensitive(metadata, "contents");
+            if(contents) pcloud_process(contents, parent, q);
+        }
+        cJSON_Delete(root);
     }
     free(resp);
 }
@@ -385,20 +389,28 @@ static void dropbox_walk(const char* token, const wchar_t* parent, MPMCQueue* q)
     snprintf(headers,512,"Authorization: Bearer %s\r\nContent-Type: application/json\r\n", token);
     const char* body="{\"path\":\"\",\"recursive\":true}";
     char* resp=NULL; if(!http_request("api.dropboxapi.com", "/2/files/list_folder", "POST", headers, body, &resp)) return;
-    const char* p=resp; const char* end=resp+strlen(resp);
-    while((p=strchr(p,'{'))){
-        const char* obj=p; int depth=1; p++;
-        while(depth>0 && p<end){ if(*p=='{') depth++; else if(*p=='}') depth--; p++; }
-        const char* obj_end=p;
-        char name[256], path_lower[1024];
-        if(json_get_string(obj,obj_end,"name",name,sizeof(name)) && json_get_string(obj,obj_end,"path_lower",path_lower,sizeof(path_lower))){
-            BOOL is_dir = find_in_range(obj,obj_end,"\".tag\":\"folder\"")!=NULL;
-            uint64_t size=0; json_get_number(obj,obj_end,"size",&size);
-            wchar_t full_parent[MAX_LONG_PATH];
-            wchar_t wpath[MAX_LONG_PATH]; to_wide(path_lower,wpath,MAX_LONG_PATH);
-            path_dirname(wpath,full_parent,MAX_LONG_PATH);
-            enqueue_item(q,full_parent,name,size,0,0,is_dir);
+    cJSON* root = cJSON_Parse(resp);
+    if(root){
+        cJSON* entries = cJSON_GetObjectItemCaseSensitive(root, "entries");
+        if(cJSON_IsArray(entries)){
+            cJSON* item;
+            cJSON_ArrayForEach(item, entries){
+                cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
+                cJSON* path_lower = cJSON_GetObjectItemCaseSensitive(item, "path_lower");
+                if(cJSON_IsString(name) && cJSON_IsString(path_lower)){
+                    cJSON* tag = cJSON_GetObjectItemCaseSensitive(item, ".tag");
+                    BOOL is_dir = cJSON_IsString(tag) && strcmp(tag->valuestring,"folder")==0;
+                    uint64_t size=0;
+                    cJSON* sizeItem = cJSON_GetObjectItemCaseSensitive(item, "size");
+                    if(cJSON_IsNumber(sizeItem)) size = (uint64_t)sizeItem->valuedouble;
+                    wchar_t full_parent[MAX_LONG_PATH];
+                    wchar_t wpath[MAX_LONG_PATH]; to_wide(path_lower->valuestring,wpath,MAX_LONG_PATH);
+                    path_dirname(wpath,full_parent,MAX_LONG_PATH);
+                    enqueue_item(q,full_parent,name->valuestring,size,0,0,is_dir);
+                }
+            }
         }
+        cJSON_Delete(root);
     }
     free(resp);
 }
