@@ -98,22 +98,22 @@ static uint64_t to_filetime(uint64_t unix_secs){
 
 static void process_record(cJSON* rec){
     if(!rec) return; const char* rec_name=NULL; const char* subject=NULL; const char* preview=""; uint64_t ts=0;
-    cJSON* rn=cJSON_GetObjectItem(rec,"recordName"); if(cJSON_IsString(rn)) rec_name=rn->valuestring;
-    cJSON* fields=cJSON_GetObjectItem(rec,"fields");
+    cJSON* rn=cJSON_GetObjectItemCaseSensitive(rec,"recordName"); if(cJSON_IsString(rn)) rec_name=rn->valuestring;
+    cJSON* fields=cJSON_GetObjectItemCaseSensitive(rec,"fields");
     if(cJSON_IsObject(fields)){
-        cJSON* sub=cJSON_GetObjectItem(fields,"subject");
+        cJSON* sub=cJSON_GetObjectItemCaseSensitive(fields,"subject");
         if(cJSON_IsObject(sub)){
-            cJSON* val=cJSON_GetObjectItem(sub,"value"); if(cJSON_IsString(val)) subject=val->valuestring;
+            cJSON* val=cJSON_GetObjectItemCaseSensitive(sub,"value"); if(cJSON_IsString(val)) subject=val->valuestring;
         }
-        cJSON* prev=cJSON_GetObjectItem(fields,"preview");
+        cJSON* prev=cJSON_GetObjectItemCaseSensitive(fields,"preview");
         if(cJSON_IsObject(prev)){
-            cJSON* val=cJSON_GetObjectItem(prev,"value"); if(cJSON_IsString(val)) preview=val->valuestring;
+            cJSON* val=cJSON_GetObjectItemCaseSensitive(prev,"value"); if(cJSON_IsString(val)) preview=val->valuestring;
         }
-        cJSON* date=cJSON_GetObjectItem(fields,"sentDate");
+        cJSON* date=cJSON_GetObjectItemCaseSensitive(fields,"sentDate");
         if(cJSON_IsObject(date)){
-            cJSON* val=cJSON_GetObjectItem(date,"value");
+            cJSON* val=cJSON_GetObjectItemCaseSensitive(date,"value");
             if(cJSON_IsObject(val)){
-                cJSON* ts_item=cJSON_GetObjectItem(val,"timestamp");
+                cJSON* ts_item=cJSON_GetObjectItemCaseSensitive(val,"timestamp");
                 if(cJSON_IsNumber(ts_item)) ts=(uint64_t)ts_item->valuedouble/1000ULL;
             } else if(cJSON_IsNumber(val)) ts=(uint64_t)val->valuedouble/1000ULL;
         }
@@ -146,8 +146,15 @@ static void scan(void){
     char url[512]; snprintf(url,sizeof(url),"https://api.apple-cloudkit.com/database/1/%s/%s/private/records/query",container_utf8,env_utf8);
     const char* body="{\"query\":{\"recordType\":\"MailMessage\"},\"resultsLimit\":5}";
     char* resp=NULL; if(!http_post(url,token_utf8,body,&resp)) return;
-    cJSON* root=cJSON_Parse(resp); free(resp); if(!root) return;
-    cJSON* recs=cJSON_GetObjectItem(root,"records");
+    cJSON* root=cJSON_Parse(resp);
+    if(!root){
+        const char* err=cJSON_GetErrorPtr();
+        if(err) fprintf(stderr,"iCloud JSON parse error: %s\n",err);
+        free(resp);
+        return;
+    }
+    free(resp);
+    cJSON* recs=cJSON_GetObjectItemCaseSensitive(root,"records");
     if(cJSON_IsArray(recs)){
         cJSON* r=NULL; cJSON_ArrayForEach(r,recs){ if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break; if(cJSON_IsObject(r)) process_record(r); }
     }

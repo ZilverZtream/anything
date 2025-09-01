@@ -11,6 +11,7 @@
 #include <sqlite3.h>
 #include <curl/curl.h>
 #include <limits.h>
+#include <gumbo.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
@@ -143,28 +144,43 @@ static char* http_fetch(const char* url){
     if(res!=CURLE_OK){ free(buf.data); return NULL; } return buf.data;
 }
 
-static char* strip_html(const char* html){
-    if(!html) return NULL; size_t len=strlen(html); char* out=(char*)malloc(len+1); if(!out) return NULL;
-    size_t j=0; int state=0; //0=text,1=tag,2=script,3=style
-    for(size_t i=0;i<len;i++){
-        char c=html[i];
-        if(state==0){
-            if(c=='<'){
-                if(!strncasecmp(html+i,"<script",7)) state=2;
-                else if(!strncasecmp(html+i,"<style",6)) state=3;
-                else state=1;
-            }else{
-                if(c=='\n'||c=='\r') c=' '; out[j++]=c;
-            }
-        }else if(state==1){
-            if(c=='>') state=0;
-        }else if(state==2){
-            if(!strncasecmp(html+i,"</script",8)){ char* gt=strchr(html+i,'>'); if(!gt) break; i=gt-html; state=0; }
-        }else if(state==3){
-            if(!strncasecmp(html+i,"</style",7)){ char* gt=strchr(html+i,'>'); if(!gt) break; i=gt-html; state=0; }
+static void append_text(GumboNode* node,char** out,size_t* len,size_t* cap){
+    if(node->type==GUMBO_NODE_TEXT){
+        const char* text=node->v.text.text;
+        size_t tlen=strlen(text);
+        if(*len + tlen + 1 > *cap){
+            size_t ncap=*cap? *cap*2 + tlen: tlen+1;
+            char* tmp=(char*)realloc(*out,ncap);
+            if(!tmp) return;
+            *out=tmp; *cap=ncap;
+        }
+        for(size_t i=0;i<tlen;i++){
+            char c=text[i];
+            if(c=='\n'||c=='\r') c=' ';
+            (*out)[(*len)++]=c;
+        }
+        (*out)[*len]=0;
+    }else if(node->type==GUMBO_NODE_ELEMENT &&
+             node->v.element.tag!=GUMBO_TAG_SCRIPT &&
+             node->v.element.tag!=GUMBO_TAG_STYLE){
+        GumboVector* children=&node->v.element.children;
+        for(size_t i=0;i<children->length;i++){
+            append_text(children->data[i],out,len,cap);
         }
     }
-    out[j]=0; return out;
+}
+
+static char* html_to_text(const char* html){
+    if(!html) return NULL;
+    GumboOutput* output=gumbo_parse(html);
+    if(!output) return NULL;
+    size_t cap=256,len=0;
+    char* out=(char*)malloc(cap);
+    if(!out){ gumbo_destroy_output(&kGumboDefaultOptions,output); return NULL; }
+    out[0]=0;
+    append_text(output->root,&out,&len,&cap);
+    gumbo_destroy_output(&kGumboDefaultOptions,output);
+    return out;
 }
 
 static void push_page(const char* url,const char* title,const char* text){
@@ -184,7 +200,7 @@ static void push_page(const char* url,const char* title,const char* text){
 
 static void process_url(const char* url,const char* title){
     if(!url||seen_has(url)) return; char* html=http_fetch(url); if(!html){ seen_add(url); return; }
-    char* text=strip_html(html); free(html); if(text){ push_page(url,title,text); free(text); }
+    char* text=html_to_text(html); free(html); if(text){ push_page(url,title,text); free(text); }
     seen_add(url);
 }
 
