@@ -5,6 +5,7 @@
 #include "util.h"
 #include <wchar.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -54,15 +55,24 @@ static void scan_key(HKEY key, const wchar_t* path){
     if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) return;
 
     DWORD val_count=0, max_val_name=0, max_val_len=0;
-    RegQueryInfoKeyW(key,NULL,NULL,NULL,NULL,NULL,NULL,&val_count,&max_val_name,&max_val_len,NULL,NULL);
+    if(RegQueryInfoKeyW(key,NULL,NULL,NULL,NULL,NULL,NULL,&val_count,&max_val_name,&max_val_len,NULL,NULL)!=ERROR_SUCCESS){
+        fwprintf(stderr,L"[registry] RegQueryInfoKeyW failed for %ls: %lu\n", path, GetLastError());
+        return;
+    }
     wchar_t* val_name = (wchar_t*)malloc(sizeof(wchar_t)*(max_val_name+2));
     BYTE*   val_data = (BYTE*)malloc(max_val_len+2*sizeof(wchar_t));
+    if(!val_name || !val_data){
+        fwprintf(stderr,L"[registry] allocation failed for %ls\n", path);
+    }
     if(val_name && val_data){
         for(DWORD i=0;i<val_count;i++){
             DWORD name_len = max_val_name+1;
             DWORD data_len = max_val_len;
             DWORD type = 0;
-            if(RegEnumValueW(key,i,val_name,&name_len,NULL,&type,val_data,&data_len)!=ERROR_SUCCESS) continue;
+            if(RegEnumValueW(key,i,val_name,&name_len,NULL,&type,val_data,&data_len)!=ERROR_SUCCESS){
+                fwprintf(stderr,L"[registry] RegEnumValueW failed in %ls: %lu\n", path, GetLastError());
+                continue;
+            }
             const wchar_t* vname = name_len ? val_name : L"(Default)";
             wchar_t* content = NULL;
             if(type==REG_SZ || type==REG_EXPAND_SZ){
@@ -78,12 +88,18 @@ static void scan_key(HKEY key, const wchar_t* path){
     free(val_name); free(val_data);
 
     DWORD sub_count=0, max_sub_name=0;
-    RegQueryInfoKeyW(key,NULL,NULL,NULL,&sub_count,&max_sub_name,NULL,NULL,NULL,NULL,NULL,NULL);
+    if(RegQueryInfoKeyW(key,NULL,NULL,NULL,&sub_count,&max_sub_name,NULL,NULL,NULL,NULL,NULL,NULL)!=ERROR_SUCCESS){
+        fwprintf(stderr,L"[registry] RegQueryInfoKeyW failed for %ls: %lu\n", path, GetLastError());
+        return;
+    }
     wchar_t* sub_name = (wchar_t*)malloc(sizeof(wchar_t)*(max_sub_name+2));
     if(sub_name){
         for(DWORD i=0;i<sub_count;i++){
             DWORD namelen = max_sub_name+1;
-            if(RegEnumKeyExW(key,i,sub_name,&namelen,NULL,NULL,NULL,NULL)!=ERROR_SUCCESS) continue;
+            if(RegEnumKeyExW(key,i,sub_name,&namelen,NULL,NULL,NULL,NULL)!=ERROR_SUCCESS){
+                fwprintf(stderr,L"[registry] RegEnumKeyExW failed in %ls: %lu\n", path, GetLastError());
+                continue;
+            }
             wchar_t sub_path[MAX_LONG_PATH];
             _snwprintf(sub_path, MAX_LONG_PATH, L"%s\\%s", path, sub_name);
             push_item(path, sub_name, NULL);
@@ -111,6 +127,8 @@ static void scan(void){
         if(RegOpenKeyExW(roots[i].root, NULL, 0, KEY_READ, &h)==ERROR_SUCCESS){
             scan_key(h, roots[i].name);
             RegCloseKey(h);
+        }else{
+            fwprintf(stderr,L"[registry] RegOpenKeyExW failed for %ls: %lu\n", roots[i].name, GetLastError());
         }
     }
 }

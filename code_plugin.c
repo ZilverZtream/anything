@@ -3,6 +3,7 @@
 #include <wchar.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -156,16 +157,24 @@ static void process_line(char* line, char** buf, size_t* len, size_t* cap){
 static wchar_t* parse_file(const wchar_t* path){
 #ifdef _WIN32
     FILE* f = _wfopen(path, L"rb");
+    if(!f){ fwprintf(stderr,L"[code] failed to open %ls\n",path); return NULL; }
 #else
     char path_mb[PATH_MAX];
     wcstombs(path_mb, path, sizeof(path_mb));
     FILE* f = fopen(path_mb, "rb");
+    if(!f){ fprintf(stderr,"[code] failed to open %s: %s\n",path_mb,strerror(errno)); return NULL; }
 #endif
-    if(!f) return NULL;
     fseek(f,0,SEEK_END); long len = ftell(f); fseek(f,0,SEEK_SET);
     char* data = (char*)malloc(len+1);
     if(!data){ fclose(f); return NULL; }
-    fread(data,1,len,f); data[len]=0; fclose(f);
+#ifdef _WIN32
+    size_t r=fread(data,1,len,f);
+    if(r!=(size_t)len){ fwprintf(stderr,L"[code] failed to read %ls\n",path); free(data); fclose(f); return NULL; }
+#else
+    size_t r=fread(data,1,len,f);
+    if(r!=(size_t)len){ fprintf(stderr,"[code] failed to read %s\n",path_mb); free(data); fclose(f); return NULL; }
+#endif
+    data[len]=0; fclose(f);
 
     size_t cap = len*2 + 1; size_t l=0; char* out = (char*)malloc(cap);
     if(!out){ free(data); return NULL; }

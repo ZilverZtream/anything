@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <limits.h>
+#include <errno.h>
 #define _snwprintf swprintf
 #define _wcsicmp wcscasecmp
 #define WAIT_OBJECT_0 0
@@ -30,18 +31,32 @@ static BOOL init(const PluginHost* host){
 
 static wchar_t* ocr_file(const wchar_t* path){
     TessBaseAPI* api = TessBaseAPICreate();
-    if(!api) return NULL;
-    if(TessBaseAPIInit3(api, NULL, "eng")!=0){ TessBaseAPIDelete(api); return NULL; }
+    if(!api){
+        fwprintf(stderr,L"[ocr] TessBaseAPICreate failed for %ls\n",path);
+        return NULL;
+    }
+    if(TessBaseAPIInit3(api, NULL, "eng")!=0){
+        fwprintf(stderr,L"[ocr] TessBaseAPIInit3 failed for %ls\n",path);
+        TessBaseAPIDelete(api);
+        return NULL;
+    }
     char upath[MAX_PATH*4];
 #ifdef _WIN32
     WideCharToMultiByte(CP_UTF8,0,path,-1,upath,sizeof(upath),NULL,NULL);
 #else
     wcstombs(upath, path, sizeof(upath));
 #endif
-    if(!TessBaseAPIProcessPages(api, upath, NULL, 0)){ TessBaseAPIDelete(api); return NULL; }
+    if(!TessBaseAPIProcessPages(api, upath, NULL, 0)){
+        fwprintf(stderr,L"[ocr] ProcessPages failed for %ls\n",path);
+        TessBaseAPIDelete(api);
+        return NULL;
+    }
     char* text = TessBaseAPIGetUTF8Text(api);
     TessBaseAPIDelete(api);
-    if(!text) return NULL;
+    if(!text){
+        fwprintf(stderr,L"[ocr] GetUTF8Text returned NULL for %ls\n",path);
+        return NULL;
+    }
 #ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8,0,text,-1,NULL,0);
     wchar_t* out = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
@@ -61,7 +76,10 @@ static void scan(void){
     wchar_t pattern[MAX_PATH];
     _snwprintf(pattern, MAX_PATH, L"%s\\*.*", root);
     WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pattern, &fd);
-    if(h==INVALID_HANDLE_VALUE) return;
+    if(h==INVALID_HANDLE_VALUE){
+        fwprintf(stderr,L"[ocr] failed to open %ls: %lu\n",root,GetLastError());
+        return;
+    }
     do{
         if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
         if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
@@ -107,7 +125,10 @@ static void scan(void){
     char root_mb[PATH_MAX];
     wcstombs(root_mb, root, sizeof(root_mb));
     DIR* d = opendir(root_mb);
-    if(!d) return;
+    if(!d){
+        fprintf(stderr,"[ocr] failed to open %s: %s\n", root_mb, strerror(errno));
+        return;
+    }
     struct dirent* ent;
     while((ent = readdir(d))){
         if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
@@ -119,7 +140,10 @@ static void scan(void){
            _wcsicmp(wext,L"pdf")) continue;
         char full_mb[PATH_MAX];
         snprintf(full_mb, sizeof(full_mb), "%s/%s", root_mb, ent->d_name);
-        struct stat st; if(stat(full_mb,&st)!=0) continue;
+        struct stat st; if(stat(full_mb,&st)!=0){
+            fprintf(stderr,"[ocr] stat failed %s: %s\n", full_mb, strerror(errno));
+            continue;
+        }
         if(S_ISDIR(st.st_mode)) continue;
         wchar_t full[MAX_PATH]; mbstowcs(full, full_mb, MAX_PATH);
         for(wchar_t* p=full; *p; ++p) if(*p==L'/') *p=L'\\';
