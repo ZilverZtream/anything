@@ -2,6 +2,7 @@
 #include "scanner.h"
 #include "apfs.h"
 #include <CoreServices/CoreServices.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
@@ -33,6 +34,24 @@ struct FileScanner {
 
 static FileScanner* g_current;
 
+static void fs_to_wide(wchar_t* dst, const char* src, size_t dstlen){
+    if(!dstlen) return;
+    CFStringRef cf = CFStringCreateWithFileSystemRepresentation(NULL, src);
+    if(!cf){ dst[0] = 0; return; }
+    CFRange range = {0, CFStringGetLength(cf)};
+#if __BIG_ENDIAN__
+    CFStringEncoding enc = kCFStringEncodingUTF32BE;
+#else
+    CFStringEncoding enc = kCFStringEncodingUTF32LE;
+#endif
+    CFIndex used = 0;
+    CFStringGetBytes(cf, range, enc, 0, false, (UInt8*)dst,
+                     (dstlen - 1) * sizeof(wchar_t), &used);
+    CFRelease(cf);
+    size_t chars = (size_t)used / sizeof(wchar_t);
+    dst[chars] = 0;
+}
+
 static BOOL has_ext(const char* path, const char* ext){
     const char* dot = strrchr(path, '.');
     if(!dot) return FALSE;
@@ -51,10 +70,8 @@ static void emit_zip_entries(FileScanner* s, const char* path){
         if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) continue;
         wi->content = NULL;
         wi->preview = NULL;
-        mbstowcs(wi->parent_path, path, MAX_LONG_PATH);
-        wi->parent_path[MAX_LONG_PATH-1] = 0;
-        mbstowcs(wi->name, name, MAX_PATH);
-        wi->name[MAX_PATH-1] = 0;
+        fs_to_wide(wi->parent_path, path, MAX_LONG_PATH);
+        fs_to_wide(wi->name, name, MAX_PATH);
         wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
         wi->attributes = 0;
         wi->clone_id = 0;
@@ -77,8 +94,7 @@ static void emit_pst_tree(FileScanner* s, const wchar_t* parent, pst_file* pf, p
                 wi->preview = NULL;
                 wcsncpy(wi->parent_path, parent, MAX_LONG_PATH);
                 wi->parent_path[MAX_LONG_PATH-1] = 0;
-                mbstowcs(wi->name, subj, MAX_PATH);
-                wi->name[MAX_PATH-1] = 0;
+                fs_to_wide(wi->name, subj, MAX_PATH);
                 wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
                 wi->attributes = 0;
                 wi->clone_id = 0;
@@ -102,7 +118,7 @@ static void emit_pst_entries(FileScanner* s, const char* path){
     pst_desc_tree* top = pst_getTopOfFolders(&pf, root);
     if(top && top->child){
         wchar_t parent[MAX_LONG_PATH];
-        mbstowcs(parent, path, MAX_LONG_PATH);
+        fs_to_wide(parent, path, MAX_LONG_PATH);
         emit_pst_tree(s, parent, &pf, top->child);
     }
     pst_freeItem(root);
@@ -141,8 +157,8 @@ static void emit(FileScanner* s, const char* path, int base){
     if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
     wi->content = NULL;
     wi->preview = NULL;
-    mbstowcs(wi->parent_path, parent, MAX_LONG_PATH);
-    mbstowcs(wi->name, name, MAX_PATH);
+    fs_to_wide(wi->parent_path, parent, MAX_LONG_PATH);
+    fs_to_wide(wi->name, name, MAX_PATH);
     wi->file_size = st.st_size;
 #if defined(__APPLE__)
     wi->creation_time = st.st_birthtime;
@@ -200,11 +216,11 @@ static void fsevent_cb(ConstFSEventStreamRef streamRef,
             if(p){
                 char parent[PATH_MAX]; size_t len = p - paths[i];
                 strncpy(parent, paths[i], len); parent[len]=0;
-                mbstowcs(wi->parent_path, parent, MAX_LONG_PATH);
-                mbstowcs(wi->name, p+1, MAX_PATH);
+                fs_to_wide(wi->parent_path, parent, MAX_LONG_PATH);
+                fs_to_wide(wi->name, p+1, MAX_PATH);
             } else {
-                mbstowcs(wi->parent_path, "", MAX_LONG_PATH);
-                mbstowcs(wi->name, paths[i], MAX_PATH);
+                fs_to_wide(wi->parent_path, "", MAX_LONG_PATH);
+                fs_to_wide(wi->name, paths[i], MAX_PATH);
             }
             wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
             wi->attributes = 0;
