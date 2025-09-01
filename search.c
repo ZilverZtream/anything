@@ -13,6 +13,10 @@
 #include <stdlib.h>
 #pragma comment(lib, "shlwapi.lib")
 
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+
 #include "database.h"
 #include "anything.h"
 #include "util.h"
@@ -80,17 +84,55 @@ typedef struct { uint64_t dummy; } Result;
 static void search_names(Query* q, Result* results){ (void)q; (void)results; }
 static void search_content(Query* q, Result* results){ (void)q; (void)results; }
 static void search_metadata(Query* q, Result* results){ (void)q; (void)results; }
+
+typedef struct {
+    void (*fn)(Query*, Result*);
+    Query* q;
+    Result* results;
+} SearchTask;
+
+#ifdef _WIN32
+static DWORD WINAPI search_thread(void* param){
+    SearchTask* t = (SearchTask*)param;
+    t->fn(t->q, t->results);
+    return 0;
+}
 static void parallel_search(Query* q, Result* results){
-#pragma omp parallel sections
-    {
-#pragma omp section
-        search_names(q, results);
-#pragma omp section
-        search_content(q, results);
-#pragma omp section
-        search_metadata(q, results);
+    SearchTask tasks[3] = {
+        {search_names, q, results},
+        {search_content, q, results},
+        {search_metadata, q, results},
+    };
+    HANDLE threads[3];
+    for(int i=0;i<3;i++){
+        threads[i] = CreateThread(NULL, 0, search_thread, &tasks[i], 0, NULL);
+    }
+    WaitForMultipleObjects(3, threads, TRUE, INFINITE);
+    for(int i=0;i<3;i++){
+        CloseHandle(threads[i]);
     }
 }
+#else
+static void* search_thread(void* param){
+    SearchTask* t = (SearchTask*)param;
+    t->fn(t->q, t->results);
+    return NULL;
+}
+static void parallel_search(Query* q, Result* results){
+    SearchTask tasks[3] = {
+        {search_names, q, results},
+        {search_content, q, results},
+        {search_metadata, q, results},
+    };
+    pthread_t threads[3];
+    for(int i=0;i<3;i++){
+        pthread_create(&threads[i], NULL, search_thread, &tasks[i]);
+    }
+    for(int i=0;i<3;i++){
+        pthread_join(threads[i], NULL);
+    }
+}
+#endif
 
 typedef struct Node{ int type; TermType ttype; char* text; struct Node* left; struct Node* right; } Node;
 static void free_node(Node* n){ if(!n)return; free_node(n->left); free_node(n->right); if(n->type==TOK_TERM && n->text) free(n->text); free(n); }
