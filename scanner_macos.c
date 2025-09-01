@@ -109,19 +109,33 @@ static void emit_pst_entries(FileScanner* s, const char* path){
     pst_close(&pf);
 }
 
-static void emit(FileScanner* s, const char* path){
+static void emit(FileScanner* s, const char* path, int base){
     struct stat st;
     if(stat(path,&st)!=0) return;
     char parent[PATH_MAX];
-    const char* name = strrchr(path,'/');
-    if(name){
-        size_t len = name - path;
-        strncpy(parent, path, len);
-        parent[len]=0;
-        name++;
+    const char* name;
+    if(base >= 0){
+        name = path + base;
+        if(base > 0){
+            size_t len = base - 1;
+            if(len >= sizeof(parent)) len = sizeof(parent) - 1;
+            memcpy(parent, path, len);
+            parent[len] = 0;
+        } else {
+            parent[0] = 0;
+        }
     } else {
-        parent[0]=0;
-        name = path;
+        const char* p = strrchr(path,'/');
+        if(p){
+            size_t len = p - path;
+            strncpy(parent, path, len);
+            parent[len]=0;
+            p++;
+            name = p;
+        } else {
+            parent[0]=0;
+            name = path;
+        }
     }
     DbWorkItem* wi;
     if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
@@ -155,8 +169,8 @@ static void emit(FileScanner* s, const char* path){
 }
 
 static int enum_cb(const char* fpath, const struct stat* sb, int typeflag, struct FTW* ftwbuf){
-    (void)sb; (void)typeflag; (void)ftwbuf;
-    emit(g_current, fpath);
+    (void)sb; (void)typeflag;
+    emit(g_current, fpath, ftwbuf ? ftwbuf->base : -1);
     return 0;
 }
 
@@ -199,7 +213,7 @@ static void fsevent_cb(ConstFSEventStreamRef streamRef,
             wi->op = WI_DELETE;
             while(!MPMC_Push(s->outq, wi)) sched_yield();
         } else {
-            emit(s, paths[i]);
+            emit(s, paths[i], -1);
         }
     }
 }
