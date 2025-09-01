@@ -74,7 +74,7 @@ cl /O2 /MD anything.c database.c exfat.c ntfs.c search.c util.c plugin.c lmdb.li
 ```
 
 ## Graphical User Interface
-`ui_imgui.cpp` provides a Dear ImGui front end that streams instant search results from the LMDB database. It features a preview pane with highlighted text snippets or image thumbnails and an "Advanced Search Builder" for extension, size, date, path, regex and whole-word filters.
+`ui_imgui.cpp` provides a Dear ImGui front end that streams instant search results from the LMDB database. It features a preview pane with highlighted text snippets, syntax-colored code previews, or image thumbnails and an "Advanced Search Builder" for extension, size, date, path, regex and whole-word filters.
 
 Compile with `HAS_IMGUI` (and optionally `HAS_STB_IMAGE` for image previews) and link against ImGui, GLFW, OpenGL, LMDB, stb_image and the Win32 shlwapi library:
 
