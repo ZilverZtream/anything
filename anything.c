@@ -20,6 +20,7 @@
 #include <wchar.h>
 #ifdef __APPLE__
 #include <CoreServices/CoreServices.h>
+#include <CoreFoundation/CoreFoundation.h>
 #endif
 
 #include "anything.h"
@@ -73,6 +74,56 @@ static void* _aligned_malloc(size_t size, size_t align){
 }
 static void _aligned_free(void* p){ free(p); }
 #define CP_UTF8 65001
+#ifdef __APPLE__
+static void utf8_to_wide(const char* src, wchar_t* dst, size_t dstlen){
+    if(!dstlen) return;
+    CFStringRef cf = CFStringCreateWithCString(NULL, src, kCFStringEncodingUTF8);
+    if(!cf){ dst[0] = 0; return; }
+    CFRange range = {0, CFStringGetLength(cf)};
+#if __BIG_ENDIAN__
+    CFStringEncoding enc = kCFStringEncodingUTF32BE;
+#else
+    CFStringEncoding enc = kCFStringEncodingUTF32LE;
+#endif
+    CFIndex used = 0;
+    CFStringGetBytes(cf, range, enc, 0, false, (UInt8*)dst,
+                     (dstlen - 1) * sizeof(wchar_t), &used);
+    CFRelease(cf);
+    size_t chars = (size_t)used / sizeof(wchar_t);
+    dst[chars] = 0;
+}
+static void wide_to_utf8(const wchar_t* src, char* dst, size_t dstlen){
+    if(!dstlen) return;
+#if __BIG_ENDIAN__
+    CFStringEncoding enc = kCFStringEncodingUTF32BE;
+#else
+    CFStringEncoding enc = kCFStringEncodingUTF32LE;
+#endif
+    size_t wlen = wcslen(src);
+    CFStringRef cf = CFStringCreateWithBytes(NULL, (const UInt8*)src,
+                                             wlen * sizeof(wchar_t), enc, false);
+    if(!cf){ dst[0] = 0; return; }
+    CFStringGetCString(cf, dst, dstlen, kCFStringEncodingUTF8);
+    CFRelease(cf);
+}
+static int MultiByteToWideChar(unsigned int cp, unsigned int flags, const char* src, int srclen, wchar_t* dst, int dstlen){
+    (void)cp; (void)flags; (void)srclen;
+    if(!dst) {
+        CFStringRef cf = CFStringCreateWithCString(NULL, src, kCFStringEncodingUTF8);
+        if(!cf) return 0;
+        int len = (int)CFStringGetLength(cf) + 1;
+        CFRelease(cf);
+        return len;
+    }
+    utf8_to_wide(src, dst, dstlen);
+    return (int)wcslen(dst);
+}
+static int WideCharToMultiByte(unsigned int cp, unsigned int flags, const wchar_t* src, int srclen, char* dst, int dstlen, void* a, void* b){
+    (void)cp; (void)flags; (void)srclen; (void)a; (void)b;
+    wide_to_utf8(src, dst, dstlen);
+    return (int)strlen(dst);
+}
+#else
 static int MultiByteToWideChar(unsigned int cp, unsigned int flags, const char* src, int srclen, wchar_t* dst, int dstlen){
     (void)cp; (void)flags; (void)srclen;
     return mbstowcs(dst, src, dstlen);
@@ -81,6 +132,7 @@ static int WideCharToMultiByte(unsigned int cp, unsigned int flags, const wchar_
     (void)cp; (void)flags; (void)srclen; (void)a; (void)b;
     return wcstombs(dst, src, dstlen);
 }
+#endif
 #endif
 
 static MPMCQueue g_live_updates;
@@ -212,9 +264,9 @@ static wchar_t* extract_with_filter(const wchar_t* path){
         return NULL;
     }
     CFRelease(text);
-    size_t wlen = mbstowcs(NULL, buf, 0) + 1;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, buf, -1, NULL, 0);
     wchar_t* wout = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
-    if(wout) mbstowcs(wout, buf, wlen);
+    if(wout) MultiByteToWideChar(CP_UTF8, 0, buf, -1, wout, wlen);
     free(buf);
     return wout;
 #else
