@@ -1,5 +1,5 @@
 // Git Repository Scanner Plugin
-// Scans for .git directories and indexes commit messages and diffs.
+// Scans for .git directories and indexes commit messages and diffs using libgit2.
 
 #include "plugin.h"
 #include "util.h"
@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <git2.h>
 
 #ifdef _WIN32
 #ifndef PATH_MAX
@@ -35,14 +36,6 @@ static uint64_t to_filetime(time_t t){
     return ((uint64_t)t*10000000ULL)+116444736000000000ULL;
 }
 
-#ifdef _WIN32
-#define POPEN  _popen
-#define PCLOSE _pclose
-#else
-#define POPEN  popen
-#define PCLOSE pclose
-#endif
-
 static PluginHost g_host;
 
 static wchar_t* utf8_to_wchar(const char* s){
@@ -55,57 +48,61 @@ static wchar_t* utf8_to_wchar(const char* s){
     return w;
 }
 
-static void process_commit(const wchar_t* repo_path, const char* hash){
-    char repo_mb[PATH_MAX];
-    wcstombs(repo_mb, repo_path, sizeof(repo_mb));
-    char cmd[PATH_MAX + 128];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" show --no-color --format=%%H%%n%%an%%n%%at%%n%%B --patch %s", repo_mb, hash);
-    FILE* fp = POPEN(cmd, "r");
-    if(!fp) return;
-    char line[4096];
-    if(!fgets(line, sizeof(line), fp)){ PCLOSE(fp); return; }
-    char commit_hash[64];
-    sscanf(line, "%63s", commit_hash);
-    if(!fgets(line, sizeof(line), fp)){ PCLOSE(fp); return; }
-    char author[256];
-    line[strcspn(line, "\r\n")] = 0;
-    strcpy(author, line);
-    if(!fgets(line, sizeof(line), fp)){ PCLOSE(fp); return; }
-    unsigned long long ts = strtoull(line, NULL, 10);
-    char* content = NULL; size_t cap=0,len=0;
-    while(fgets(line, sizeof(line), fp)){
-        size_t l = strlen(line);
-        if(len + l + 1 > cap){
-            size_t new_cap = cap ? cap * 2 : 4096;
-            while(new_cap < len + l + 1) new_cap *= 2;
-            char* tmp = (char*)realloc(content, new_cap);
-            if(!tmp){ free(content); content=NULL; break; }
-            content = tmp; cap = new_cap;
-        }
-        memcpy(content + len, line, l);
-        len += l;
+static void process_commit(const wchar_t* repo_path, git_repository* repo, const git_oid* oid){
+    git_commit* commit = NULL;
+    if(git_commit_lookup(&commit, repo, oid)!=0) return;
+
+    const git_signature* sig = git_commit_author(commit);
+    const char* author = sig && sig->name ? sig->name : "";
+    git_time_t ts = git_commit_time(commit);
+    const char* message = git_commit_message(commit);
+
+    git_tree* commit_tree = NULL;
+    git_tree* parent_tree = NULL;
+    git_diff* diff = NULL;
+    git_commit_tree(&commit_tree, commit);
+    if(git_commit_parentcount(commit) > 0){
+        git_commit* parent = NULL;
+        git_commit_parent(&parent, commit, 0);
+        git_commit_tree(&parent_tree, parent);
+        git_commit_free(parent);
     }
-    if(content) content[len] = 0;
-    PCLOSE(fp);
+    git_diff_tree_to_tree(&diff, repo, parent_tree, commit_tree, NULL);
+    git_buf buf = GIT_BUF_INIT;
+    git_diff_to_buf(&buf, diff, GIT_DIFF_FORMAT_PATCH);
 
     size_t authlen = strlen(author);
-    size_t contlen = content ? strlen(content) : 0;
-    char* total = (char*)malloc(authlen + contlen + 10);
+    size_t msglen = message ? strlen(message) : 0;
+    size_t difflen = buf.size;
+    char* total = (char*)malloc(authlen + msglen + difflen + 20);
     if(total){
-        int n = snprintf(total, authlen + contlen + 10, "Author: %s\n", author);
-        if(content) memcpy(total + n, content, contlen + 1);
-        else total[n] = 0;
+        int n = snprintf(total, authlen + msglen + difflen + 20, "Author: %s\n", author);
+        if(message) memcpy(total + n, message, msglen);
+        n += (int)msglen;
+        if(difflen){
+            memcpy(total + n, buf.ptr, difflen);
+            total[n + difflen] = 0;
+        }else{
+            total[n] = 0;
+        }
     }
-    free(content);
+    git_buf_dispose(&buf);
+    git_diff_free(diff);
+    git_tree_free(commit_tree);
+    git_tree_free(parent_tree);
+
     wchar_t* wcontent = utf8_to_wchar(total);
     free(total);
-    if(!wcontent) return;
+    if(!wcontent){ git_commit_free(commit); return; }
+
+    char oid_str[GIT_OID_HEXSZ+1];
+    git_oid_tostr(oid_str, sizeof(oid_str), oid);
 
     DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
-    if(!wi){ free(wcontent); return; }
+    if(!wi){ git_commit_free(commit); free(wcontent); return; }
     wcscpy_s(wi->parent_path, MAX_LONG_PATH, repo_path);
     wchar_t whash[MAX_PATH];
-    mbstowcs(whash, commit_hash, MAX_PATH);
+    mbstowcs(whash, oid_str, MAX_PATH);
     wcscpy_s(wi->name, MAX_PATH, whash);
     uint64_t ft = to_filetime((time_t)ts);
     wi->file_size = 0;
@@ -120,10 +117,11 @@ static void process_commit(const wchar_t* repo_path, const char* hash){
     wi->clone_id = 0;
     while(!MPMC_Push(g_host.queue, wi)){
         if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0){
-            aligned_free(wi); free(wcontent); return;
+            aligned_free(wi); free(wcontent); git_commit_free(commit); return;
         }
         Sleep(0);
     }
+    git_commit_free(commit);
 }
 
 #ifdef _WIN32
@@ -142,17 +140,29 @@ static void scan_dir(const wchar_t* dir){
             if(wcscmp(fd.cFileName, L".git")==0){
                 char repo_mb[PATH_MAX];
                 wcstombs(repo_mb, dir, sizeof(repo_mb));
-                char cmd[PATH_MAX + 64];
-                snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-list --all", repo_mb);
-                FILE* fp = POPEN(cmd, "r");
-                if(fp){
-                    char hash[128];
-                    while(fgets(hash,sizeof(hash),fp)){
-                        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
-                        hash[strcspn(hash, "\r\n")] = 0;
-                        if(hash[0]) process_commit(dir, hash);
+                git_repository* repo = NULL;
+                if(git_repository_open(&repo, repo_mb)==0){
+                    git_revwalk* walk = NULL;
+                    if(git_revwalk_new(&walk, repo)==0){
+                        git_revwalk_sorting(walk, GIT_SORT_TIME);
+                        git_reference_iterator* iter = NULL;
+                        git_reference* ref = NULL;
+                        if(git_reference_iterator_new(&iter, repo)==0){
+                            while(git_reference_next(&ref, iter)==0){
+                                const git_oid* oid = git_reference_target(ref);
+                                if(oid) git_revwalk_push(walk, oid);
+                                git_reference_free(ref);
+                            }
+                            git_reference_iterator_free(iter);
+                        }
+                        git_oid oid;
+                        while(git_revwalk_next(&oid, walk)==0){
+                            if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+                            process_commit(dir, repo, &oid);
+                        }
+                        git_revwalk_free(walk);
                     }
-                    PCLOSE(fp);
+                    git_repository_free(repo);
                 }
             }else{
                 scan_dir(full);
@@ -181,20 +191,31 @@ static void scan_dir(const wchar_t* dir){
         for(wchar_t* p=full; *p; ++p) if(*p==L'/') *p=L'\\';
         if(S_ISDIR(st.st_mode)){
             if(strcmp(ent->d_name, ".git")==0){
-                // found git repository at parent path "dir"
                 char repo_mb[PATH_MAX];
                 wcstombs(repo_mb, dir, sizeof(repo_mb));
-                char cmd[PATH_MAX + 64];
-                snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-list --all", repo_mb);
-                FILE* fp = POPEN(cmd, "r");
-                if(fp){
-                    char hash[128];
-                    while(fgets(hash,sizeof(hash),fp)){
-                        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
-                        hash[strcspn(hash, "\r\n")] = 0;
-                        if(hash[0]) process_commit(dir, hash);
+                git_repository* repo = NULL;
+                if(git_repository_open(&repo, repo_mb)==0){
+                    git_revwalk* walk = NULL;
+                    if(git_revwalk_new(&walk, repo)==0){
+                        git_revwalk_sorting(walk, GIT_SORT_TIME);
+                        git_reference_iterator* iter = NULL;
+                        git_reference* ref = NULL;
+                        if(git_reference_iterator_new(&iter, repo)==0){
+                            while(git_reference_next(&ref, iter)==0){
+                                const git_oid* oid = git_reference_target(ref);
+                                if(oid) git_revwalk_push(walk, oid);
+                                git_reference_free(ref);
+                            }
+                            git_reference_iterator_free(iter);
+                        }
+                        git_oid oid;
+                        while(git_revwalk_next(&oid, walk)==0){
+                            if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+                            process_commit(dir, repo, &oid);
+                        }
+                        git_revwalk_free(walk);
                     }
-                    PCLOSE(fp);
+                    git_repository_free(repo);
                 }
             }else{
                 scan_dir(full);
@@ -208,6 +229,7 @@ static void scan_dir(const wchar_t* dir){
 static BOOL init(const PluginHost* host){
     if(!host) return FALSE;
     g_host = *host;
+    git_libgit2_init();
     return TRUE;
 }
 
@@ -216,7 +238,7 @@ static void scan(void){
 }
 
 static void plugin_shutdown(void){
-    // no state to free
+    git_libgit2_shutdown();
 }
 
 static AnythingPlugin g_plugin = {
