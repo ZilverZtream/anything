@@ -141,7 +141,7 @@ typedef struct Node{ int type; TermType ttype; char* text; struct Node* left; st
 static void free_node(Node* n){ if(!n)return; free_node(n->left); free_node(n->right); if(n->type==TOK_TERM && n->text) free(n->text); free(n); }
 
 static void usage(void){
-    wprintf(L"search.exe --db <path> [--workers N] [--json] <terms and filters>\n");
+    wprintf(L"search.exe --db <path> [--workers N] [--json] [--start-indexer|--pause-indexer] <terms and filters>\n");
 }
 
 static uint64_t parse_size(const char* s){
@@ -214,6 +214,43 @@ static void print_json_path(const char* dir, const char* name){
     putchar('"');
 }
 
+static void output_error(bool json, const char* msg){
+    if(json){
+        printf("{\"error\":\"");
+        json_escape_and_print(msg);
+        printf("\"}\n");
+    } else {
+        fwprintf(stderr, L"%hs\n", msg);
+    }
+}
+
+static int set_indexer_state(const wchar_t* dbPath, bool start, bool json){
+    MDB_env* env;
+    if(mdb_env_create(&env)!=0){ output_error(json, "env_create failed"); return 1; }
+    char u8db[MAX_PATH*3]; to_utf8(dbPath, u8db, sizeof(u8db));
+    if(mdb_env_open(env, u8db, 0, 0664)!=0){ mdb_env_close(env); output_error(json, "env_open failed"); return 1; }
+    MDB_txn* txn;
+    if(mdb_txn_begin(env, NULL, 0, &txn)!=0){ mdb_env_close(env); output_error(json, "txn_begin failed"); return 1; }
+    MDB_dbi dbi_meta;
+    if(mdb_dbi_open(txn, "meta", 0, &dbi_meta)!=0){ mdb_txn_abort(txn); mdb_env_close(env); output_error(json, "dbi_open failed"); return 1; }
+    MDB_val k={.mv_data="index_state",.mv_size=11}, v;
+    IndexState st; ZeroMemory(&st, sizeof(st));
+    if(mdb_get(txn, dbi_meta, &k, &v)==0 && v.mv_size==sizeof(IndexState)){
+        memcpy(&st, v.mv_data, sizeof(st));
+    }
+    st.indexing_level = start ? INDEX_FULL_CONTENT : 0;
+    MDB_val nv={.mv_data=&st,.mv_size=sizeof(st)};
+    if(mdb_put(txn, dbi_meta, &k, &nv, 0)!=0){ mdb_txn_abort(txn); mdb_env_close(env); output_error(json, "set index state failed"); return 1; }
+    mdb_txn_commit(txn);
+    mdb_env_close(env);
+    if(json){
+        printf("{\"status\":\"%s\"}\n", start?"started":"paused");
+    } else {
+        wprintf(L"Indexer %s\n", start?L"started":L"paused");
+    }
+    return 0;
+}
+
 static void add_logic_token(TokenList* toks, const char* s){
     if(!*s) return;
     if(_stricmp(s,"AND")==0){ tokenlist_push(toks,(Token){.type=TOK_AND}); return; }
@@ -237,6 +274,7 @@ static void parse_query(int argc, wchar_t** argv, wchar_t* dbPath, SearchQuery* 
     tokenlist_init(tokens);
     for(int i=1;i<argc;i++){
         if(wcscmp(argv[i], L"--db")==0 && i+1<argc){ wcscpy_s(dbPath, MAX_PATH, argv[++i]); continue; }
+        if(wcscmp(argv[i], L"--start-indexer")==0 || wcscmp(argv[i], L"--pause-indexer")==0) continue;
         char u8[1024]; to_utf8(argv[i], u8, sizeof(u8));
         if(_strnicmp(u8,"size:",5)==0){
             const char* s=u8+5;
@@ -289,6 +327,19 @@ static void parse_query(int argc, wchar_t** argv, wchar_t* dbPath, SearchQuery* 
         if(!q->title_pattern && tokens->items[i].ttype==TERM_TITLE) q->title_pattern=_strdup(tokens->items[i].text);
         if(!q->ext_pattern && tokens->items[i].ttype==TERM_EXT) q->ext_pattern=_strdup(tokens->items[i].text);
     }
+}
+
+static void free_search_query(SearchQuery* q){
+    if(q->name_pattern) free(q->name_pattern);
+    if(q->content_pattern) free(q->content_pattern);
+    if(q->author_pattern) free(q->author_pattern);
+    if(q->camera_pattern) free(q->camera_pattern);
+    if(q->lens_pattern) free(q->lens_pattern);
+    if(q->artist_pattern) free(q->artist_pattern);
+    if(q->album_pattern) free(q->album_pattern);
+    if(q->title_pattern) free(q->title_pattern);
+    if(q->ext_pattern) free(q->ext_pattern);
+    if(q->path_filter) free(q->path_filter);
 }
 
 typedef struct {
@@ -949,6 +1000,7 @@ int wmain(int argc, wchar_t** argv){
         if(wcscmp(argv[i], L"--db")==0){ i++; continue; }
         if(wcscmp(argv[i], L"--workers")==0){ i++; continue; }
         if(wcscmp(argv[i], L"--json")==0){ continue; }
+        if(wcscmp(argv[i], L"--start-indexer")==0 || wcscmp(argv[i], L"--pause-indexer")==0){ continue; }
         char u8[512]; to_utf8(argv[i], u8, sizeof(u8));
         size_t ulen = strlen(u8);
         if(qpos + ulen + 2 < sizeof(qcanon)){ memcpy(qcanon+qpos,u8,ulen); qpos+=ulen; qcanon[qpos++]=' '; qcanon[qpos]=0; }
@@ -965,23 +1017,32 @@ int wmain(int argc, wchar_t** argv){
     wchar_t dbPath[MAX_PATH];
     SearchQuery q; TokenList tokens;
     int workers = g_config.default_search_workers; bool json_output=false;
+    bool admin_start=false, admin_pause=false;
     for(int ai=1; ai<argc; ++ai){
         if(wcscmp(argv[ai], L"--workers")==0 && ai+1<argc){
             workers = _wtoi(argv[++ai]);
         } else if(wcscmp(argv[ai], L"--json")==0){
             json_output=true;
+        } else if(wcscmp(argv[ai], L"--start-indexer")==0){
+            admin_start=true;
+        } else if(wcscmp(argv[ai], L"--pause-indexer")==0){
+            admin_pause=true;
         }
     }
     if(workers<1) workers=1;
     if(workers>g_config.max_search_workers) workers=g_config.max_search_workers;
     parse_query(argc, argv, dbPath, &q, &tokens);
-    if(!dbPath[0]){ usage(); return 1; }
+    if(!dbPath[0]){ if(json_output) output_error(json_output, "missing --db"); else usage(); free_search_query(&q); tokenlist_free(&tokens); return 1; }
     if(!enterprise_check_permission("user", "db")){
-        fwprintf(stderr, L"Permission denied\n");
-        return 1;
+        output_error(json_output, "Permission denied");
+        free_search_query(&q); tokenlist_free(&tokens); return 1;
+    }
+    if(admin_start || admin_pause){
+        int rc = set_indexer_state(dbPath, admin_start, json_output);
+        free_search_query(&q); tokenlist_free(&tokens); return rc;
     }
     wcscpy_s(g_db_path, MAX_PATH, dbPath);
-    if(!open_bloom(dbPath)){ fwprintf(stderr,L"bloom open failed\n"); return 1; }
+    if(!open_bloom(dbPath)){ output_error(json_output, "bloom open failed"); free_search_query(&q); tokenlist_free(&tokens); return 1; }
 
     // Try cache based on query without size/path/date filters
     IdVec rec_ids; idvec_init(&rec_ids);
@@ -989,11 +1050,11 @@ int wmain(int argc, wchar_t** argv){
 
     // Open env and dbis
     MDB_env* env=NULL; MDB_txn* txn=NULL;
-    if(mdb_env_create(&env)!=0){ fwprintf(stderr,L"env_create failed\n"); return 1; }
+    if(mdb_env_create(&env)!=0){ output_error(json_output,"env_create failed"); free_search_query(&q); tokenlist_free(&tokens); close_bloom(); return 1; }
     mdb_env_set_maxdbs(env, 64);
     char u8db[MAX_PATH*3]; to_utf8(dbPath,u8db,sizeof(u8db));
-    if(mdb_env_open(env, u8db, MDB_RDONLY, 0664)!=0){ fwprintf(stderr,L"env_open failed\n"); close_bloom(); return 1; }
-    if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ fwprintf(stderr,L"txn_begin failed\n"); close_bloom(); return 1; }
+    if(mdb_env_open(env, u8db, MDB_RDONLY, 0664)!=0){ output_error(json_output,"env_open failed"); mdb_env_close(env); free_search_query(&q); tokenlist_free(&tokens); close_bloom(); return 1; }
+    if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ output_error(json_output,"txn_begin failed"); mdb_env_close(env); close_bloom(); free_search_query(&q); tokenlist_free(&tokens); return 1; }
     MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_mtime, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_strrev, dbi_attr;
     if(mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
        mdb_dbi_open(txn,"records",0,&dbi_records)!=0 ||
@@ -1013,7 +1074,7 @@ int wmain(int argc, wchar_t** argv){
        mdb_dbi_open(txn,"title_index",0,&dbi_title)!=0 ||
        mdb_dbi_open(txn,"strrev",0,&dbi_strrev)!=0 ||
        mdb_dbi_open(txn,"attr_index",0,&dbi_attr)!=0){
-       fwprintf(stderr,L"dbi_open failed\n"); mdb_txn_abort(txn); mdb_env_close(env); close_bloom(); return 1;
+       output_error(json_output,"dbi_open failed"); mdb_txn_abort(txn); mdb_env_close(env); close_bloom(); free_search_query(&q); tokenlist_free(&tokens); return 1;
     }
 
 
@@ -1117,16 +1178,7 @@ int wmain(int argc, wchar_t** argv){
     mdb_txn_abort(txn); mdb_env_close(env);
 
     // cleanup
-    if(q.name_pattern) free(q.name_pattern);
-    if(q.content_pattern) free(q.content_pattern);
-    if(q.author_pattern) free(q.author_pattern);
-    if(q.camera_pattern) free(q.camera_pattern);
-    if(q.lens_pattern) free(q.lens_pattern);
-    if(q.artist_pattern) free(q.artist_pattern);
-    if(q.album_pattern) free(q.album_pattern);
-    if(q.title_pattern) free(q.title_pattern);
-    if(q.ext_pattern) free(q.ext_pattern);
-    if(q.path_filter) free(q.path_filter);
+    free_search_query(&q);
     idvec_free(&rec_ids);
     idvec_free(&cache_copy);
     tokenlist_free(&tokens);
