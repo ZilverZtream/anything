@@ -32,6 +32,8 @@ typedef struct { uint32_t trigram_count; uint64_t bloom_offset; } StringMeta;
 static HANDLE bloom_mapping = NULL;
 static const uint8_t* bloom_readonly_base = NULL;
 static size_t g_bloom_size = 0;
+// Global database path for caching term results
+static wchar_t g_db_path[MAX_PATH]={0};
 static BOOL open_bloom(const wchar_t* dbPath){
     wchar_t bp[MAX_PATH]; swprintf(bp, MAX_PATH, L"%s\\bloom.dat", dbPath);
     HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -344,6 +346,74 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     if(!base){ CloseHandle(m); CloseHandle(f); return; }
     CacheHeader* h = (CacheHeader*)base;
     h->sig = hash64(qstr, strlen(qstr)); h->count = (uint32_t)ids->n;
+    memcpy(base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
+    UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
+}
+
+// Per-term cache helpers
+static char term_prefix(TermType t){
+    switch(t){
+        case TERM_NAME: return 'N';
+        case TERM_AUTHOR: return 'A';
+        case TERM_CAMERA: return 'M';
+        case TERM_LENS: return 'L';
+        case TERM_ARTIST: return 'R';
+        case TERM_ALBUM: return 'B';
+        case TERM_TITLE: return 'T';
+        case TERM_EXT: return 'E';
+        case TERM_CONTENT: return 'C';
+    }
+    return 'X';
+}
+
+static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
+    if(!g_db_path[0]) return FALSE;
+    char key[512];
+    key[0] = term_prefix(ttype);
+    strncpy(key+1, term, sizeof(key)-2);
+    key[sizeof(key)-1] = 0;
+    uint64_t sig = hash64(key, strlen(key));
+    wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, g_db_path);
+    wchar_t* p = wcsrchr(cachePath, L'\\'); if(!p) return FALSE;
+    swprintf(p+1, (size_t)(MAX_PATH-(p+1-cachePath)), L"cache_term_%016llx.tmp", (unsigned long long)sig);
+    HANDLE f = CreateFileW(cachePath, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if(f==INVALID_HANDLE_VALUE) return FALSE;
+    DWORD sz = GetFileSize(f, NULL);
+    if(sz < sizeof(CacheHeader)){ CloseHandle(f); return FALSE; }
+    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
+    if(!m){ CloseHandle(f); return FALSE; }
+    BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0);
+    if(!base){ CloseHandle(m); CloseHandle(f); return FALSE; }
+    const CacheHeader* h = (const CacheHeader*)base;
+    BOOL ok = FALSE;
+    if(h->sig == sig && sz >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
+        out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
+        memcpy(out->ids, base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
+        out->n = h->count; out->cap = h->count;
+        ok = TRUE;
+    }
+    UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
+    return ok;
+}
+
+static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
+    if(!g_db_path[0]) return;
+    char key[512];
+    key[0] = term_prefix(ttype);
+    strncpy(key+1, term, sizeof(key)-2);
+    key[sizeof(key)-1] = 0;
+    uint64_t sig = hash64(key, strlen(key));
+    wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, g_db_path);
+    wchar_t* p = wcsrchr(cachePath, L'\\'); if(!p) return;
+    swprintf(p+1, (size_t)(MAX_PATH-(p+1-cachePath)), L"cache_term_%016llx.tmp", (unsigned long long)sig);
+    HANDLE f = CreateFileW(cachePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if(f==INVALID_HANDLE_VALUE) return;
+    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, (DWORD)(sizeof(CacheHeader)+ids->n*sizeof(uint64_t)), NULL);
+    if(!m){ CloseHandle(f); return; }
+    BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_WRITE, 0,0,0);
+    if(!base){ CloseHandle(m); CloseHandle(f); return; }
+    CacheHeader* h = (CacheHeader*)base;
+    h->sig = sig; h->count = (uint32_t)ids->n;
     memcpy(base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
 }
@@ -826,18 +896,23 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
 static void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MDB_dbi dbi_trigram, MDB_dbi dbi_smeta, MDB_dbi dbi_content, MDB_dbi dbi_author, MDB_dbi dbi_camera, MDB_dbi dbi_lens, MDB_dbi dbi_artist, MDB_dbi dbi_album, MDB_dbi dbi_title, MDB_dbi dbi_ext, MDB_dbi dbi_strrev, MDB_dbi dbi_date, IdVec* out){
     if(!n) return;
     if(n->type==TOK_TERM){
-        switch(n->ttype){
-            case TERM_NAME: records_for_name(txn, dbi_trigram, dbi_fname, dbi_strings, dbi_smeta, n->text, out); break;
-            case TERM_CONTENT: records_for_content(txn, dbi_trigram, dbi_content, n->text, out); break;
-            case TERM_AUTHOR: records_for_author(txn, dbi_author, dbi_strrev, n->text, out); break;
-            case TERM_CAMERA: records_for_camera(txn, dbi_camera, dbi_strrev, n->text, out); break;
-            case TERM_LENS: records_for_lens(txn, dbi_lens, dbi_strrev, n->text, out); break;
-            case TERM_ARTIST: records_for_artist(txn, dbi_artist, dbi_strrev, n->text, out); break;
-            case TERM_ALBUM: records_for_album(txn, dbi_album, dbi_strrev, n->text, out); break;
-            case TERM_TITLE: records_for_title(txn, dbi_title, dbi_strrev, n->text, out); break;
-            case TERM_EXT: records_for_ext(txn, dbi_ext, n->text, out); break;
+        if(!try_load_term_cache(n->ttype, n->text, out)){
+            switch(n->ttype){
+                case TERM_NAME: records_for_name(txn, dbi_trigram, dbi_fname, dbi_strings, dbi_smeta, n->text, out); break;
+                case TERM_CONTENT: records_for_content(txn, dbi_trigram, dbi_content, n->text, out); break;
+                case TERM_AUTHOR: records_for_author(txn, dbi_author, dbi_strrev, n->text, out); break;
+                case TERM_CAMERA: records_for_camera(txn, dbi_camera, dbi_strrev, n->text, out); break;
+                case TERM_LENS: records_for_lens(txn, dbi_lens, dbi_strrev, n->text, out); break;
+                case TERM_ARTIST: records_for_artist(txn, dbi_artist, dbi_strrev, n->text, out); break;
+                case TERM_ALBUM: records_for_album(txn, dbi_album, dbi_strrev, n->text, out); break;
+                case TERM_TITLE: records_for_title(txn, dbi_title, dbi_strrev, n->text, out); break;
+                case TERM_EXT: records_for_ext(txn, dbi_ext, n->text, out); break;
+            }
+            sort_unique(out);
+            save_term_cache(n->ttype, n->text, out);
+        } else {
+            sort_unique(out);
         }
-        sort_unique(out);
         return;
     }
     if(n->type==TOK_AND || n->type==TOK_OR){
@@ -897,6 +972,7 @@ int wmain(int argc, wchar_t** argv){
         fwprintf(stderr, L"Permission denied\n");
         return 1;
     }
+    wcscpy_s(g_db_path, MAX_PATH, dbPath);
     if(!open_bloom(dbPath)){ fwprintf(stderr,L"bloom open failed\n"); return 1; }
 
     // Try cache based on canonical query string
