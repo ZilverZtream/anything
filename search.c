@@ -899,16 +899,14 @@ int wmain(int argc, wchar_t** argv){
     }
     if(!open_bloom(dbPath)){ fwprintf(stderr,L"bloom open failed\n"); return 1; }
 
-    // Try cache
-    if(q.name_pattern){
-        IdVec cached; idvec_init(&cached);
-        if(try_load_cache(dbPath, q.name_pattern, &cached)){
-            tokenlist_free(&tokens);
-            idvec_free(&cached);
-            goto do_search_with_ids;
-        }
+    // Try cache based on canonical query string
+    IdVec cached; idvec_init(&cached);
+    if(try_load_cache(dbPath, qcanon, &cached)){
+        tokenlist_free(&tokens);
         idvec_free(&cached);
+        goto do_search_with_ids;
     }
+    idvec_free(&cached);
 
     // Open env and dbis
     MDB_env* env=NULL; MDB_txn* txn=NULL;
@@ -1023,8 +1021,8 @@ int wmain(int argc, wchar_t** argv){
     free(all);
 
     // Save cache for next run
-    if(q.name_pattern && rec_ids.n>0){
-        save_cache(dbPath, q.name_pattern, &rec_ids);
+    if(rec_ids.n>0){
+        save_cache(dbPath, qcanon, &rec_ids);
     }
 
     mdb_txn_abort(txn); mdb_env_close(env);
