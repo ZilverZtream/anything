@@ -2,10 +2,16 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <stdlib.h>
 #include <wchar.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+
+#define _stricmp strcasecmp
+#define _strnicmp strncasecmp
+#define _strdup strdup
 
 #include "../util.h"
 
@@ -205,11 +211,22 @@ static void test_filter_dm(){
     tokenlist_free(&tokens); free_search_query(&q);
 }
 
+static void test_parse_tokens_syntax_error(){
+    wchar_t* argv[] = { L"prog", L"termA", L")", L"termB" };
+    int argc = sizeof(argv)/sizeof(argv[0]);
+    wchar_t dbPath[MAX_PATH]; SearchQuery q; TokenList tokens;
+    parse_query(argc, argv, dbPath, &q, &tokens);
+    Node* root = parse_tokens(&tokens);
+    assert(root == NULL);
+    tokenlist_free(&tokens); free_search_query(&q);
+}
+
 int main(){
     test_parse_tokens_complex();
     test_parse_tokens_precedence();
     test_filter_size();
     test_filter_dm();
+    test_parse_tokens_syntax_error();
     printf("All search tests passed\n");
     return 0;
 }

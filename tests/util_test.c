@@ -50,12 +50,43 @@ static void test_bm25_score(){
     assert(fabsf(s2 - 4.2096554f) < 1e-5f);
 }
 
+static void test_path_join_dirname(){
+    wchar_t out[MAX_PATH];
+    // path_join with root path and automatic separator
+    assert(path_join(out, MAX_PATH, L"C:\\", L"file.txt"));
+    assert(wcscmp(out, L"C:\\file.txt") == 0);
+    // path_join where first part lacks trailing slash
+    assert(path_join(out, MAX_PATH, L"C:\\base", L"child"));
+    assert(wcscmp(out, L"C:\\base\\child") == 0);
+    // path_join with empty second component
+    assert(path_join(out, MAX_PATH, L"C:\\base", L""));
+    assert(wcscmp(out, L"C:\\base\\") == 0);
+    // path_join with empty first component
+    assert(path_join(out, MAX_PATH, L"", L"solo"));
+    assert(wcscmp(out, L"solo") == 0);
+
+    // path_dirname basic path
+    assert(path_dirname(L"C:\\base\\child.txt", out, MAX_PATH));
+    assert(wcscmp(out, L"C:\\base") == 0);
+    // path_dirname with trailing slash
+    assert(path_dirname(L"C:\\base\\sub\\", out, MAX_PATH));
+    assert(wcscmp(out, L"C:\\base\\sub") == 0);
+    // path_dirname of root
+    assert(path_dirname(L"C:\\", out, MAX_PATH));
+    assert(wcscmp(out, L"C:") == 0);
+    // path_dirname without separator
+    assert(!path_dirname(L"noslash", out, MAX_PATH));
+    // path_dirname empty string
+    assert(!path_dirname(L"", out, MAX_PATH));
+}
+
 int main(void){
     test_normalize_filename_utf8();
     test_hash64_crc64_sha1();
     test_levenshtein_distance();
     test_fuzzy_match();
     test_bm25_score();
+    test_path_join_dirname();
     printf("All util tests passed\n");
     return 0;
 }
