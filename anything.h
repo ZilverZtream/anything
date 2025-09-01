@@ -10,7 +10,9 @@
 #else
 #include <pthread.h>
 #include <sys/types.h>
-typedef void* HANDLE;
+// Use pthread_t for HANDLE on non-Windows platforms to provide a
+// concrete native handle type rather than a generic void pointer.
+typedef pthread_t HANDLE;
 typedef int BOOL;
 #include <stdint.h>
 typedef int32_t LONG;
