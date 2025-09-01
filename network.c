@@ -3,6 +3,16 @@
 #endif
 #include "scanner.h"
 #include <stdlib.h>
+#include <stdint.h>
+
+static BOOL is_cancelled(HANDLE h){
+#ifdef _WIN32
+    return WaitForSingleObject(h,0)==WAIT_OBJECT_0;
+#else
+    if(!h) return FALSE;
+    return *(volatile BOOL*)(uintptr_t)h;
+#endif
+}
 
 #ifdef _WIN32
 
@@ -52,6 +62,7 @@ struct NetworkScanner {
     pthread_t thread;
     MPMCQueue* outq;
     HANDLE cancel;
+    volatile BOOL stop;
     char root[PATH_MAX];
 };
 
@@ -79,6 +90,8 @@ static int enum_cb_net(const char* fpath, const struct stat* sb, int typeflag, s
     (void)typeflag;
     struct NetworkScanner* s = g_net_current;
     if(!s) return 0;
+    if(is_cancelled(s->cancel)) s->stop = TRUE;
+    if(s->stop) return 1;
     const char* name = fpath + ftwbuf->base;
     char parent[PATH_MAX];
     if(ftwbuf->base > 0){
@@ -99,7 +112,7 @@ static void* net_thread(void* arg){
 }
 
 NetworkScanner* NetworkScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent){
-    (void)threads; (void)cancelEvent;
+    (void)threads;
     struct NetworkScanner* s = (struct NetworkScanner*)calloc(1, sizeof(struct NetworkScanner));
     if(!s) return NULL;
     wcstombs(s->root, rootPath, PATH_MAX);
@@ -112,10 +125,13 @@ NetworkScanner* NetworkScanner_Start(const wchar_t* rootPath, int threads, MPMCQ
 void NetworkScanner_Wait(struct NetworkScanner* s){
     if(!s) return;
     pthread_join(s->thread, NULL);
+    s->thread = 0;
 }
 
 void NetworkScanner_Free(struct NetworkScanner* s){
     if(!s) return;
+    s->stop = TRUE;
+    if(s->thread) pthread_join(s->thread, NULL);
     free(s);
 }
 
@@ -139,6 +155,7 @@ struct NetworkScanner {
     pthread_t thread;
     MPMCQueue* outq;
     HANDLE cancel;
+    volatile BOOL stop;
     char root[PATH_MAX];
 };
 
@@ -166,6 +183,8 @@ static int enum_cb_net(const char* fpath, const struct stat* sb, int typeflag, s
     (void)typeflag;
     struct NetworkScanner* s = g_net_current;
     if(!s) return 0;
+    if(is_cancelled(s->cancel)) s->stop = TRUE;
+    if(s->stop) return 1;
     const char* name = fpath + ftwbuf->base;
     char parent[PATH_MAX];
     if(ftwbuf->base > 0){
@@ -186,7 +205,7 @@ static void* net_thread(void* arg){
 }
 
 NetworkScanner* NetworkScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent){
-    (void)threads; (void)cancelEvent;
+    (void)threads;
     struct NetworkScanner* s = (struct NetworkScanner*)calloc(1, sizeof(struct NetworkScanner));
     if(!s) return NULL;
     wcstombs(s->root, rootPath, PATH_MAX);
@@ -199,10 +218,13 @@ NetworkScanner* NetworkScanner_Start(const wchar_t* rootPath, int threads, MPMCQ
 void NetworkScanner_Wait(struct NetworkScanner* s){
     if(!s) return;
     pthread_join(s->thread, NULL);
+    s->thread = 0;
 }
 
 void NetworkScanner_Free(struct NetworkScanner* s){
     if(!s) return;
+    s->stop = TRUE;
+    if(s->thread) pthread_join(s->thread, NULL);
     free(s);
 }
 
