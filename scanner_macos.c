@@ -8,9 +8,12 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <sched.h>
 #include <ftw.h>
+#include <zip.h>
+#include <libpst/libpst.h>
 
 #ifndef FILE_ATTRIBUTE_DIRECTORY
 #define FILE_ATTRIBUTE_DIRECTORY 0x10
@@ -29,6 +32,82 @@ struct FileScanner {
 };
 
 static FileScanner* g_current;
+
+static BOOL has_ext(const char* path, const char* ext){
+    const char* dot = strrchr(path, '.');
+    if(!dot) return FALSE;
+    return strcasecmp(dot+1, ext) == 0;
+}
+
+static void emit_zip_entries(FileScanner* s, const char* path){
+    int err = 0;
+    zip_t* z = zip_open(path, 0, &err);
+    if(!z) return;
+    zip_int64_t count = zip_get_num_entries(z, 0);
+    for(zip_int64_t i=0;i<count;i++){
+        const char* name = zip_get_name(z, i, 0);
+        if(!name) continue;
+        DbWorkItem* wi;
+        if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) continue;
+        wi->content = NULL;
+        wi->preview = NULL;
+        mbstowcs(wi->parent_path, path, MAX_LONG_PATH);
+        wi->parent_path[MAX_LONG_PATH-1] = 0;
+        mbstowcs(wi->name, name, MAX_PATH);
+        wi->name[MAX_PATH-1] = 0;
+        wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
+        wi->attributes = 0;
+        wi->clone_id = 0;
+        wi->stage = INDEX_NAMES_ONLY;
+        wi->op = WI_ADD;
+        while(!MPMC_Push(s->outq, wi)) sched_yield();
+    }
+    zip_close(z);
+}
+
+static void emit_pst_tree(FileScanner* s, const wchar_t* parent, pst_file* pf, pst_desc_tree* node){
+    for(pst_desc_tree* cur=node; cur; cur=cur->next){
+        pst_item* item = pst_parse_item(pf, cur, NULL);
+        if(item){
+            pst_convert_utf8_null(item, &item->subject);
+            const char* subj = item->subject ? item->subject : "";
+            DbWorkItem* wi;
+            if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))==0){
+                wi->content = NULL;
+                wi->preview = NULL;
+                wcsncpy(wi->parent_path, parent, MAX_LONG_PATH);
+                wi->parent_path[MAX_LONG_PATH-1] = 0;
+                mbstowcs(wi->name, subj, MAX_PATH);
+                wi->name[MAX_PATH-1] = 0;
+                wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
+                wi->attributes = 0;
+                wi->clone_id = 0;
+                wi->stage = INDEX_NAMES_ONLY;
+                wi->op = WI_ADD;
+                while(!MPMC_Push(s->outq, wi)) sched_yield();
+            }
+            pst_freeItem(item);
+        }
+        if(cur->child) emit_pst_tree(s, parent, pf, cur->child);
+    }
+}
+
+static void emit_pst_entries(FileScanner* s, const char* path){
+    pst_file pf; memset(&pf,0,sizeof(pf));
+    if(pst_open(&pf, path, NULL)!=0) return;
+    if(pst_load_index(&pf)!=0){ pst_close(&pf); return; }
+    if(pst_load_extended_attributes(&pf)!=0){ pst_close(&pf); return; }
+    pst_item* root = pst_parse_item(&pf, pf.d_head, NULL);
+    if(!root){ pst_close(&pf); return; }
+    pst_desc_tree* top = pst_getTopOfFolders(&pf, root);
+    if(top && top->child){
+        wchar_t parent[MAX_LONG_PATH];
+        mbstowcs(parent, path, MAX_LONG_PATH);
+        emit_pst_tree(s, parent, &pf, top->child);
+    }
+    pst_freeItem(root);
+    pst_close(&pf);
+}
 
 static void emit(FileScanner* s, const char* path){
     struct stat st;
@@ -69,6 +148,10 @@ static void emit(FileScanner* s, const char* path){
     wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)) sched_yield();
+    if(!S_ISDIR(st.st_mode)){
+        if(has_ext(path, "zip")) emit_zip_entries(s, path);
+        else if(has_ext(path, "pst")) emit_pst_entries(s, path);
+    }
 }
 
 static int enum_cb(const char* fpath, const struct stat* sb, int typeflag, struct FTW* ftwbuf){
