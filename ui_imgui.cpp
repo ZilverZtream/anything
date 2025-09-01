@@ -1,9 +1,10 @@
  #ifdef HAS_IMGUI
  #include <imgui.h>
- #include <imgui_impl_glfw.h>
- #include <imgui_impl_opengl3.h>
- #include <GLFW/glfw3.h>
- #include "stb_image.h"
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+#include <GLFW/glfw3.h>
+#include "stb_image.h"
+#include "TextEditor.h"
 #ifdef _WIN32
 #include <windows.h>
 #include <intrin.h>
@@ -120,6 +121,8 @@ struct DuplicateItem {
 };
 
 static std::vector<DuplicateItem> g_duplicates;
+static TextEditor g_code_editor;
+static std::string g_code_preview_file;
 
 #ifdef _WIN32
 static bool taskbar_search_is_enabled(){
@@ -823,6 +826,7 @@ static void search_thread(SearchThreadArgs* sta) {
                 std::string e = to_lower(filename.substr(dot + 1));
                 if (e == "jpg" || e == "png" || e == "gif" || e == "bmp") type = "image";
                 else if (e == "pdf") type = "pdf";
+                else if (e == "c" || e == "h" || e == "cpp" || e == "cc" || e == "hpp" || e == "rs" || e == "go" || e == "cs" || e == "vb" || e == "java" || e == "py") type = "code";
             }
             sta->results->push_back({filename, path, snippet, (int64_t)r->file_size, (time_t)(r->modified_time / 10000000 - 11644473600LL), type, ranked[i].score});
         }
@@ -1048,6 +1052,20 @@ int run_ui(void){
                             if (ImGui::BeginTabItem("Preview")) {
                                 if (r.type == "text" || r.type == "pdf") {
                                     draw_highlighted(r.snippet, query_str);
+                                } else if (r.type == "code") {
+                                    std::string full = r.path + "\\" + r.filename;
+                                    if (g_code_preview_file != full) {
+                                        g_code_preview_file = full;
+                                        g_code_editor.SetReadOnly(true);
+                                        g_code_editor.SetPalette(TextEditor::GetDarkPalette());
+                                        std::string ext;
+                                        size_t d = r.filename.rfind('.');
+                                        if (d != std::string::npos) ext = to_lower(r.filename.substr(d + 1));
+                                        if (ext == "py") g_code_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::Python());
+                                        else g_code_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::CPlusPlus());
+                                        g_code_editor.SetText(r.snippet);
+                                    }
+                                    g_code_editor.Render("CodePreview");
                                 } else if (r.type == "image") {
                                     if (r.texture != 0) {
                                         float aspect = static_cast<float>(r.height) / static_cast<float>(r.width);
