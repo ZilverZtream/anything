@@ -58,9 +58,37 @@ static void test_trigram_bloom(){
     }
 }
 
+static void test_db_put_records_and_get_by_path(){
+    wchar_t path[MAX_PATH];
+    make_temp_dir(path, MAX_PATH);
+    Db* db = NULL;
+    assert(db_create(path, 1, 1, &db));
+
+    uint64_t parent_id = db_intern_wstring(db, L"parent");
+    assert(db_commit_write(db));
+    uint64_t name_id = db_intern_wstring(db, L"file.txt");
+    assert(db_commit_write(db));
+
+    DbRecord rec = {0};
+    rec.parent_str_id = parent_id;
+    rec.name_str_id = name_id;
+    rec.type = DB_REC_FILE;
+    rec.file_size = 1;
+    rec.creation_time = rec.modified_time = rec.access_time = 1;
+    assert(db_put_records(db, &rec, 1));
+    assert(db_commit_write(db));
+    const DbHeader* hdr = db_header(db);
+    assert(hdr->record_count == 1);
+
+    DbRecord out;
+    assert(!db_get_record_by_path(db, L"parent", L"missing", &out));
+    db_close(db);
+}
+
 int main(void){
     test_db_intern_wstring();
     test_trigram_bloom();
+    test_db_put_records_and_get_by_path();
     printf("All database tests passed\n");
     return 0;
 }
