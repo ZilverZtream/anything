@@ -59,7 +59,7 @@ The MacVM scanner can read ext4-based virtual disk images used by Docker, Parall
 ## Plugin API
 Custom data source scanners can be implemented as DLLs. Place compiled plugins in a `plugins` folder next to the executable and they will be loaded at startup. The `plugin.h` header documents the API each DLL must expose.
 
-An example `ocr_plugin.c` is provided which uses Tesseract OCR to extract and index text from images and scanned PDFs.
+Example plugins include `ocr_plugin.c`, which uses Tesseract OCR to extract and index text from images and scanned PDFs, and `registry_plugin.c`, a Windows-only plugin that scans the system registry for searchable keys and values.
 
 ## Build
 This project is written in **C** for Windows.
