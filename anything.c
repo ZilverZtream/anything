@@ -34,6 +34,54 @@
 #include <stdbool.h>
 #include <zip.h>
 #include <libpst/libpst.h>
+#ifndef _WIN32
+#include <strings.h>
+#include <stdarg.h>
+#include <wctype.h>
+#define Sleep(ms) usleep((ms)*1000)
+#define _stricmp strcasecmp
+#define _strnicmp strncasecmp
+#define _wcsicmp wcscasecmp
+static int wcsncasecmp_local(const wchar_t* a, const wchar_t* b, size_t n){
+    for(size_t i=0;i<n;i++){
+        wchar_t ca = towlower(a[i]);
+        wchar_t cb = towlower(b[i]);
+        if(ca!=cb || ca==0 || cb==0) return ca - cb;
+    }
+    return 0;
+}
+static char* StrStrIA(const char* haystack, const char* needle){
+    return strcasestr(haystack, needle);
+}
+static wchar_t* StrStrIW(const wchar_t* haystack, const wchar_t* needle){
+    size_t nlen = wcslen(needle);
+    for(const wchar_t* p=haystack; *p; p++){
+        if(wcsncasecmp_local(p, needle, nlen) == 0) return (wchar_t*)p;
+    }
+    return NULL;
+}
+static int _snwprintf(wchar_t* dst, size_t cch, const wchar_t* fmt, ...){
+    va_list ap; va_start(ap, fmt);
+    int r = vswprintf(dst, cch, fmt, ap);
+    va_end(ap);
+    return r;
+}
+static void* _aligned_malloc(size_t size, size_t align){
+    void* p = NULL;
+    if(posix_memalign(&p, align, size)!=0) return NULL;
+    return p;
+}
+static void _aligned_free(void* p){ free(p); }
+#define CP_UTF8 65001
+static int MultiByteToWideChar(unsigned int cp, unsigned int flags, const char* src, int srclen, wchar_t* dst, int dstlen){
+    (void)cp; (void)flags; (void)srclen;
+    return mbstowcs(dst, src, dstlen);
+}
+static int WideCharToMultiByte(unsigned int cp, unsigned int flags, const wchar_t* src, int srclen, char* dst, int dstlen, void* a, void* b){
+    (void)cp; (void)flags; (void)srclen; (void)a; (void)b;
+    return wcstombs(dst, src, dstlen);
+}
+#endif
 
 static MPMCQueue g_live_updates;
 static BOOL g_live_inited = FALSE;
