@@ -153,6 +153,7 @@ void NTFSScanner_Free(NTFSScanner* s);
 HANDLE StartUSNTailer(const wchar_t* volumeRoot, MPMCQueue* outQueue, HANDLE cancelEvent);
 #endif
 
+#ifndef ANYTHING_NO_DB_TYPES
 // ---- DB API (LMDB) ----
 typedef enum {
     DB_ERROR_NONE = 0,
@@ -188,5 +189,6 @@ BOOL db_compress(Db* db, const wchar_t* out_path);
 
 uint64_t db_intern_wstring(Db* db, const wchar_t* s);
 BOOL db_put_records(Db* db, const DbRecord* recs, size_t count);
+#endif
 
 #endif

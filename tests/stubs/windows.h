@@ -5,6 +5,7 @@
 #include <wchar.h>
 #include <stdarg.h>
 #include <alloca.h>
+#include <string.h>
 
 typedef int BOOL;
 typedef unsigned char BYTE;
@@ -12,6 +13,7 @@ typedef unsigned short WORD;
 typedef unsigned int UINT;
 typedef uint32_t DWORD;
 typedef int64_t LONG;
+typedef int64_t LONG64;
 typedef uint64_t ULONGLONG;
 typedef uint64_t ULONG64;
 typedef void* HANDLE;
@@ -36,15 +38,20 @@ BOOL VirtualFree(void*, size_t, DWORD);
 #define FILE_SHARE_WRITE 0
 #define FILE_SHARE_DELETE 0
 #define OPEN_EXISTING 0
+#define OPEN_ALWAYS 0
 #define FILE_FLAG_SEQUENTIAL_SCAN 0
 #define FILE_FLAG_DELETE_ON_CLOSE 0
 #define FILE_ATTRIBUTE_TEMPORARY 0
+#define FILE_ATTRIBUTE_NORMAL 0
 #define CREATE_ALWAYS 0
 #define FILE_BEGIN 0
 #define _TRUNCATE ((size_t)-1)
+#define FORMAT_MESSAGE_FROM_SYSTEM 0
+#define FORMAT_MESSAGE_IGNORE_INSERTS 0
 
 #define _malloca(size) alloca(size)
 #define _freea(p) ((void)0)
+#define ZeroMemory(p,s) memset((p),0,(s))
 
 typedef struct _FILETIME {
     DWORD dwLowDateTime;
@@ -80,6 +87,14 @@ typedef union _ULARGE_INTEGER {
     uint64_t QuadPart;
 } ULARGE_INTEGER;
 
+typedef union _LARGE_INTEGER {
+    struct {
+        DWORD LowPart;
+        LONG HighPart;
+    };
+    int64_t QuadPart;
+} LARGE_INTEGER;
+
 BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX* ms);
 int wcscpy_s(wchar_t* dst, size_t dstcch, const wchar_t* src);
 int wcsncat_s(wchar_t* dst, size_t dstcch, const wchar_t* src, size_t count);
@@ -96,6 +111,15 @@ BOOL ReadFile(HANDLE, void*, DWORD, DWORD*, void*);
 BOOL WriteFile(HANDLE, const void*, DWORD, DWORD*, void*);
 BOOL CloseHandle(HANDLE);
 DWORD SetFilePointer(HANDLE, LONG, void*, DWORD);
+BOOL SetFilePointerEx(HANDLE, LARGE_INTEGER, LARGE_INTEGER*, DWORD);
+BOOL GetFileSizeEx(HANDLE, LARGE_INTEGER*);
+BOOL CreateDirectoryW(const wchar_t*, void*);
+DWORD GetLastError(void);
+void GetSystemTimeAsFileTime(FILETIME*);
+BOOL FormatMessageA(DWORD, const void*, DWORD, DWORD, char*, DWORD, void*);
+int wcsncpy_s(wchar_t* dst, size_t dstcch, const wchar_t* src, size_t count);
+void* _aligned_malloc(size_t, size_t);
+void _aligned_free(void*);
 int WideCharToMultiByte(UINT, DWORD, const wchar_t*, int, char*, int, const char*, BOOL*);
 int MultiByteToWideChar(UINT, DWORD, const char*, int, wchar_t*, int);
 
