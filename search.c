@@ -944,6 +944,7 @@ int wmain(int argc, wchar_t** argv){
     config_load_file(L"anything.conf");
     // Build canonical query string (all args except --db <path>)
     char qcanon[4096]={0}; size_t qpos=0;
+    char qcanon_base[4096]={0}; size_t qbase=0;
     for(int i=1;i<argc;i++){
         if(wcscmp(argv[i], L"--db")==0){ i++; continue; }
         if(wcscmp(argv[i], L"--workers")==0){ i++; continue; }
@@ -951,6 +952,13 @@ int wmain(int argc, wchar_t** argv){
         char u8[512]; to_utf8(argv[i], u8, sizeof(u8));
         size_t ulen = strlen(u8);
         if(qpos + ulen + 2 < sizeof(qcanon)){ memcpy(qcanon+qpos,u8,ulen); qpos+=ulen; qcanon[qpos++]=' '; qcanon[qpos]=0; }
+        BOOL is_filter = (_strnicmp(u8,"size:",5)==0)||(_strnicmp(u8,"dm:",3)==0)||(_strnicmp(u8,"path:",5)==0);
+        if(!is_filter){
+            if(qbase + ulen + 2 < sizeof(qcanon_base)){
+                memcpy(qcanon_base+qbase,u8,ulen);
+                qbase+=ulen; qcanon_base[qbase++]=' '; qcanon_base[qbase]=0;
+            }
+        }
     }
     enterprise_audit_log("user", qcanon);
     enterprise_ad_authenticate("user", "");
@@ -975,14 +983,9 @@ int wmain(int argc, wchar_t** argv){
     wcscpy_s(g_db_path, MAX_PATH, dbPath);
     if(!open_bloom(dbPath)){ fwprintf(stderr,L"bloom open failed\n"); return 1; }
 
-    // Try cache based on canonical query string
-    IdVec cached; idvec_init(&cached);
-    if(try_load_cache(dbPath, qcanon, &cached)){
-        tokenlist_free(&tokens);
-        idvec_free(&cached);
-        goto do_search_with_ids;
-    }
-    idvec_free(&cached);
+    // Try cache based on query without size/path/date filters
+    IdVec rec_ids; idvec_init(&rec_ids);
+    BOOL cache_hit = try_load_cache(dbPath, qcanon_base, &rec_ids);
 
     // Open env and dbis
     MDB_env* env=NULL; MDB_txn* txn=NULL;
@@ -1014,15 +1017,22 @@ int wmain(int argc, wchar_t** argv){
     }
 
 
-    IdVec rec_ids; idvec_init(&rec_ids);
-    Node* root = parse_tokens(&tokens);
-    if(root){
-        eval_node(root, txn, dbi_strings, dbi_fname_index, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &rec_ids);
-        free_node(root);
+    IdVec cache_copy; idvec_init(&cache_copy);
+    if(!cache_hit){
+        Node* root = parse_tokens(&tokens);
+        if(root){
+            eval_node(root, txn, dbi_strings, dbi_fname_index, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &rec_ids);
+            free_node(root);
+        } else {
+            stream_all_records(txn, dbi_date, collect_record, &rec_ids);
+        }
+        sort_unique(&rec_ids);
+        cache_copy.ids = (uint64_t*)malloc(rec_ids.n*sizeof(uint64_t));
+        memcpy(cache_copy.ids, rec_ids.ids, rec_ids.n*sizeof(uint64_t));
+        cache_copy.n = cache_copy.cap = rec_ids.n;
     } else {
-        stream_all_records(txn, dbi_date, collect_record, &rec_ids);
+        sort_unique(&rec_ids);
     }
-    sort_unique(&rec_ids);
 
     // Use secondary indexes to restrict candidate IDs
     if(q.size_min>0 || q.size_max<~0ULL){
@@ -1096,9 +1106,9 @@ int wmain(int argc, wchar_t** argv){
     mdb_txn_abort(txnprint);
     free(all);
 
-    // Save cache for next run
-    if(rec_ids.n>0){
-        save_cache(dbPath, qcanon, &rec_ids);
+    // Save cache for next run using filterless query
+    if(!cache_hit && cache_copy.n>0){
+        save_cache(dbPath, qcanon_base, &cache_copy);
     }
 
     mdb_txn_abort(txn); mdb_env_close(env);
@@ -1115,21 +1125,8 @@ int wmain(int argc, wchar_t** argv){
     if(q.ext_pattern) free(q.ext_pattern);
     if(q.path_filter) free(q.path_filter);
     idvec_free(&rec_ids);
+    idvec_free(&cache_copy);
     tokenlist_free(&tokens);
-    close_bloom();
-    return 0;
-
-do_search_with_ids: ;
-    // If we jump here (cache hit), we need to reopen env to resolve
-    MDB_env* env2=NULL; MDB_txn* txn2=NULL;
-    mdb_env_create(&env2); mdb_env_set_maxdbs(env2,64);
-    if(mdb_env_open(env2, u8db, MDB_RDONLY, 0664)!=0){ close_bloom(); return 1; }
-    mdb_txn_begin(env2,NULL,MDB_RDONLY,&txn2);
-    MDB_dbi dbi_strings2, dbi_records2;
-    mdb_dbi_open(txn2,"strings",0,&dbi_strings2);
-    mdb_dbi_open(txn2,"records",0,&dbi_records2);
-    // Actually, cached ids were in 'cached', but we didn't carry it here. For brevity, skip cache reopen path.
-    mdb_txn_abort(txn2); mdb_env_close(env2);
     close_bloom();
     return 0;
 }
