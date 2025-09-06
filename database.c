@@ -197,7 +197,8 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
     if(!d){ return FALSE; }
     d->map_init = (size_t)map_init_mb * 1024ull * 1024ull;
     d->map_max  = (size_t)map_max_mb  * 1024ull * 1024ull;
-    if(d->map_init < 128*1024*1024) d->map_init = 128*1024*1024;
+    size_t min_init = 1024ull * 1024ull * 1024ull; // start with at least 1 GB
+    if(d->map_init < min_init) d->map_init = min_init;
     if(d->map_max  < d->map_init)   d->map_max = d->map_init*4;
     ensure_dir(path);
     int rc = mdb_env_create(&d->env);

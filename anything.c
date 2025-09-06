@@ -646,6 +646,7 @@ typedef struct WriterCtx {
     size_t grow_attempts;
 } WriterCtx;
 
+static const size_t MAP_GROWTH_INCREMENT = 1ull * 1024ull * 1024ull * 1024ull; // 1 GB
 static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch){
     for(;;){
         if(db_put_records(ctx->db, buf, in_batch)){
@@ -655,11 +656,13 @@ static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch
         if(err->code == DB_ERROR_LMDB && err->detail == MDB_MAP_FULL){
             db_abort_write(ctx->db);
             size_t cur = db_current_mapsize(ctx->db);
-            size_t newsize = cur * 2;
-            if(newsize > db_max_mapsize(ctx->db)){
-                fprintf(stderr, "DB mapsize at max; cannot grow beyond %llu bytes\n", (unsigned long long)db_max_mapsize(ctx->db));
+            size_t max = db_max_mapsize(ctx->db);
+            if(cur >= max){
+                fprintf(stderr, "DB mapsize at max; cannot grow beyond %llu bytes\n", (unsigned long long)max);
                 return FALSE;
             }
+            size_t newsize = cur + MAP_GROWTH_INCREMENT;
+            if(newsize > max) newsize = max;
             if(!db_set_mapsize(ctx->db, newsize)){
                 const DbError* serr = db_last_error(ctx->db);
                 fprintf(stderr, "db_set_mapsize failed: %s (code=%d)\n", serr->message, serr->detail);
