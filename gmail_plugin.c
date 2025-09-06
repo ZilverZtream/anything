@@ -65,7 +65,13 @@ struct curl_buf{ char* data; size_t size; };
 static size_t curl_write_cb(void* contents,size_t size,size_t nmemb,void* userp){
     size_t realsize=size*nmemb; struct curl_buf* mem=(struct curl_buf*)userp;
     char* ptr=(char*)realloc(mem->data, mem->size+realsize+1);
-    if(!ptr) return 0; mem->data=ptr; memcpy(&mem->data[mem->size],contents,realsize);
+    if(!ptr){
+        free(mem->data);
+        mem->data=NULL;
+        mem->size=0;
+        return 0;
+    }
+    mem->data=ptr; memcpy(&mem->data[mem->size],contents,realsize);
     mem->size+=realsize; mem->data[mem->size]=0; return realsize;
 }
 
