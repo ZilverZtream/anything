@@ -2,6 +2,7 @@
 #include "util.h"
 #include <shlwapi.h>
 #include <string.h>
+#include <wchar.h>
 #include <stdlib.h>
 #include <malloc.h>
 #include <immintrin.h>
@@ -152,13 +153,39 @@ void split_extension_utf8(const char* name_utf8, char* ext_out, size_t ext_len){
 }
 void to_utf8(const wchar_t* w, char* u8, size_t u8cap){
     if(!w || !u8 || u8cap==0){ if(u8) u8[0]=0; return; }
-    WideCharToMultiByte(CP_UTF8,0,w,-1,u8,(int)u8cap,NULL,NULL);
-    u8[u8cap-1]=0;
+    int needed = WideCharToMultiByte(CP_UTF8,0,w,-1,NULL,0,NULL,NULL);
+    if(needed <= 0){ u8[0] = 0; return; }
+    if((size_t)needed <= u8cap){
+        WideCharToMultiByte(CP_UTF8,0,w,-1,u8,(int)u8cap,NULL,NULL);
+        u8[u8cap-1]=0;
+    } else {
+        char* tmp = (char*)malloc((size_t)needed);
+        if(!tmp){ u8[0]=0; return; }
+        WideCharToMultiByte(CP_UTF8,0,w,-1,tmp,needed,NULL,NULL);
+        size_t copy = u8cap - 1;
+        if((size_t)needed-1 < copy) copy = (size_t)needed-1;
+        memcpy(u8, tmp, copy);
+        u8[copy] = 0;
+        free(tmp);
+    }
 }
 void to_wide(const char* u8, wchar_t* w, size_t wcap){
     if(!u8 || !w || wcap==0){ if(w) w[0]=0; return; }
-    MultiByteToWideChar(CP_UTF8,0,u8,-1,w,(int)wcap);
-    w[wcap-1]=0;
+    int needed = MultiByteToWideChar(CP_UTF8,0,u8,-1,NULL,0);
+    if(needed <= 0){ w[0] = 0; return; }
+    if((size_t)needed <= wcap){
+        MultiByteToWideChar(CP_UTF8,0,u8,-1,w,(int)wcap);
+        w[wcap-1]=0;
+    } else {
+        wchar_t* tmp = (wchar_t*)malloc((size_t)needed * sizeof(wchar_t));
+        if(!tmp){ w[0]=0; return; }
+        MultiByteToWideChar(CP_UTF8,0,u8,-1,tmp,needed);
+        size_t copy = wcap - 1;
+        if((size_t)needed-1 < copy) copy = (size_t)needed-1;
+        memcpy(w, tmp, copy * sizeof(wchar_t));
+        w[copy] = 0;
+        free(tmp);
+    }
 }
 uint64_t hash64(const void* data, size_t len){
     const uint8_t* p = (const uint8_t*)data;
