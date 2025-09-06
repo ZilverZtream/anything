@@ -224,47 +224,63 @@ static void onedrive_walk(const char* token, const wchar_t* root, const char* ro
             strcpy(path,"/v1.0/me/drive/root/children?select=id,name,size,folder,fileSystemInfo");
 
         char* resp=NULL;
-        if(http_request("graph.microsoft.com", path, "GET", headers, NULL, &resp)){
-            cJSON* root = cJSON_Parse(resp);
-            if(root){
-                cJSON* value = cJSON_GetObjectItemCaseSensitive(root, "value");
-                if(cJSON_IsArray(value)){
-                    cJSON* item;
-                    cJSON_ArrayForEach(item, value){
-                        cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
-                        cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
-                        if(cJSON_IsString(name) && cJSON_IsString(id)){
-                            uint64_t size=0; uint64_t ct=0, mt=0;
-                            cJSON* sizeItem = cJSON_GetObjectItemCaseSensitive(item, "size");
-                            if(cJSON_IsNumber(sizeItem)) size = (uint64_t)sizeItem->valuedouble;
-                            cJSON* fsi = cJSON_GetObjectItemCaseSensitive(item, "fileSystemInfo");
-                            if(cJSON_IsObject(fsi)){
-                                cJSON* ctime = cJSON_GetObjectItemCaseSensitive(fsi, "createdDateTime");
-                                cJSON* mtime = cJSON_GetObjectItemCaseSensitive(fsi, "lastModifiedDateTime");
-                                if(cJSON_IsString(ctime)) ct = parse_rfc3339(ctime->valuestring);
-                                if(cJSON_IsString(mtime)) mt = parse_rfc3339(mtime->valuestring);
-                            }
-                            BOOL is_dir = cJSON_GetObjectItemCaseSensitive(item, "folder") != NULL;
-                            enqueue_item(q, curr->parent, name->valuestring, size, ct, mt, is_dir);
-                            if(is_dir){
-                                ODriveNode* child=(ODriveNode*)malloc(sizeof(ODriveNode));
-                                if(child){
-                                    wchar_t wname[MAX_PATH]; to_wide(name->valuestring,wname,MAX_PATH);
-                                    path_join(child->parent,MAX_LONG_PATH,curr->parent,wname);
-                                    strcpy_s(child->id,sizeof(child->id),id->valuestring);
-                                    child->next=NULL;
-                                    if(tail) tail->next=child; else head=child;
-                                    tail=child;
-                                }
-                            }
-                        }
+        if(!http_request("graph.microsoft.com", path, "GET", headers, NULL, &resp)){
+            free(curr);
+            goto cleanup_odrive;
+        }
+        cJSON* root = cJSON_Parse(resp);
+        if(!root){
+            free(resp);
+            free(curr);
+            goto cleanup_odrive;
+        }
+        cJSON* value = cJSON_GetObjectItemCaseSensitive(root, "value");
+        if(!cJSON_IsArray(value)){
+            cJSON_Delete(root);
+            free(resp);
+            free(curr);
+            goto cleanup_odrive;
+        }
+        cJSON* item;
+        cJSON_ArrayForEach(item, value){
+            cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
+            cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
+            if(cJSON_IsString(name) && cJSON_IsString(id)){
+                uint64_t size=0; uint64_t ct=0, mt=0;
+                cJSON* sizeItem = cJSON_GetObjectItemCaseSensitive(item, "size");
+                if(cJSON_IsNumber(sizeItem)) size = (uint64_t)sizeItem->valuedouble;
+                cJSON* fsi = cJSON_GetObjectItemCaseSensitive(item, "fileSystemInfo");
+                if(cJSON_IsObject(fsi)){
+                    cJSON* ctime = cJSON_GetObjectItemCaseSensitive(fsi, "createdDateTime");
+                    cJSON* mtime = cJSON_GetObjectItemCaseSensitive(fsi, "lastModifiedDateTime");
+                    if(cJSON_IsString(ctime)) ct = parse_rfc3339(ctime->valuestring);
+                    if(cJSON_IsString(mtime)) mt = parse_rfc3339(mtime->valuestring);
+                }
+                BOOL is_dir = cJSON_GetObjectItemCaseSensitive(item, "folder") != NULL;
+                enqueue_item(q, curr->parent, name->valuestring, size, ct, mt, is_dir);
+                if(is_dir){
+                    ODriveNode* child=(ODriveNode*)malloc(sizeof(ODriveNode));
+                    if(child){
+                        wchar_t wname[MAX_PATH]; to_wide(name->valuestring,wname,MAX_PATH);
+                        path_join(child->parent,MAX_LONG_PATH,curr->parent,wname);
+                        strcpy_s(child->id,sizeof(child->id),id->valuestring);
+                        child->next=NULL;
+                        if(tail) tail->next=child; else head=child;
+                        tail=child;
                     }
                 }
-                cJSON_Delete(root);
             }
-            free(resp);
         }
+        cJSON_Delete(root);
+        free(resp);
         free(curr);
+    }
+
+cleanup_odrive:
+    while(head){
+        ODriveNode* tmp=head;
+        head=head->next;
+        free(tmp);
     }
 }
 
@@ -296,49 +312,65 @@ static void google_drive_walk(const char* token, const wchar_t* root, const char
             strcpy(path,"/drive/v3/files?q='root'+in+parents&fields=files(id,name,mimeType,modifiedTime,size)");
 
         char* resp=NULL;
-        if(http_request("www.googleapis.com", path, "GET", headers,NULL,&resp)){
-            cJSON* root = cJSON_Parse(resp);
-            if(root){
-                cJSON* files = cJSON_GetObjectItemCaseSensitive(root, "files");
-                if(cJSON_IsArray(files)){
-                    cJSON* item;
-                    cJSON_ArrayForEach(item, files){
-                        cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
-                        cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
-                        if(cJSON_IsString(name) && cJSON_IsString(id)){
-                            const char* mime = NULL;
-                            cJSON* mimeItem = cJSON_GetObjectItemCaseSensitive(item, "mimeType");
-                            if(cJSON_IsString(mimeItem)) mime = mimeItem->valuestring;
-                            BOOL is_dir = (mime && strstr(mime, "application/vnd.google-apps.folder")!=NULL);
-                            uint64_t size=0;
-                            cJSON* sizeItem = cJSON_GetObjectItemCaseSensitive(item, "size");
-                            if(cJSON_IsString(sizeItem) && sizeItem->valuestring)
-                                size = strtoull(sizeItem->valuestring, NULL, 10);
-                            else if(cJSON_IsNumber(sizeItem))
-                                size = (uint64_t)sizeItem->valuedouble;
-                            uint64_t mt=0;
-                            cJSON* mtime = cJSON_GetObjectItemCaseSensitive(item, "modifiedTime");
-                            if(cJSON_IsString(mtime)) mt = parse_rfc3339(mtime->valuestring);
-                            enqueue_item(q,curr->parent,name->valuestring,size,mt,mt,is_dir);
-                            if(is_dir){
-                                GDriveNode* child=(GDriveNode*)malloc(sizeof(GDriveNode));
-                                if(child){
-                                    wchar_t wname[MAX_PATH]; to_wide(name->valuestring,wname,MAX_PATH);
-                                    path_join(child->parent,MAX_LONG_PATH,curr->parent,wname);
-                                    strcpy_s(child->id,sizeof(child->id),id->valuestring);
-                                    child->next=NULL;
-                                    if(tail) tail->next=child; else head=child;
-                                    tail=child;
-                                }
-                            }
-                        }
+        if(!http_request("www.googleapis.com", path, "GET", headers,NULL,&resp)){
+            free(curr);
+            goto cleanup_gdrive;
+        }
+        cJSON* root = cJSON_Parse(resp);
+        if(!root){
+            free(resp);
+            free(curr);
+            goto cleanup_gdrive;
+        }
+        cJSON* files = cJSON_GetObjectItemCaseSensitive(root, "files");
+        if(!cJSON_IsArray(files)){
+            cJSON_Delete(root);
+            free(resp);
+            free(curr);
+            goto cleanup_gdrive;
+        }
+        cJSON* item;
+        cJSON_ArrayForEach(item, files){
+            cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
+            cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
+            if(cJSON_IsString(name) && cJSON_IsString(id)){
+                const char* mime = NULL;
+                cJSON* mimeItem = cJSON_GetObjectItemCaseSensitive(item, "mimeType");
+                if(cJSON_IsString(mimeItem)) mime = mimeItem->valuestring;
+                BOOL is_dir = (mime && strstr(mime, "application/vnd.google-apps.folder")!=NULL);
+                uint64_t size=0;
+                cJSON* sizeItem = cJSON_GetObjectItemCaseSensitive(item, "size");
+                if(cJSON_IsString(sizeItem) && sizeItem->valuestring)
+                    size = strtoull(sizeItem->valuestring, NULL, 10);
+                else if(cJSON_IsNumber(sizeItem))
+                    size = (uint64_t)sizeItem->valuedouble;
+                uint64_t mt=0;
+                cJSON* mtime = cJSON_GetObjectItemCaseSensitive(item, "modifiedTime");
+                if(cJSON_IsString(mtime)) mt = parse_rfc3339(mtime->valuestring);
+                enqueue_item(q,curr->parent,name->valuestring,size,mt,mt,is_dir);
+                if(is_dir){
+                    GDriveNode* child=(GDriveNode*)malloc(sizeof(GDriveNode));
+                    if(child){
+                        wchar_t wname[MAX_PATH]; to_wide(name->valuestring,wname,MAX_PATH);
+                        path_join(child->parent,MAX_LONG_PATH,curr->parent,wname);
+                        strcpy_s(child->id,sizeof(child->id),id->valuestring);
+                        child->next=NULL;
+                        if(tail) tail->next=child; else head=child;
+                        tail=child;
                     }
                 }
-                cJSON_Delete(root);
             }
-            free(resp);
         }
+        cJSON_Delete(root);
+        free(resp);
         free(curr);
+    }
+
+cleanup_gdrive:
+    while(head){
+        GDriveNode* tmp=head;
+        head=head->next;
+        free(tmp);
     }
 }
 
