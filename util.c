@@ -383,6 +383,13 @@ int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen)
     return dist;
 }
 
+typedef struct { uint32_t val; size_t off; } Trigram;
+static int trigram_cmp(const void* a, const void* b){
+    uint32_t va = ((const Trigram*)a)->val;
+    uint32_t vb = ((const Trigram*)b)->val;
+    return (va > vb) - (va < vb);
+}
+
 BOOL fuzzy_match(const char* text, const char* pattern, int max_dist){
     if(!text || !pattern || max_dist < 0) return FALSE;
     size_t n = strlen(text), m = strlen(pattern);
@@ -392,6 +399,62 @@ BOOL fuzzy_match(const char* text, const char* pattern, int max_dist){
         if((int)(m - n) > max_dist) return FALSE;
         return levenshtein_distance(text, n, pattern, m) <= max_dist;
     }
+
+    /*
+    Index-based approach using trigrams to reduce the number of candidate
+    windows that require a full Levenshtein distance computation. The
+    algorithm builds a small trigram index for the pattern, scans the text
+    once collecting candidate starting positions and only evaluates those
+    candidates. If no candidates are found we fall back to the previous
+    brute-force scan to maintain correctness.
+    */
+    if(m >= 3 && n > 64){
+        size_t trig_cnt = m - 2;
+        Trigram trigs[1024];
+        for(size_t j = 0; j < trig_cnt; j++){
+            trigs[j].val = ((uint32_t)(unsigned char)pattern[j] << 16) |
+                           ((uint32_t)(unsigned char)pattern[j+1] << 8) |
+                           (uint32_t)(unsigned char)pattern[j+2];
+            trigs[j].off = j;
+        }
+
+        qsort(trigs, trig_cnt, sizeof(Trigram), trigram_cmp);
+
+        unsigned char* cand = (unsigned char*)calloc(n, 1);
+        if(!cand) return FALSE;
+
+        for(size_t i = 0; i + 3 <= n; i++){
+            uint32_t val = ((uint32_t)(unsigned char)text[i] << 16) |
+                           ((uint32_t)(unsigned char)text[i+1] << 8) |
+                           (uint32_t)(unsigned char)text[i+2];
+            Trigram key = { val, 0 };
+            Trigram* f = bsearch(&key, trigs, trig_cnt, sizeof(Trigram), trigram_cmp);
+            if(f){
+                size_t idx = (size_t)(f - trigs);
+                while(idx > 0 && trigs[idx-1].val == val) idx--; // rewind
+                for(; idx < trig_cnt && trigs[idx].val == val; idx++){
+                    size_t j = trigs[idx].off;
+                    if(i < j) continue;
+                    size_t start = i - j;
+                    if(start <= n - m) cand[start] = 1;
+                }
+            }
+        }
+
+        BOOL any = FALSE;
+        for(size_t i = 0; i <= n - m; i++){
+            if(!cand[i]) continue;
+            any = TRUE;
+            size_t win = m + (size_t)max_dist;
+            if(i + win > n) win = n - i;
+            int d = levenshtein_distance(text + i, win, pattern, m);
+            if(d <= max_dist){ free(cand); return TRUE; }
+        }
+        free(cand);
+        if(any) return FALSE; // no candidate matched
+        // fall back to brute force when no candidates were found
+    }
+
     for(size_t i = 0; i <= n - m; i++){
         size_t win = m + (size_t)max_dist;
         if(i + win > n) win = n - i;
