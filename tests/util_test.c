@@ -41,6 +41,8 @@ static void test_fuzzy_match(){
     assert(fuzzy_match("hello","hullo",1));
     assert(!fuzzy_match("hello","world",2));
     assert(!fuzzy_match("short","longer",1));
+    // regression: ensure matches are found even when no trigram is shared
+    assert(fuzzy_match("abxd","abcd",1));
 }
 
 static void test_bm25_score(){
