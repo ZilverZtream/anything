@@ -185,19 +185,24 @@ static BOOL obtain_token(CloudProvider p, char** out_token){
     snprintf(body, sizeof(body), "client_id=%s&client_secret=%s&refresh_token=%s&grant_type=refresh_token", client, secret, refresh);
     char headers[128]; strcpy(headers, "Content-Type: application/x-www-form-urlencoded\r\n");
     char* resp=NULL;
-    if(!http_request(host, path, "POST", headers, body, &resp)) return FALSE;
-    cJSON* root = cJSON_Parse(resp);
-    if(!root){ free(resp); return FALSE; }
+    cJSON* root=NULL;
+    BOOL ok=FALSE;
+    if(!http_request(host, path, "POST", headers, body, &resp)) goto cleanup;
+    root = cJSON_Parse(resp);
+    if(!root) goto cleanup;
     cJSON* tok = cJSON_GetObjectItemCaseSensitive(root, "access_token");
-    if(!cJSON_IsString(tok) || !tok->valuestring){ cJSON_Delete(root); free(resp); return FALSE; }
+    if(!cJSON_IsString(tok) || !tok->valuestring) goto cleanup;
 #ifdef _WIN32
     *out_token = _strdup(tok->valuestring);
 #else
     *out_token = strdup(tok->valuestring);
 #endif
-    cJSON_Delete(root);
-    free(resp);
-    return *out_token!=NULL;
+    ok = (*out_token!=NULL);
+
+cleanup:
+    if(root) cJSON_Delete(root);
+    if(resp) free(resp);
+    return ok;
 }
 
 // ---- Provider specific scanners ----

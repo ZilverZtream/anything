@@ -112,13 +112,15 @@ static uint64_t to_filetime(uint64_t unix_secs){
 
 static void process_message(const char* id, const char* token_utf8){
     char url[512]; snprintf(url,sizeof(url),"https://gmail.googleapis.com/gmail/v1/users/me/messages/%s?format=full",id);
-    char* resp=NULL; if(!http_get(url,token_utf8,&resp)){
+    char* resp=NULL; cJSON* root=NULL; wchar_t* wcontent=NULL; DbWorkItem* wi=NULL;
+    if(!http_get(url,token_utf8,&resp)){
         fprintf(stderr,"[gmail] failed to fetch message %s\n", id);
-        return;
+        goto cleanup;
     }
-    cJSON* root=cJSON_Parse(resp); free(resp); if(!root){
+    root=cJSON_Parse(resp);
+    if(!root){
         fprintf(stderr,"[gmail] failed to parse message JSON %s\n", id);
-        return;
+        goto cleanup;
     }
     const char* snippet=""; const char* subject=NULL; const char* internal=NULL;
     cJSON* sn=cJSON_GetObjectItem(root,"snippet"); if(cJSON_IsString(sn)) snippet=sn->valuestring;
@@ -136,10 +138,10 @@ static void process_message(const char* id, const char* token_utf8){
         }
     }
     uint64_t ts=0; if(internal) ts=strtoull(internal,NULL,10)/1000ULL;
-    wchar_t* wcontent=NULL; size_t wlen=mbstowcs(NULL,snippet,0);
+    size_t wlen=mbstowcs(NULL,snippet,0);
     if(wlen!=(size_t)-1){ wcontent=(wchar_t*)malloc((wlen+1)*sizeof(wchar_t)); if(wcontent) mbstowcs(wcontent,snippet,wlen+1); }
     wchar_t wname[MAX_PATH]; if(subject) to_wide(subject,wname,MAX_PATH); else to_wide(id,wname,MAX_PATH);
-    DbWorkItem* wi=(DbWorkItem*)wi_alloc(); if(!wi){ free(wcontent); cJSON_Delete(root); return; }
+    wi=(DbWorkItem*)wi_alloc(); if(!wi) goto cleanup;
     wcscpy_s(wi->parent_path,MAX_LONG_PATH,L"gmail");
     wcscpy_s(wi->name,MAX_PATH,wname);
     uint64_t ft=ts? to_filetime(ts):0;
@@ -148,10 +150,17 @@ static void process_message(const char* id, const char* token_utf8){
     wi->content=wcontent; wi->preview=NULL; wi->clone_id=0;
     int tries=0; while(!MPMC_Push(g_host.queue,wi)){
         if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
-            if(wcontent) free(wcontent); wi_free(wi); cJSON_Delete(root); return; }
+            goto cleanup;
+        }
         Sleep(0);
     }
-    cJSON_Delete(root);
+    wi=NULL; wcontent=NULL; // ownership passed to queue
+
+cleanup:
+    if(root) cJSON_Delete(root);
+    if(resp) free(resp);
+    if(wi) wi_free(wi);
+    if(wcontent) free(wcontent);
 }
 
 static BOOL init(const PluginHost* host){
@@ -163,13 +172,15 @@ static BOOL init(const PluginHost* host){
 static void scan(void){
     if(g_oauth_token[0]==L'\0') return; char token_utf8[256];
     to_utf8(g_oauth_token,token_utf8,sizeof(token_utf8));
-    char* resp=NULL; if(!http_get("https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=5",token_utf8,&resp)){
+    char* resp=NULL; cJSON* root=NULL;
+    if(!http_get("https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=5",token_utf8,&resp)){
         fprintf(stderr,"[gmail] failed to list messages\n");
-        return;
+        goto cleanup;
     }
-    cJSON* root=cJSON_Parse(resp); free(resp); if(!root){
+    root=cJSON_Parse(resp);
+    if(!root){
         fprintf(stderr,"[gmail] failed to parse message list JSON\n");
-        return;
+        goto cleanup;
     }
     cJSON* msgs=cJSON_GetObjectItem(root,"messages");
     if(cJSON_IsArray(msgs)){
@@ -179,7 +190,10 @@ static void scan(void){
             if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
         }
     }
-    cJSON_Delete(root);
+
+cleanup:
+    if(root) cJSON_Delete(root);
+    if(resp) free(resp);
 }
 
 static void gmail_shutdown(void){
