@@ -247,18 +247,25 @@ uint64_t crc64_file(const wchar_t* path){
 void sha1(const void* data, size_t len, uint8_t out[20]){
     if(!data || !out){ if(out) memset(out,0,20); return; }
     BCRYPT_ALG_HANDLE hAlg = NULL;
-    DWORD hashObjSize=0, cbData=0;
-    if(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA1_ALGORITHM, NULL, 0)!=0){ memset(out,0,20); return; }
-    if(BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&hashObjSize, sizeof(hashObjSize), &cbData, 0)!=0){ BCryptCloseAlgorithmProvider(hAlg,0); memset(out,0,20); return; }
-    PUCHAR hashObj = (PUCHAR)malloc(hashObjSize);
-    if(!hashObj){ BCryptCloseAlgorithmProvider(hAlg,0); memset(out,0,20); return; }
     BCRYPT_HASH_HANDLE hHash = NULL;
-    if(BCryptCreateHash(hAlg, &hHash, hashObj, hashObjSize, NULL, 0, 0)!=0){ free(hashObj); BCryptCloseAlgorithmProvider(hAlg,0); memset(out,0,20); return; }
-    BCryptHashData(hHash, (PUCHAR)data, (ULONG)len, 0);
-    BCryptFinishHash(hHash, out, 20, 0);
-    BCryptDestroyHash(hHash);
-    BCryptCloseAlgorithmProvider(hAlg,0);
-    free(hashObj);
+    PUCHAR hashObj = NULL;
+    DWORD hashObjSize = 0, cbData = 0;
+    int status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA1_ALGORITHM, NULL, 0);
+    if(status != 0) goto cleanup;
+    status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&hashObjSize, sizeof(hashObjSize), &cbData, 0);
+    if(status != 0) goto cleanup;
+    hashObj = (PUCHAR)malloc(hashObjSize);
+    if(!hashObj){ status = 1; goto cleanup; }
+    status = BCryptCreateHash(hAlg, &hHash, hashObj, hashObjSize, NULL, 0, 0);
+    if(status != 0) goto cleanup;
+    status = BCryptHashData(hHash, (PUCHAR)data, (ULONG)len, 0);
+    if(status != 0) goto cleanup;
+    status = BCryptFinishHash(hHash, out, 20, 0);
+cleanup:
+    if(status != 0) memset(out,0,20);
+    if(hHash) BCryptDestroyHash(hHash);
+    if(hAlg) BCryptCloseAlgorithmProvider(hAlg,0);
+    if(hashObj) free(hashObj);
 }
 
 // Runtime AVX2 check via CPUID
