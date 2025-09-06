@@ -50,14 +50,18 @@ static uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom){
     uint32_t tcount = 0;
     size_t len = strlen(name_u8);
     if(len<3) return 0;
-    char* tmp=(char*)_malloca(len+1); memcpy(tmp,name_u8,len+1); lowercase_ascii(tmp,len);
+    char stack_tmp[512];
+    BOOL heap = len + 1 > sizeof(stack_tmp);
+    char* tmp = heap ? (char*)malloc(len + 1) : stack_tmp;
+    if(!tmp) return 0;
+    memcpy(tmp, name_u8, len + 1); lowercase_ascii(tmp, len);
     for(size_t i=0;i+3<=len;i++){
         uint32_t hs[4];
         build_bloom_hashes_simd(&tmp[i], hs);
         bloom_set(bloom, hs[0]); bloom_set(bloom, hs[1]); bloom_set(bloom, hs[2]); bloom_set(bloom, hs[3]);
         tcount++;
     }
-    _freea(tmp);
+    if(heap) free(tmp);
     return tcount;
 }
 
@@ -346,13 +350,16 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
     DbImpl* d = (DbImpl*)db_;
     int needed = WideCharToMultiByte(CP_UTF8,0,s,-1,NULL,0,NULL,NULL);
     if(needed<=0) return 0;
-    char* u8 = (char*)_malloca(needed);
+    char stack_u8[512];
+    BOOL heap = needed > (int)sizeof(stack_u8);
+    char* u8 = heap ? (char*)malloc(needed) : stack_u8;
+    if(!u8) return 0;
     WideCharToMultiByte(CP_UTF8,0,s,-1,u8,needed,NULL,NULL);
     // Try to read using the current write txn if present; otherwise open a RO txn.
     MDB_txn* rtxn = d->wtxn ? d->wtxn : NULL;
     BOOL need_abort = FALSE;
     if(!rtxn){
-        if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn)!=0){ _freea(u8); return 0; }
+        if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn)!=0){ if(heap) free(u8); return 0; }
         need_abort = TRUE;
     }
     MDB_val k={.mv_data=u8,.mv_size=(size_t)(needed-1)}, v;
@@ -360,25 +367,25 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
     if(rc==0){
         uint64_t id = *(uint64_t*)v.mv_data;
         if(need_abort) mdb_txn_abort(rtxn);
-        _freea(u8);
+        if(heap) free(u8);
         return id;
     }
     if(need_abort) mdb_txn_abort(rtxn);
-    if(!d->wtxn){ if(!db_begin_write(db_)){ _freea(u8); return 0; } }
+    if(!d->wtxn){ if(!db_begin_write(db_)){ if(heap) free(u8); return 0; } }
     uint64_t new_id = d->header_cache.string_count + 1;
     d->header_cache.string_count = new_id;
     MDB_val idkey={.mv_data=&new_id,.mv_size=sizeof(new_id)};
     MDB_val idval={.mv_data=u8,.mv_size=(size_t)(needed-1)};
     rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
-    if(rc){ set_mdb_error(d,rc); _freea(u8); return 0; }
+    if(rc){ set_mdb_error(d,rc); if(heap) free(u8); return 0; }
     MDB_val revval={.mv_data=&new_id,.mv_size=sizeof(new_id)};
     rc = mdb_put(d->wtxn, d->dbi_strrev, &k, &revval, 0);
-    if(rc){ set_mdb_error(d,rc); _freea(u8); return 0; }
+    if(rc){ set_mdb_error(d,rc); if(heap) free(u8); return 0; }
     // update header
     MDB_val mk,mv; const char* H="header"; to_mdb_val(H, strlen(H), &mk);
     to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
     rc = mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
-    _freea(u8);
+    if(heap) free(u8);
     if(rc){ set_mdb_error(d,rc); return 0; }
     return new_id;
 }
@@ -423,8 +430,11 @@ static void extract_trigrams(const char* text, uint32_t** out_tris, size_t* out_
 static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     size_t len = strlen(name_u8);
     if(len < 3) return;
-    char* tmp = (char*)_malloca(len+1);
-    memcpy(tmp, name_u8, len+1);
+    char stack_tmp[512];
+    BOOL heap = len + 1 > sizeof(stack_tmp);
+    char* tmp = heap ? (char*)malloc(len + 1) : stack_tmp;
+    if(!tmp) return;
+    memcpy(tmp, name_u8, len + 1);
     lowercase_ascii(tmp, len);
 
     uint32_t* tris; size_t tri_n;
@@ -443,14 +453,17 @@ static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
         int rc = mdb_put(d->wtxn, d->dbi_trigram_index, &k, &v, MDB_NODUPDATA);
         if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d, rc); }
     }
-    _freea(tmp);
+    if(heap) free(tmp);
 }
 
 static void remove_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     size_t len = strlen(name_u8);
     if(len < 3) return;
-    char* tmp = (char*)_malloca(len+1);
-    memcpy(tmp, name_u8, len+1);
+    char stack_tmp[512];
+    BOOL heap = len + 1 > sizeof(stack_tmp);
+    char* tmp = heap ? (char*)malloc(len + 1) : stack_tmp;
+    if(!tmp) return;
+    memcpy(tmp, name_u8, len + 1);
     lowercase_ascii(tmp, len);
 
     uint32_t* tris; size_t tri_n;
@@ -467,7 +480,7 @@ static void remove_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
         int rc = mdb_del(d->wtxn, d->dbi_trigram_index, &k, &v);
         if(rc && rc!=MDB_NOTFOUND){ set_mdb_error(d, rc); }
     }
-    _freea(tmp);
+    if(heap) free(tmp);
 }
 
 BOOL db_get_compressed_trigram(Db* db_, uint32_t trigram, CompressedTrigram* out){

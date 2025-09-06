@@ -326,10 +326,11 @@ int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen)
 
     size_t cols = blen + 1;
     size_t buf_size = cols * sizeof(int);
-    BOOL heap = buf_size > 4096;
-    int* col = heap ? (int*)malloc(buf_size) : (int*)_malloca(buf_size);
+    int stack_col[1025];
+    BOOL heap = buf_size > sizeof(stack_col);
+    int* col = heap ? (int*)malloc(buf_size) : stack_col;
     if(!col){
-        if(heap){ free(col); } else { /* _malloca failed, nothing to free */ }
+        if(heap) free(col);
         return (int)(alen>blen?alen:blen);
     }
 
@@ -351,7 +352,7 @@ int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen)
     }
 
     int dist = col[blen];
-    if(heap){ free(col); } else { _freea(col); }
+    if(heap) free(col);
     return dist;
 }
 
