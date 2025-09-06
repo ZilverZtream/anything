@@ -139,17 +139,19 @@ static BOOL load_token(void){
 
 static void process_message(const char* id,const char* token_utf8){
     char url[512]; snprintf(url,sizeof(url),"https://graph.microsoft.com/v1.0/me/messages/%s?$select=subject,bodyPreview,receivedDateTime",id);
-    char* resp=NULL; if(!http_get(url,token_utf8,&resp)) return;
-    cJSON* root=cJSON_Parse(resp); free(resp); if(!root) return;
+    char* resp=NULL; cJSON* root=NULL; wchar_t* wcontent=NULL; DbWorkItem* wi=NULL;
+    if(!http_get(url,token_utf8,&resp)) goto cleanup;
+    root=cJSON_Parse(resp);
+    if(!root) goto cleanup;
     const char* subject=NULL; const char* preview=""; const char* received=NULL;
     cJSON* sj=cJSON_GetObjectItem(root,"subject"); if(cJSON_IsString(sj)) subject=sj->valuestring;
     cJSON* pv=cJSON_GetObjectItem(root,"bodyPreview"); if(cJSON_IsString(pv)) preview=pv->valuestring;
     cJSON* rd=cJSON_GetObjectItem(root,"receivedDateTime"); if(cJSON_IsString(rd)) received=rd->valuestring;
     uint64_t ts=received? parse_rfc3339(received):0;
     wchar_t wname[MAX_PATH]; if(subject) to_wide(subject,wname,MAX_PATH); else to_wide(id,wname,MAX_PATH);
-    size_t wlen=mbstowcs(NULL,preview,0); wchar_t* wcontent=NULL;
+    size_t wlen=mbstowcs(NULL,preview,0);
     if(wlen!=(size_t)-1){ wcontent=(wchar_t*)malloc((wlen+1)*sizeof(wchar_t)); if(wcontent) mbstowcs(wcontent,preview,wlen+1); }
-    DbWorkItem* wi=(DbWorkItem*)wi_alloc(); if(!wi){ if(wcontent) free(wcontent); cJSON_Delete(root); return; }
+    wi=(DbWorkItem*)wi_alloc(); if(!wi) goto cleanup;
     wcscpy_s(wi->parent_path,MAX_LONG_PATH,L"msmail");
     wcscpy_s(wi->name,MAX_PATH,wname);
     uint64_t ft=ts? to_filetime(ts):0;
@@ -157,10 +159,18 @@ static void process_message(const char* id,const char* token_utf8){
     wi->attributes=0; wi->stage=INDEX_FULL_CONTENT; wi->op=WI_ADD;
     wi->content=wcontent; wi->preview=NULL; wi->clone_id=0;
     int tries=0; while(!MPMC_Push(g_host.queue,wi)){
-        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){ if(wcontent) free(wcontent); wi_free(wi); cJSON_Delete(root); return; }
+        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
+            goto cleanup;
+        }
         Sleep(0);
     }
-    cJSON_Delete(root);
+    wi=NULL; wcontent=NULL; // ownership transferred
+
+cleanup:
+    if(root) cJSON_Delete(root);
+    if(resp) free(resp);
+    if(wi) wi_free(wi);
+    if(wcontent) free(wcontent);
 }
 
 static BOOL init(const PluginHost* host){
@@ -185,8 +195,10 @@ static BOOL init(const PluginHost* host){
 static void scan(void){
     if(g_token[0]==L'\0') return; char token_utf8[256];
     to_utf8(g_token,token_utf8,sizeof(token_utf8));
-    char* resp=NULL; if(!http_get("https://graph.microsoft.com/v1.0/me/messages?$top=5",token_utf8,&resp)) return;
-    cJSON* root=cJSON_Parse(resp); free(resp); if(!root) return;
+    char* resp=NULL; cJSON* root=NULL;
+    if(!http_get("https://graph.microsoft.com/v1.0/me/messages?$top=5",token_utf8,&resp)) goto cleanup;
+    root=cJSON_Parse(resp);
+    if(!root) goto cleanup;
     cJSON* arr=cJSON_GetObjectItem(root,"value");
     if(cJSON_IsArray(arr)){
         cJSON* m=NULL; cJSON_ArrayForEach(m,arr){
@@ -195,7 +207,10 @@ static void scan(void){
             if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
         }
     }
-    cJSON_Delete(root);
+
+cleanup:
+    if(root) cJSON_Delete(root);
+    if(resp) free(resp);
 }
 
 static void msmail_shutdown(void){

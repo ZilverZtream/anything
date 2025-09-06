@@ -151,20 +151,22 @@ static void scan(void){
     char env_utf8[64]; to_utf8(g_environment,env_utf8,sizeof(env_utf8));
     char url[512]; snprintf(url,sizeof(url),"https://api.apple-cloudkit.com/database/1/%s/%s/private/records/query",container_utf8,env_utf8);
     const char* body="{\"query\":{\"recordType\":\"MailMessage\"},\"resultsLimit\":5}";
-    char* resp=NULL; if(!http_post(url,token_utf8,body,&resp)) return;
-    cJSON* root=cJSON_Parse(resp);
+    char* resp=NULL; cJSON* root=NULL;
+    if(!http_post(url,token_utf8,body,&resp)) goto cleanup;
+    root=cJSON_Parse(resp);
     if(!root){
         const char* err=cJSON_GetErrorPtr();
         if(err) fprintf(stderr,"iCloud JSON parse error: %s\n",err);
-        free(resp);
-        return;
+        goto cleanup;
     }
-    free(resp);
     cJSON* recs=cJSON_GetObjectItemCaseSensitive(root,"records");
     if(cJSON_IsArray(recs)){
         cJSON* r=NULL; cJSON_ArrayForEach(r,recs){ if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break; if(cJSON_IsObject(r)) process_record(r); }
     }
-    cJSON_Delete(root);
+
+cleanup:
+    if(root) cJSON_Delete(root);
+    if(resp) free(resp);
 }
 
 static void icloud_shutdown(void){
