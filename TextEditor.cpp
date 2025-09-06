@@ -9,6 +9,8 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "imgui.h" // for imGui::GetCurrentWindow()
 
+static const size_t kMaxUndoBufferSize = 100;
+
 // TODO
 // - multiline comments vs single-line: latter is blocking start of a ML
 
@@ -316,9 +318,14 @@ void TextEditor::AddUndo(UndoRecord& aValue)
 	//	aValue.mAfter.mCursorPosition.mLine, aValue.mAfter.mCursorPosition.mColumn
 	//	);
 
-	mUndoBuffer.resize((size_t)(mUndoIndex + 1));
-	mUndoBuffer.back() = aValue;
-	++mUndoIndex;
+        mUndoBuffer.resize((size_t)(mUndoIndex + 1));
+        mUndoBuffer.back() = aValue;
+        ++mUndoIndex;
+        if (mUndoBuffer.size() > kMaxUndoBufferSize)
+        {
+                mUndoBuffer.erase(mUndoBuffer.begin());
+                --mUndoIndex;
+        }
 }
 
 TextEditor::Coordinates TextEditor::ScreenPosToCoordinates(const ImVec2& aPosition) const
