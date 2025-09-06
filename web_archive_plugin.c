@@ -24,6 +24,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 char* strdup(const char*);
 int posix_memalign(void**, size_t, size_t);
 int usleep(unsigned int);
@@ -42,6 +43,12 @@ static int wcscpy_s(wchar_t* dst,size_t dstcch,const wchar_t* src){if(!dst||!src
 #endif
 
 static PluginHost g_host;
+
+#ifdef _WIN32
+static HANDLE g_mutex;
+#else
+static pthread_mutex_t g_mutex;
+#endif
 
 // helper conversions and aligned allocation
 static void to_utf8(const wchar_t* w, char* u8, size_t cap){
@@ -385,9 +392,26 @@ static void scan_safari(void){
 #endif
 
 // ---- Plugin entry points ----
-static BOOL init(const PluginHost* host){ if(!host) return FALSE; g_host=*host; init_state_path(); load_state(); return TRUE; }
+static BOOL init(const PluginHost* host){
+    if(!host) return FALSE;
+    g_host = *host;
+#ifdef _WIN32
+    if(!g_mutex) g_mutex = CreateMutex(NULL, FALSE, NULL);
+#else
+    pthread_mutex_init(&g_mutex, NULL);
+#endif
+    init_state_path();
+    load_state();
+    return TRUE;
+}
 
 static void scan(void){
+#ifdef _WIN32
+    WaitForSingleObject(g_mutex, INFINITE);
+#else
+    pthread_mutex_lock(&g_mutex);
+#endif
+
     scan_chrome();
     scan_edge();
     scan_opera();
@@ -396,9 +420,31 @@ static void scan(void){
 #ifdef __APPLE__
     scan_safari();
 #endif
+
+#ifdef _WIN32
+    ReleaseMutex(g_mutex);
+#else
+    pthread_mutex_unlock(&g_mutex);
+#endif
 }
 
-static void plugin_shutdown(void){ for(size_t i=0;i<g_seen_count;i++) free(g_seen[i].url); free(g_seen); }
+static void plugin_shutdown(void){
+#ifdef _WIN32
+    WaitForSingleObject(g_mutex, INFINITE);
+#else
+    pthread_mutex_lock(&g_mutex);
+#endif
+    for(size_t i=0;i<g_seen_count;i++) free(g_seen[i].url);
+    free(g_seen);
+#ifdef _WIN32
+    ReleaseMutex(g_mutex);
+    CloseHandle(g_mutex);
+    g_mutex = NULL;
+#else
+    pthread_mutex_unlock(&g_mutex);
+    pthread_mutex_destroy(&g_mutex);
+#endif
+}
 
 static AnythingPlugin g_plugin={ ANYTHING_PLUGIN_API_VERSION, L"Web Archive Scanner", init, scan, plugin_shutdown };
 

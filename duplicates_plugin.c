@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <errno.h>
+#include <pthread.h>
 #define _snwprintf swprintf
 #define WAIT_OBJECT_0 0
 static int WaitForSingleObject(HANDLE h, unsigned int ms){(void)h; (void)ms; return 1;}
@@ -47,9 +48,20 @@ static FileEntry* g_files = NULL;
 static size_t     g_file_count = 0;
 static size_t     g_file_cap   = 0;
 
+#ifdef _WIN32
+static HANDLE g_mutex;
+#else
+static pthread_mutex_t g_mutex;
+#endif
+
 static BOOL init(const PluginHost* host){
     if(!host) return FALSE;
     g_host = *host;
+#ifdef _WIN32
+    if(!g_mutex) g_mutex = CreateMutex(NULL, FALSE, NULL);
+#else
+    pthread_mutex_init(&g_mutex, NULL);
+#endif
     return TRUE;
 }
 
@@ -195,14 +207,39 @@ static void free_state(void){
 }
 
 static void scan(void){
+#ifdef _WIN32
+    WaitForSingleObject(g_mutex, INFINITE);
+#else
+    pthread_mutex_lock(&g_mutex);
+#endif
+
     const wchar_t* root = L"duplicates"; // directory to scan
     scan_dir(root);
     emit_duplicates();
     free_state();
+
+#ifdef _WIN32
+    ReleaseMutex(g_mutex);
+#else
+    pthread_mutex_unlock(&g_mutex);
+#endif
 }
 
 static void plugin_shutdown(void){
+#ifdef _WIN32
+    WaitForSingleObject(g_mutex, INFINITE);
+#else
+    pthread_mutex_lock(&g_mutex);
+#endif
     free_state();
+#ifdef _WIN32
+    ReleaseMutex(g_mutex);
+    CloseHandle(g_mutex);
+    g_mutex = NULL;
+#else
+    pthread_mutex_unlock(&g_mutex);
+    pthread_mutex_destroy(&g_mutex);
+#endif
 }
 
 static AnythingPlugin g_plugin = {
