@@ -510,14 +510,13 @@ typedef struct {
 } RankedResult;
 
 typedef struct FilterArgs {
-    MDB_env* env;
     uint64_t* ids;
     size_t start, end;
     SearchQuery* q;
     RankedResult* out;
-    size_t* outn;
+    size_t outn;
+    size_t outcap;
     char db_path[MAX_PATH*3];
-    SRWLOCK* lock;
     size_t total_docs;
     size_t docs_with_term;
 } FilterArgs;
@@ -556,9 +555,11 @@ static DWORD WINAPI filter_worker_thread(void* p){
             if(!ok) continue;
         }
         float score = calculate_relevance(txn, dbi_strings, r, parent, name, a->q, a->total_docs, a->docs_with_term);
-        AcquireSRWLockExclusive(a->lock);
-        a->out[*a->outn].rec_id = rid; a->out[*a->outn].score = score; (*a->outn)++;
-        ReleaseSRWLockExclusive(a->lock);
+        if(a->outn < a->outcap){
+            a->out[a->outn].rec_id = rid;
+            a->out[a->outn].score = score;
+            a->outn++;
+        }
     }
     mdb_txn_abort(txn); mdb_env_close(env);
     return 0;
@@ -1116,21 +1117,35 @@ int wmain(int argc, wchar_t** argv){
     size_t docs_with_term = rec_ids.n;
 
     // Step 3: Apply filters, rank, and print (parallel)
-    SRWLOCK outlock; InitializeSRWLock(&outlock);
     int tcount = workers;
     HANDLE th[4]; FilterArgs fa[4];
-    RankedResult* all = (RankedResult*)malloc(rec_ids.n * sizeof(RankedResult)); size_t alln=0;
     for(int ti=0; ti<tcount; ++ti){
         size_t s = (rec_ids.n*ti)/tcount;
         size_t e = (rec_ids.n*(ti+1))/tcount;
         ZeroMemory(&fa[ti], sizeof(FilterArgs));
-        fa[ti].ids = rec_ids.ids; fa[ti].start=s; fa[ti].end=e; fa[ti].q=&q; fa[ti].out=all; fa[ti].outn=&alln; fa[ti].lock=&outlock;
-        fa[ti].total_docs = total_docs; fa[ti].docs_with_term = docs_with_term;
+        fa[ti].ids = rec_ids.ids;
+        fa[ti].start = s;
+        fa[ti].end = e;
+        fa[ti].q = &q;
+        fa[ti].outcap = e - s;
+        fa[ti].out = (RankedResult*)malloc(fa[ti].outcap * sizeof(RankedResult));
+        fa[ti].outn = 0;
+        fa[ti].total_docs = total_docs;
+        fa[ti].docs_with_term = docs_with_term;
         to_utf8(dbPath, fa[ti].db_path, sizeof(fa[ti].db_path));
         th[ti] = CreateThread(NULL,0,filter_worker_thread,&fa[ti],0,NULL);
     }
     WaitForMultipleObjects(tcount, th, TRUE, INFINITE);
     for(int ti=0; ti<tcount; ++ti) CloseHandle(th[ti]);
+    size_t alln = 0;
+    for(int ti=0; ti<tcount; ++ti) alln += fa[ti].outn;
+    RankedResult* all = (RankedResult*)malloc(alln * sizeof(RankedResult));
+    size_t pos = 0;
+    for(int ti=0; ti<tcount; ++ti){
+        memcpy(all + pos, fa[ti].out, fa[ti].outn * sizeof(RankedResult));
+        pos += fa[ti].outn;
+        free(fa[ti].out);
+    }
     // sort by score desc
     qsort(all, alln, sizeof(RankedResult), cmp_rank);
     size_t show = alln<200? alln:200;
