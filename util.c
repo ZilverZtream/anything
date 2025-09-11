@@ -13,6 +13,12 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "bcrypt.lib")
 
+#ifndef _WIN32
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <limits.h>
+#endif
 // default sort buffer size: 256MB
 size_t g_sort_buffer_size = 256 * 1024 * 1024;
 
@@ -520,6 +526,7 @@ void normalize_filename_utf8(const char* name_utf8, char* out, size_t outcap){
     free(tmp);
 }
 
+#ifdef _WIN32
 typedef struct {
     HANDLE h;
     size_t remaining;
@@ -527,6 +534,15 @@ typedef struct {
     BOOL loaded;
     wchar_t path[MAX_PATH];
 } SortChunk;
+#else
+typedef struct {
+    int fd;
+    size_t remaining;
+    uint8_t* item;
+    BOOL loaded;
+    char path[PATH_MAX];
+} SortChunk;
+#endif
 
 static void heap_push(size_t* heap, size_t* heap_size, size_t idx,
                       SortChunk* chunks,
@@ -566,6 +582,50 @@ static size_t heap_pop(size_t* heap, size_t* heap_size, SortChunk* chunks,
     return result;
 }
 
+#ifdef _WIN32
+static HANDLE tempfile_create(wchar_t path[MAX_PATH], const wchar_t* tmpdir){
+    if(!GetTempFileNameW(tmpdir, L"srt", 0, path)) return INVALID_HANDLE_VALUE;
+    return CreateFileW(path, GENERIC_READ|GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE, NULL);
+}
+static BOOL chunk_write(HANDLE h, const void* buf, size_t bytes){
+    DWORD written = 0;
+    return WriteFile(h, buf, (DWORD)bytes, &written, NULL) && written==(DWORD)bytes;
+}
+static BOOL chunk_read(HANDLE h, void* buf, size_t bytes){
+    DWORD rd = 0;
+    return ReadFile(h, buf, (DWORD)bytes, &rd, NULL) && rd==(DWORD)bytes;
+}
+static void chunk_close(HANDLE h, const wchar_t* path){
+    if(h!=INVALID_HANDLE_VALUE) CloseHandle(h);
+    if(path && path[0]) DeleteFileW(path);
+}
+#else
+static int tempfile_create(char path[PATH_MAX], const wchar_t* tmpdir){
+    char dir[PATH_MAX];
+    if(tmpdir && tmpdir[0]){
+        to_utf8(tmpdir, dir, sizeof(dir));
+    } else {
+        const char* td = getenv("TMPDIR");
+        if(!td) td = "/tmp";
+        strncpy(dir, td, sizeof(dir));
+        dir[sizeof(dir)-1] = 0;
+    }
+    snprintf(path, PATH_MAX, "%s/srtXXXXXX", dir);
+    return mkstemp(path);
+}
+static BOOL chunk_write(int fd, const void* buf, size_t bytes){
+    return write(fd, buf, bytes) == (ssize_t)bytes;
+}
+static BOOL chunk_read(int fd, void* buf, size_t bytes){
+    return read(fd, buf, bytes) == (ssize_t)bytes;
+}
+static void chunk_close(int fd, const char* path){
+    if(fd >= 0) close(fd);
+    if(path && *path) unlink(path);
+}
+#endif
+
 BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
                    int (*cmp)(const void*, const void*)){
     if(!base || !cmp || size==0) return FALSE;
@@ -573,49 +633,85 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
     if(max_items==0) return FALSE;
     if(n <= max_items){ qsort(base, n, size, cmp); return TRUE; }
 
+#ifdef _WIN32
     wchar_t tmpbuf[MAX_PATH];
     if(!tmpdir){ GetTempPathW(MAX_PATH, tmpbuf); tmpdir = tmpbuf; }
+#else
+    wchar_t tmpbuf[PATH_MAX];
+    if(!tmpdir || !tmpdir[0]){
+        const char* td = getenv("TMPDIR");
+        if(!td) td = "/tmp";
+        mbstowcs(tmpbuf, td, PATH_MAX);
+        tmpbuf[PATH_MAX-1]=0;
+        tmpdir = tmpbuf;
+    }
+#endif
 
     size_t offset=0, chunks_n=0;
     SortChunk* chunks=NULL;
+    size_t* heap=NULL;
     while(offset < n){
         size_t m = n - offset; if(m > max_items) m = max_items;
         qsort((uint8_t*)base + offset*size, m, size, cmp);
+#ifdef _WIN32
         wchar_t file[MAX_PATH];
-        if(!GetTempFileNameW(tmpdir, L"srt", 0, file)) goto fail;
-        HANDLE h = CreateFileW(file, GENERIC_READ|GENERIC_WRITE, 0, NULL,
-                               CREATE_ALWAYS,
-                               FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,
-                               NULL);
+        HANDLE h = tempfile_create(file, tmpdir);
         if(h==INVALID_HANDLE_VALUE) goto fail;
-        DWORD written=0;
-        if(!WriteFile(h, (uint8_t*)base + offset*size, (DWORD)(m*size), &written, NULL) || written!=(DWORD)(m*size)){
-            CloseHandle(h); goto fail;
+        if(!chunk_write(h, (uint8_t*)base + offset*size, m*size)){
+            chunk_close(h, file); goto fail;
         }
         SetFilePointer(h,0,NULL,FILE_BEGIN);
-        SortChunk* tmp=(SortChunk*)realloc(chunks, (chunks_n+1)*sizeof(SortChunk));
-        if(!tmp){ CloseHandle(h); goto fail; }
-        chunks=tmp;
-        chunks[chunks_n].h=h;
-        chunks[chunks_n].remaining=m;
-        chunks[chunks_n].item=(uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-        chunks[chunks_n].loaded=FALSE;
-        chunks[chunks_n].path[0]=0;
-        if(wcscpy_s(chunks[chunks_n].path, MAX_PATH, file)!=0){
-            CloseHandle(h); goto fail;
+#else
+        char file[PATH_MAX];
+        int fd = tempfile_create(file, tmpdir);
+        if(fd<0) goto fail;
+        if(!chunk_write(fd, (uint8_t*)base + offset*size, m*size)){
+            chunk_close(fd, file); goto fail;
         }
+        lseek(fd,0,SEEK_SET);
+#endif
+        SortChunk* tmp=(SortChunk*)realloc(chunks, (chunks_n+1)*sizeof(SortChunk));
+        if(!tmp){
+#ifdef _WIN32
+            chunk_close(h, file);
+#else
+            chunk_close(fd, file);
+#endif
+            goto fail;
+        }
+        chunks=tmp;
+#ifdef _WIN32
+        chunks[chunks_n].h=h;
+        wcscpy_s(chunks[chunks_n].path, MAX_PATH, file);
+#else
+        chunks[chunks_n].fd=fd;
+        strncpy(chunks[chunks_n].path, file, PATH_MAX-1);
+        chunks[chunks_n].path[PATH_MAX-1]=0;
+#endif
+        chunks[chunks_n].remaining=m;
+#ifdef _WIN32
+        chunks[chunks_n].item=(uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        if(!chunks[chunks_n].item){ chunk_close(chunks[chunks_n].h, chunks[chunks_n].path); goto fail; }
+#else
+        chunks[chunks_n].item=(uint8_t*)mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if(chunks[chunks_n].item==MAP_FAILED){ chunk_close(chunks[chunks_n].fd, chunks[chunks_n].path); chunks[chunks_n].item=NULL; goto fail; }
+#endif
+        chunks[chunks_n].loaded=FALSE;
         chunks_n++;
         offset += m;
     }
 
     for(size_t i=0;i<chunks_n;i++){
-        DWORD rd=0;
-        if(chunks[i].remaining>0 && ReadFile(chunks[i].h, chunks[i].item, (DWORD)size, &rd, NULL) && rd==size){
+#ifdef _WIN32
+        if(chunks[i].remaining>0 && chunk_read(chunks[i].h, chunks[i].item, size)){
+#else
+        if(chunks[i].remaining>0 && chunk_read(chunks[i].fd, chunks[i].item, size)){
+#endif
             chunks[i].remaining--; chunks[i].loaded=TRUE;
         }
     }
 
-    size_t* heap = (size_t*)malloc(chunks_n * sizeof(size_t));
+    heap = (size_t*)malloc(chunks_n * sizeof(size_t));
     if(!heap) goto fail;
     size_t heap_sz = 0;
     for(size_t i=0;i<chunks_n;i++){
@@ -628,31 +724,44 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
         memcpy((uint8_t*)base + out_idx*size, chunks[best].item, size);
         out_idx++;
         if(chunks[best].remaining>0){
-            DWORD rd=0;
-            if(ReadFile(chunks[best].h, chunks[best].item, (DWORD)size, &rd, NULL) && rd==size){
+#ifdef _WIN32
+            if(chunk_read(chunks[best].h, chunks[best].item, size)){
+#else
+            if(chunk_read(chunks[best].fd, chunks[best].item, size)){
+#endif
                 chunks[best].remaining--; chunks[best].loaded=TRUE;
                 heap_push(heap, &heap_sz, best, chunks, cmp);
             } else {
                 chunks[best].loaded=FALSE;
-                CloseHandle(chunks[best].h);
+#ifdef _WIN32
+                chunk_close(chunks[best].h, chunks[best].path);
                 chunks[best].h = INVALID_HANDLE_VALUE;
-                DeleteFileW(chunks[best].path);
-                chunks[best].path[0] = 0;
+#else
+                chunk_close(chunks[best].fd, chunks[best].path);
+                chunks[best].fd = -1;
+#endif
             }
         } else {
             chunks[best].loaded=FALSE;
-            CloseHandle(chunks[best].h);
+#ifdef _WIN32
+            chunk_close(chunks[best].h, chunks[best].path);
             chunks[best].h = INVALID_HANDLE_VALUE;
-            DeleteFileW(chunks[best].path);
-            chunks[best].path[0] = 0;
+#else
+            chunk_close(chunks[best].fd, chunks[best].path);
+            chunks[best].fd = -1;
+#endif
         }
     }
     free(heap);
 
     for(size_t i=0;i<chunks_n;i++){
+#ifdef _WIN32
         if(chunks[i].item) VirtualFree(chunks[i].item,0,MEM_RELEASE);
-        if(chunks[i].h!=INVALID_HANDLE_VALUE) CloseHandle(chunks[i].h);
-        if(chunks[i].path[0]) DeleteFileW(chunks[i].path);
+        if(chunks[i].h!=INVALID_HANDLE_VALUE) chunk_close(chunks[i].h, chunks[i].path);
+#else
+        if(chunks[i].item) munmap(chunks[i].item, size);
+        if(chunks[i].fd>=0) chunk_close(chunks[i].fd, chunks[i].path);
+#endif
     }
     free(chunks);
     return TRUE;
@@ -660,9 +769,13 @@ fail:
     if(heap) free(heap);
     if(chunks){
         for(size_t i=0;i<chunks_n;i++){
+#ifdef _WIN32
             if(chunks[i].item) VirtualFree(chunks[i].item,0,MEM_RELEASE);
-            if(chunks[i].h!=INVALID_HANDLE_VALUE) CloseHandle(chunks[i].h);
-            if(chunks[i].path[0]) DeleteFileW(chunks[i].path);
+            if(chunks[i].h!=INVALID_HANDLE_VALUE) chunk_close(chunks[i].h, chunks[i].path);
+#else
+            if(chunks[i].item) munmap(chunks[i].item, size);
+            if(chunks[i].fd>=0) chunk_close(chunks[i].fd, chunks[i].path);
+#endif
         }
     }
     free(chunks);
