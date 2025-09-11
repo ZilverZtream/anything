@@ -363,19 +363,50 @@ void sort_unique(IdVec* v) {
     v->n = w;
 }
 
+static size_t lower_bound_u64(const uint64_t* arr, size_t n, uint64_t x){
+    size_t lo=0, hi=n; while(lo<hi){ size_t mid=lo+((hi-lo)>>1); if(arr[mid]<x) lo=mid+1; else hi=mid; } return lo;
+}
+
 void intersect_inplace(IdVec* a, const IdVec* b) {
-    size_t i = 0, j = 0, w = 0;
+    if(a->n==0 || b->n==0){ a->n=0; return; }
+    if(a->n*8 < b->n){
+        size_t w=0, j=0;
+        for(size_t i=0;i<a->n;i++){
+            j += lower_bound_u64(b->ids+j, b->n-j, a->ids[i]);
+            if(j<b->n && b->ids[j]==a->ids[i]){ a->ids[w++]=a->ids[i]; j++; }
+        }
+        a->n=w; return;
+    }
+    size_t i=0,j=0,w=0;
     while (i < a->n && j < b->n) {
-        uint64_t x = a->ids[i], y = b->ids[j];
-        if (x == y) { a->ids[w++] = x; i++; j++; }
-        else if (x < y) i++;
+        uint64_t x=a->ids[i], y=b->ids[j];
+        if (x==y) { a->ids[w++]=x; i++; j++; }
+        else if (x<y) i++;
         else j++;
     }
-    a->n = w;
+    a->n=w;
 }
 
 void union_inplace(IdVec* a, const IdVec* b) {
-    for (size_t i = 0; i < b->n; i++) { idvec_push(a, b->ids[i]); }
+    if(b->n==0) return;
+    size_t need=a->n+b->n;
+    if(a->cap < need){ a->cap = need; a->ids = (uint64_t*)realloc(a->ids, a->cap*sizeof(uint64_t)); }
+    size_t i=a->n, j=b->n, k=need;
+    while(i>0 && j>0){
+        uint64_t x=a->ids[i-1], y=b->ids[j-1];
+        uint64_t v;
+        if(x>y){ v=x; i--; }
+        else if(y>x){ v=y; j--; }
+        else{ v=x; i--; j--; }
+        a->ids[--k]=v;
+        while(i>0 && a->ids[i-1]==v) i--;
+        while(j>0 && b->ids[j-1]==v) j--;
+    }
+    while(i>0){ uint64_t v=a->ids[i-1]; a->ids[--k]=v; while(i>0 && a->ids[i-1]==v) i--; }
+    while(j>0){ uint64_t v=b->ids[j-1]; a->ids[--k]=v; while(j>0 && b->ids[j-1]==v) j--; }
+    size_t outn = need - k;
+    memmove(a->ids, a->ids+k, outn*sizeof(uint64_t));
+    a->n = outn;
 }
 
 void difference_inplace(IdVec* a, const IdVec* b) {
@@ -721,7 +752,7 @@ void eval_node(const Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fna
         eval_node(n->left.get(), txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &L);
         eval_node(n->right.get(), txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_ext, dbi_strrev, dbi_date, &R);
         sort_unique(&L); sort_unique(&R);
-        if (n->type == TOK_AND) { intersect_inplace(&L, &R); } else { union_inplace(&L, &R); sort_unique(&L); }
+        if (n->type == TOK_AND) { intersect_inplace(&L, &R); } else { union_inplace(&L, &R); }
         idvec_free(&R);
         *out = L;
         return;
