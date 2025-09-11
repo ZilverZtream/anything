@@ -18,6 +18,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <limits.h>
 #endif
 
 #include "database.h"
@@ -786,9 +790,17 @@ static void evict_lru_cache_entries(CacheEntry* head, size_t max_size){
     free(arr);
 }
 
+static wchar_t* path_dirname_w(wchar_t* path){
+    wchar_t* a = wcsrchr(path, L'\\');
+    wchar_t* b = wcsrchr(path, L'/');
+    if(a && b) return (a > b) ? a : b;
+    return a ? a : b;
+}
+
+#ifdef _WIN32
 static void prune_cache_dir(const wchar_t* anyPath){
     wchar_t dir[MAX_PATH]; wcscpy_s(dir, MAX_PATH, anyPath);
-    wchar_t* p = wcsrchr(dir, L'\\'); if(!p) return; *p = 0;
+    wchar_t* p = path_dirname_w(dir); if(!p) return; *p = 0;
     CacheEntry* head = NULL;
     const wchar_t* patterns[2] = {L"cache_*.tmp", L"cache_term_*.tmp"};
     for(int i=0;i<2;i++){
@@ -821,11 +833,15 @@ static void prune_cache_dir(const wchar_t* anyPath){
         head = next;
     }
 }
+#else
+static void prune_cache_dir(const char* anyPath){ (void)anyPath; }
+#endif
 
 static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     uint64_t sig = hash64(qstr, strlen(qstr));
+#ifdef _WIN32
     wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, dbPath);
-    wchar_t* p = wcsrchr(cachePath, L'\\'); if(!p) return FALSE;
+    wchar_t* p = path_dirname_w(cachePath); if(!p) return FALSE;
     swprintf(p+1, (size_t)(MAX_PATH-(p+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
     HANDLE f = CreateFileW(cachePath, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return FALSE;
@@ -850,11 +866,39 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     }
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
     return ok;
+#else
+    char path[PATH_MAX];
+    to_utf8(dbPath, path, sizeof(path));
+    char* p = strrchr(path, '/'); if(!p) return FALSE;
+    snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_%016llx.tmp", (unsigned long long)sig);
+    int fd = open(path, O_RDONLY);
+    if(fd < 0) return FALSE;
+    struct stat st; if(fstat(fd, &st) < 0){ close(fd); return FALSE; }
+    if(st.st_size < (off_t)sizeof(CacheHeader)){ close(fd); return FALSE; }
+    void* base = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    if(base == MAP_FAILED){ close(fd); return FALSE; }
+    const CacheHeader* h = (const CacheHeader*)base;
+    BOOL ok = FALSE;
+    if(h->magic == CACHE_MAGIC &&
+       h->version == CACHE_VERSION &&
+       h->sig == sig &&
+       h->generation == g_db_generation &&
+       h->bloom_size == g_bloom_size &&
+       (size_t)st.st_size >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
+        out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
+        memcpy(out->ids, (const uint8_t*)base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
+        out->n = h->count; out->cap = h->count;
+        ok = TRUE;
+    }
+    munmap(base, st.st_size); close(fd);
+    return ok;
+#endif
 }
 static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids){
     uint64_t sig = hash64(qstr, strlen(qstr));
+#ifdef _WIN32
     wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, dbPath);
-    wchar_t* p = wcsrchr(cachePath, L'\\'); if(!p) return;
+    wchar_t* p = path_dirname_w(cachePath); if(!p) return;
     swprintf(p+1, (size_t)(MAX_PATH-(p+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
     HANDLE f = CreateFileW(cachePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return;
@@ -873,6 +917,30 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     memcpy(base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
     prune_cache_dir(cachePath);
+#else
+    char path[PATH_MAX];
+    to_utf8(dbPath, path, sizeof(path));
+    char* p = strrchr(path, '/'); if(!p) return;
+    snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_%016llx.tmp", (unsigned long long)sig);
+    size_t sz = sizeof(CacheHeader)+ids->n*sizeof(uint64_t);
+    int fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0666);
+    if(fd < 0) return;
+    if(ftruncate(fd, (off_t)sz) != 0){ close(fd); return; }
+    void* base = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if(base == MAP_FAILED){ close(fd); return; }
+    CacheHeader* h = (CacheHeader*)base;
+    h->magic = CACHE_MAGIC;
+    h->version = CACHE_VERSION;
+    h->pad = 0;
+    h->generation = g_db_generation;
+    h->bloom_size = g_bloom_size;
+    h->sig = hash64(qstr, strlen(qstr));
+    h->count = (uint32_t)ids->n;
+    memcpy((uint8_t*)base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
+    msync(base, sz, MS_SYNC);
+    munmap(base, sz); close(fd);
+    prune_cache_dir(path);
+#endif
 }
 
 // Per-term cache helpers
@@ -898,8 +966,9 @@ static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
     strncpy(key+1, term, sizeof(key)-2);
     key[sizeof(key)-1] = 0;
     uint64_t sig = hash64(key, strlen(key));
+#ifdef _WIN32
     wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, g_db_path);
-    wchar_t* p = wcsrchr(cachePath, L'\\'); if(!p) return FALSE;
+    wchar_t* p = path_dirname_w(cachePath); if(!p) return FALSE;
     swprintf(p+1, (size_t)(MAX_PATH-(p+1-cachePath)), L"cache_term_%016llx.tmp", (unsigned long long)sig);
     HANDLE f = CreateFileW(cachePath, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return FALSE;
@@ -924,6 +993,33 @@ static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
     }
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
     return ok;
+#else
+    char path[PATH_MAX];
+    to_utf8(g_db_path, path, sizeof(path));
+    char* p = strrchr(path, '/'); if(!p) return FALSE;
+    snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_term_%016llx.tmp", (unsigned long long)sig);
+    int fd = open(path, O_RDONLY);
+    if(fd < 0) return FALSE;
+    struct stat st; if(fstat(fd, &st) < 0){ close(fd); return FALSE; }
+    if(st.st_size < (off_t)sizeof(CacheHeader)){ close(fd); return FALSE; }
+    void* base = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    if(base == MAP_FAILED){ close(fd); return FALSE; }
+    const CacheHeader* h = (const CacheHeader*)base;
+    BOOL ok = FALSE;
+    if(h->magic == CACHE_MAGIC &&
+       h->version == CACHE_VERSION &&
+       h->sig == sig &&
+       h->generation == g_db_generation &&
+       h->bloom_size == g_bloom_size &&
+       (size_t)st.st_size >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
+        out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
+        memcpy(out->ids, (const uint8_t*)base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
+        out->n = h->count; out->cap = h->count;
+        ok = TRUE;
+    }
+    munmap(base, st.st_size); close(fd);
+    return ok;
+#endif
 }
 
 static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
@@ -933,8 +1029,9 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     strncpy(key+1, term, sizeof(key)-2);
     key[sizeof(key)-1] = 0;
     uint64_t sig = hash64(key, strlen(key));
+#ifdef _WIN32
     wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, g_db_path);
-    wchar_t* p = wcsrchr(cachePath, L'\\'); if(!p) return;
+    wchar_t* p = path_dirname_w(cachePath); if(!p) return;
     swprintf(p+1, (size_t)(MAX_PATH-(p+1-cachePath)), L"cache_term_%016llx.tmp", (unsigned long long)sig);
     HANDLE f = CreateFileW(cachePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return;
@@ -953,6 +1050,30 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     memcpy(base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
     prune_cache_dir(cachePath);
+#else
+    char path[PATH_MAX];
+    to_utf8(g_db_path, path, sizeof(path));
+    char* p = strrchr(path, '/'); if(!p) return;
+    snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_term_%016llx.tmp", (unsigned long long)sig);
+    size_t sz = sizeof(CacheHeader)+ids->n*sizeof(uint64_t);
+    int fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0666);
+    if(fd < 0) return;
+    if(ftruncate(fd, (off_t)sz) != 0){ close(fd); return; }
+    void* base = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if(base == MAP_FAILED){ close(fd); return; }
+    CacheHeader* h = (CacheHeader*)base;
+    h->magic = CACHE_MAGIC;
+    h->version = CACHE_VERSION;
+    h->pad = 0;
+    h->generation = g_db_generation;
+    h->bloom_size = g_bloom_size;
+    h->sig = sig;
+    h->count = (uint32_t)ids->n;
+    memcpy((uint8_t*)base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
+    msync(base, sz, MS_SYNC);
+    munmap(base, sz); close(fd);
+    prune_cache_dir(path);
+#endif
 }
 
 // Intersect postings
