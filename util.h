@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <wchar.h>
+#include "result.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,8 +56,8 @@ typedef struct {
 
 void sb_init(SortBuffer* sb);
 void sb_free(SortBuffer* sb);
-BOOL sb_pack_str(SortBuffer* sb, const char* s);
-BOOL sb_pack_u64(SortBuffer* sb, uint64_t v);
+Result sb_pack_str(SortBuffer* sb, const char* s);
+Result sb_pack_u64(SortBuffer* sb, uint64_t v);
 
 // incremental hash helpers for sort keys
 uint64_t hash64_add(uint64_t h, const void* data, size_t len);

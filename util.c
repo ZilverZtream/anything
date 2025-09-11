@@ -44,16 +44,16 @@ void aligned_free(void* p){
 #endif
 }
 
-static BOOL sb_reserve(SortBuffer* sb, size_t add){
+static Result sb_reserve(SortBuffer* sb, size_t add){
     size_t need = sb->len + add;
     if(need > sb->cap){
         size_t newcap = sb->cap ? sb->cap * 2 : 256;
         while(newcap < need) newcap *= 2;
         uint8_t* p = (uint8_t*)realloc(sb->data, newcap);
-        if(!p) return FALSE;
+        if(!p) return result_error(RESULT_ERROR_MEMORY, "Out of memory");
         sb->data = p; sb->cap = newcap;
     }
-    return TRUE;
+    return result_success(NULL);
 }
 
 void sb_init(SortBuffer* sb){
@@ -64,21 +64,23 @@ void sb_free(SortBuffer* sb){
     if(!sb) return; if(sb->data) free(sb->data); sb->data=NULL; sb->len=sb->cap=0;
 }
 
-BOOL sb_pack_str(SortBuffer* sb, const char* s){
+Result sb_pack_str(SortBuffer* sb, const char* s){
     size_t n = s ? strlen(s) : 0;
-    if(!sb_reserve(sb, sizeof(uint32_t)+n)) return FALSE;
+    Result r = sb_reserve(sb, sizeof(uint32_t)+n);
+    if(r.code != RESULT_SUCCESS) return r;
     uint32_t len=(uint32_t)n;
     memcpy(sb->data+sb->len, &len, sizeof(len));
     sb->len += sizeof(len);
     if(n){ memcpy(sb->data+sb->len, s, n); sb->len += n; }
-    return TRUE;
+    return result_success(NULL);
 }
 
-BOOL sb_pack_u64(SortBuffer* sb, uint64_t v){
-    if(!sb_reserve(sb, sizeof(v))) return FALSE;
+Result sb_pack_u64(SortBuffer* sb, uint64_t v){
+    Result r = sb_reserve(sb, sizeof(v));
+    if(r.code != RESULT_SUCCESS) return r;
     memcpy(sb->data+sb->len, &v, sizeof(v));
     sb->len += sizeof(v);
-    return TRUE;
+    return result_success(NULL);
 }
 void lowercase_ascii(char* s, size_t n){
     for(size_t i=0;i<n && s[i];++i){
