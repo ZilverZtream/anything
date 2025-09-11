@@ -17,10 +17,47 @@
 #include "util.h"
 #include "lmdb.h"
 
+#ifndef _strdup
+#define _strdup strdup
+#endif
+
 typedef struct {
     uint32_t trigram_count;
     uint64_t bloom_offset; // offset in bloom file
 } StringMeta;
+
+typedef struct {
+    uint64_t hash;
+    uint64_t string_id;
+    char* string;
+} StringCache;
+
+#define STRING_CACHE_SIZE 65536u
+#define STRING_CACHE_MASK (STRING_CACHE_SIZE-1u)
+
+static StringCache g_string_cache[STRING_CACHE_SIZE];
+
+static uint64_t string_cache_lookup(const char* s, uint64_t h){
+    for(uint32_t i=0;i<STRING_CACHE_SIZE;i++){
+        StringCache* c = &g_string_cache[(h + i) & STRING_CACHE_MASK];
+        if(!c->string) return 0;
+        if(c->hash==h && strcmp(c->string, s)==0) return c->string_id;
+    }
+    return 0;
+}
+
+static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
+    for(uint32_t i=0;i<STRING_CACHE_SIZE;i++){
+        StringCache* c = &g_string_cache[(h + i) & STRING_CACHE_MASK];
+        if(!c->string){
+            c->hash=h; c->string_id=id; c->string=_strdup(s); return;
+        }
+        if(c->hash==h && strcmp(c->string,s)==0){ c->string_id=id; return; }
+    }
+    StringCache* c = &g_string_cache[h & STRING_CACHE_MASK];
+    free(c->string);
+    c->hash=h; c->string_id=id; c->string=_strdup(s);
+}
 
 static inline void bloom_set(uint8_t* bloom, uint32_t h){
     uint32_t bit = h & 0xFFFFu; // 65536 bits
@@ -393,6 +430,10 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
     char* u8 = heap ? (char*)malloc(needed) : stack_u8;
     if(!u8) return 0;
     WideCharToMultiByte(CP_UTF8,0,s,-1,u8,needed,NULL,NULL);
+    size_t u8len = (size_t)(needed-1);
+    uint64_t h = hash64(u8, u8len);
+    uint64_t cached = string_cache_lookup(u8, h);
+    if(cached){ if(heap) free(u8); return cached; }
     // Try to read using the current write txn if present; otherwise open a RO txn.
     MDB_txn* rtxn = d->wtxn ? d->wtxn : NULL;
     BOOL need_abort = FALSE;
@@ -400,11 +441,12 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
         if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn)!=0){ if(heap) free(u8); return 0; }
         need_abort = TRUE;
     }
-    MDB_val k={.mv_data=u8,.mv_size=(size_t)(needed-1)}, v;
+    MDB_val k={.mv_data=u8,.mv_size=u8len}, v;
     int rc = mdb_get(rtxn, d->dbi_strrev, &k, &v);
     if(rc==0){
         uint64_t id = *(uint64_t*)v.mv_data;
         if(need_abort) mdb_txn_abort(rtxn);
+        string_cache_insert(u8, h, id);
         if(heap) free(u8);
         return id;
     }
@@ -423,6 +465,7 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
     MDB_val mk,mv; const char* H="header"; to_mdb_val(H, strlen(H), &mk);
     to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
     rc = mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
+    string_cache_insert(u8, h, new_id);
     if(heap) free(u8);
     if(rc){ set_mdb_error(d,rc); return 0; }
     return new_id;
