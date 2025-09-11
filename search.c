@@ -218,9 +218,162 @@ static void tokenlist_free(TokenList* t){
 // Parallel search helpers
 typedef SearchQuery Query;
 typedef struct { uint64_t dummy; } Result;
-static int search_names(Query* q, Result* results){ (void)q; (void)results; return 0; }
-static int search_content(Query* q, Result* results){ (void)q; (void)results; return 0; }
-static int search_metadata(Query* q, Result* results){ (void)q; (void)results; return 0; }
+
+// Forward declarations for helpers defined later in this file.
+typedef struct IdVec IdVec;
+static void idvec_init(IdVec* v);
+static void idvec_free(IdVec* v);
+static void galloping_intersect(IdVec* a, const IdVec* b);
+static void union_inplace(IdVec* a, const IdVec* b);
+static void difference_inplace(IdVec* a, const IdVec* b);
+static uint64_t day_to_filetime(uint64_t day);
+static void records_for_range(MDB_txn* txn, MDB_dbi dbi, uint64_t minv, uint64_t maxv, IdVec* out);
+static void records_for_ext(MDB_txn* txn, MDB_dbi dbi_ext, const char* ext, IdVec* out);
+static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_dbi dbi_strings, MDB_dbi dbi_smeta, const char* term, IdVec* out);
+static void records_for_content(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_content, const char* term, IdVec* out);
+static void records_for_author(MDB_txn* txn, MDB_dbi dbi_author, MDB_dbi dbi_strrev, const char* author, IdVec* out);
+static void records_for_camera(MDB_txn* txn, MDB_dbi dbi_camera, MDB_dbi dbi_strrev, const char* camera, IdVec* out);
+static void records_for_lens(MDB_txn* txn, MDB_dbi dbi_lens, MDB_dbi dbi_strrev, const char* lens, IdVec* out);
+static void records_for_artist(MDB_txn* txn, MDB_dbi dbi_artist, MDB_dbi dbi_strrev, const char* artist, IdVec* out);
+static void records_for_album(MDB_txn* txn, MDB_dbi dbi_album, MDB_dbi dbi_strrev, const char* album, IdVec* out);
+static void records_for_title(MDB_txn* txn, MDB_dbi dbi_title, MDB_dbi dbi_strrev, const char* title, IdVec* out);
+
+// Global progressive state used by stage wrappers.
+static ProgState* g_prog_state = NULL;
+
+// Stage 0: filename search and basic filters.
+static int search_names(Query* q, Result* results){
+    (void)results;
+    if(!g_db_path[0]) return 0;
+    MDB_env* env=NULL; MDB_txn* txn=NULL;
+    MDB_dbi dbi_fname, dbi_trigram, dbi_strings, dbi_smeta, dbi_ext, dbi_size, dbi_mtime;
+    if(mdb_env_create(&env)!=0) return 0;
+    mdb_env_set_maxdbs(env,64);
+    char u8db[MAX_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
+    if(mdb_env_open(env,u8db,MDB_RDONLY,0664)!=0){ mdb_env_close(env); return 0; }
+    if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ mdb_env_close(env); return 0; }
+    if(mdb_dbi_open(txn,"filename_index",0,&dbi_fname)!=0 ||
+       mdb_dbi_open(txn,"trigram_index",0,&dbi_trigram)!=0 ||
+       mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
+       mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0 ||
+       mdb_dbi_open(txn,"extension_index",0,&dbi_ext)!=0 ||
+       mdb_dbi_open(txn,"size_index",0,&dbi_size)!=0 ||
+       mdb_dbi_open(txn,"mtime_index",0,&dbi_mtime)!=0){
+        mdb_txn_abort(txn); mdb_env_close(env); return 0;
+    }
+
+    IdVec ids; idvec_init(&ids);
+    if(q->name_pattern){
+        records_for_name(txn, dbi_trigram, dbi_fname, dbi_strings, dbi_smeta, q->name_pattern, &ids);
+    }
+
+    if(q->ext_pattern){
+        IdVec ext; idvec_init(&ext);
+        records_for_ext(txn, dbi_ext, q->ext_pattern, &ext);
+        if(ids.n>0){ galloping_intersect(&ids,&ext); idvec_free(&ext); }
+        else { ids = ext; }
+    }
+    if(q->size_min>0 || q->size_max<~0ULL){
+        IdVec sz; idvec_init(&sz);
+        records_for_range(txn, dbi_size, q->size_min, q->size_max, &sz);
+        if(ids.n>0){ galloping_intersect(&ids,&sz); idvec_free(&sz); }
+        else { ids = sz; }
+    }
+    if(q->date_min_day>0 || q->date_max_day<~0ULL){
+        uint64_t minft = day_to_filetime(q->date_min_day);
+        uint64_t maxft = day_to_filetime(q->date_max_day+1) - 1;
+        IdVec dt; idvec_init(&dt);
+        records_for_range(txn, dbi_mtime, minft, maxft, &dt);
+        if(ids.n>0){ galloping_intersect(&ids,&dt); idvec_free(&dt); }
+        else { ids = dt; }
+    }
+
+    size_t n = ids.n;
+    if(g_prog_state && n>0){
+        uint32_t* out=(uint32_t*)malloc(n*sizeof(uint32_t));
+        for(size_t i=0;i<n;i++) out[i]=(uint32_t)ids.ids[i];
+        prog_submit(g_prog_state,out,n,0,60);
+        free(out);
+    }
+    prog_mark_done(g_prog_state,0);
+    idvec_free(&ids);
+    mdb_txn_abort(txn); mdb_env_close(env);
+    return (int)n;
+}
+
+// Stage 1: metadata indexes (author/camera/etc.).
+static int search_metadata(Query* q, Result* results){
+    (void)results;
+    if(!g_db_path[0]){ prog_mark_done(g_prog_state,1); return 0; }
+    MDB_env* env=NULL; MDB_txn* txn=NULL;
+    MDB_dbi dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_strrev;
+    if(mdb_env_create(&env)!=0) { prog_mark_done(g_prog_state,1); return 0; }
+    mdb_env_set_maxdbs(env,64);
+    char u8db[MAX_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
+    if(mdb_env_open(env,u8db,MDB_RDONLY,0664)!=0){ mdb_env_close(env); prog_mark_done(g_prog_state,1); return 0; }
+    if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ mdb_env_close(env); prog_mark_done(g_prog_state,1); return 0; }
+    if(mdb_dbi_open(txn,"author_index",0,&dbi_author)!=0 ||
+       mdb_dbi_open(txn,"camera_index",0,&dbi_camera)!=0 ||
+       mdb_dbi_open(txn,"lens_index",0,&dbi_lens)!=0 ||
+       mdb_dbi_open(txn,"artist_index",0,&dbi_artist)!=0 ||
+       mdb_dbi_open(txn,"album_index",0,&dbi_album)!=0 ||
+       mdb_dbi_open(txn,"title_index",0,&dbi_title)!=0 ||
+       mdb_dbi_open(txn,"strrev",0,&dbi_strrev)!=0){
+        mdb_txn_abort(txn); mdb_env_close(env); prog_mark_done(g_prog_state,1); return 0;
+    }
+
+    IdVec ids; idvec_init(&ids);
+    if(q->author_pattern){ IdVec tmp; idvec_init(&tmp); records_for_author(txn, dbi_author, dbi_strrev, q->author_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
+    if(q->camera_pattern){ IdVec tmp; idvec_init(&tmp); records_for_camera(txn, dbi_camera, dbi_strrev, q->camera_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
+    if(q->lens_pattern){ IdVec tmp; idvec_init(&tmp); records_for_lens(txn, dbi_lens, dbi_strrev, q->lens_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
+    if(q->artist_pattern){ IdVec tmp; idvec_init(&tmp); records_for_artist(txn, dbi_artist, dbi_strrev, q->artist_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
+    if(q->album_pattern){ IdVec tmp; idvec_init(&tmp); records_for_album(txn, dbi_album, dbi_strrev, q->album_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
+    if(q->title_pattern){ IdVec tmp; idvec_init(&tmp); records_for_title(txn, dbi_title, dbi_strrev, q->title_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
+
+    size_t n = ids.n;
+    if(g_prog_state && n>0){
+        uint32_t* out=(uint32_t*)malloc(n*sizeof(uint32_t));
+        for(size_t i=0;i<n;i++) out[i]=(uint32_t)ids.ids[i];
+        prog_submit(g_prog_state,out,n,1,75);
+        free(out);
+    }
+    prog_mark_done(g_prog_state,1);
+    idvec_free(&ids);
+    mdb_txn_abort(txn); mdb_env_close(env);
+    return (int)n;
+}
+
+// Stage 2: content search (trigram/regex).
+static int search_content(Query* q, Result* results){
+    (void)results;
+    if(!g_db_path[0]){ prog_mark_done(g_prog_state,2); return 0; }
+    MDB_env* env=NULL; MDB_txn* txn=NULL;
+    MDB_dbi dbi_trigram, dbi_content;
+    if(mdb_env_create(&env)!=0){ prog_mark_done(g_prog_state,2); return 0; }
+    mdb_env_set_maxdbs(env,64);
+    char u8db[MAX_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
+    if(mdb_env_open(env,u8db,MDB_RDONLY,0664)!=0){ mdb_env_close(env); prog_mark_done(g_prog_state,2); return 0; }
+    if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ mdb_env_close(env); prog_mark_done(g_prog_state,2); return 0; }
+    if(mdb_dbi_open(txn,"trigram_index",0,&dbi_trigram)!=0 ||
+       mdb_dbi_open(txn,"content_index",0,&dbi_content)!=0){
+        mdb_txn_abort(txn); mdb_env_close(env); prog_mark_done(g_prog_state,2); return 0;
+    }
+
+    IdVec ids; idvec_init(&ids);
+    if(q->content_pattern){ records_for_content(txn, dbi_trigram, dbi_content, q->content_pattern, &ids); }
+
+    size_t n = ids.n;
+    if(g_prog_state && n>0){
+        uint32_t* out=(uint32_t*)malloc(n*sizeof(uint32_t));
+        for(size_t i=0;i<n;i++) out[i]=(uint32_t)ids.ids[i];
+        prog_submit(g_prog_state,out,n,2,95);
+        free(out);
+    }
+    prog_mark_done(g_prog_state,2);
+    idvec_free(&ids);
+    mdb_txn_abort(txn); mdb_env_close(env);
+    return (int)n;
+}
 
 typedef int (*SearchFn)(Query*, Result*);
 
@@ -281,7 +434,8 @@ static double g_stage1_ms_avg = 0.0;
 
 // Adaptive search that runs stages serially for cheap queries and
 // leverages a small thread pool for heavier ones.
-static void progressive_search(Query* q, Result* results){
+static void progressive_search(Query* q, Result* results, ProgState* ps){
+    g_prog_state = ps;
     unsigned hw = get_hw_threads();
     unsigned pool_size = hw < 3 ? hw : 3;
 
@@ -328,6 +482,7 @@ static void progressive_search(Query* q, Result* results){
         pthread_join(threads[i], NULL);
     }
 #endif
+    g_prog_state = NULL;
 }
 
 // Helpers for progressive search -------------------------------------------------
