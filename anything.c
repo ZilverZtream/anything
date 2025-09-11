@@ -7,6 +7,7 @@
 #include <intrin.h>
 #include <objbase.h>
 #include <filter.h>
+#include <process.h>
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "query.lib")
@@ -895,7 +896,8 @@ int wmain(int argc, wchar_t** argv){
     }
     PluginHost ph = { &ctx.queue, &ctx.cancel };
     Plugin_LoadAll(L"plugins", &ph);
-    HANDLE writer = CreateThread(NULL,0,DbWriterThread,&ctx,0,NULL);
+    uintptr_t wh = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))DbWriterThread,&ctx,0,NULL);
+    HANDLE writer = (HANDLE)wh;
 
     HANDLE drive_threads[26]; int drive_count=0;
     // Incremental index state
@@ -920,7 +922,8 @@ int wmain(int argc, wchar_t** argv){
                 struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = (struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; }*)malloc(sizeof(*in));
                 wcscpy_s(in->root, 8, root);
                 in->ctx=&ctx; in->use_ntfs=args.use_ntfs; in->threads=args.threads;
-                drive_threads[drive_count++] = CreateThread(NULL,0,scan_drive_thread,in,0,NULL);
+                uintptr_t dh = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))scan_drive_thread,in,0,NULL);
+                drive_threads[drive_count++] = (HANDLE)dh;
             }
         }
     } else {
@@ -935,7 +938,8 @@ int wmain(int argc, wchar_t** argv){
             struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = (struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; }*)malloc(sizeof(*in));
             wcscpy_s(in->root, 8, args.rootPath);
             in->ctx=&ctx; in->use_ntfs=args.use_ntfs; in->threads=args.threads;
-            drive_threads[drive_count++] = CreateThread(NULL,0,scan_drive_thread,in,0,NULL);
+            uintptr_t dh = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))scan_drive_thread,in,0,NULL);
+            drive_threads[drive_count++] = (HANDLE)dh;
         }
     }
 

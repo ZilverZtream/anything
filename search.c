@@ -2,6 +2,7 @@
 // search.c — fast query using trigram index + filters
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include <process.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -108,7 +109,8 @@ static void parallel_search(Query* q, Result* results){
     };
     HANDLE threads[3];
     for(int i=0;i<3;i++){
-        threads[i] = CreateThread(NULL, 0, search_thread, &tasks[i], 0, NULL);
+        uintptr_t h = _beginthreadex(NULL, 0, (unsigned (__stdcall *)(void*))search_thread, &tasks[i], 0, NULL);
+        threads[i] = (HANDLE)h;
     }
     WaitForMultipleObjects(3, threads, TRUE, INFINITE);
     for(int i=0;i<3;i++){
@@ -1133,7 +1135,8 @@ int wmain(int argc, wchar_t** argv){
         fa[ti].total_docs = total_docs;
         fa[ti].docs_with_term = docs_with_term;
         to_utf8(dbPath, fa[ti].db_path, sizeof(fa[ti].db_path));
-        th[ti] = CreateThread(NULL,0,filter_worker_thread,&fa[ti],0,NULL);
+        uintptr_t h = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))filter_worker_thread,&fa[ti],0,NULL);
+        th[ti] = (HANDLE)h;
     }
     WaitForMultipleObjects(tcount, th, TRUE, INFINITE);
     for(int ti=0; ti<tcount; ++ti) CloseHandle(th[ti]);

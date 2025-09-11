@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <process.h>
 #include "anything.h"
 #include "util.h"
 
@@ -117,7 +118,8 @@ GenericScanner* GenericScanner_Start(const wchar_t* rootPath, int threads, MPMCQ
     for(int i=0;i<threads;i++){
         ThreadBundle* tb = (ThreadBundle*)malloc(sizeof(ThreadBundle));
         tb->s = s; tb->idx = i;
-        s->workers[i] = CreateThread(NULL,0,worker2,tb,0,NULL);
+        uintptr_t h = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))worker2,tb,0,NULL);
+        s->workers[i] = (HANDLE)h;
     }
     return s;
 }
