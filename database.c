@@ -112,6 +112,7 @@ typedef struct {
     size_t   map_max;
     HANDLE   bloom_file;
     uint64_t bloom_offset;
+    BOOL     dirty;
     DbHeader header_cache;
     IndexLoadState load_state;
 } DbImpl;
@@ -237,6 +238,8 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
     DbHeader hdr = {0};
     hdr.created_time = hdr.updated_time = now_filetime();
     hdr.map_size_bytes = d->map_init;
+    hdr.generation = 0;
+    hdr.journal_seq = 0;
     MDB_val k,v; const char* H="header"; to_mdb_val(H, strlen(H), &k); to_mdb_val(&hdr, sizeof(hdr), &v);
     if((rc = mdb_put(txn, d->dbi_meta, &k, &v, 0))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
     if((rc = mdb_txn_commit(txn))){ set_mdb_error(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
@@ -326,13 +329,20 @@ BOOL db_begin_write(Db* db_){
 BOOL db_commit_write(Db* db_){
     DbImpl* d = (DbImpl*)db_;
     if(!d->wtxn) return TRUE;
+    if(d->dirty){
+        d->header_cache.generation++;
+        d->header_cache.updated_time = now_filetime();
+        MDB_val mk,mv; const char* H="header"; to_mdb_val(H, strlen(H), &mk);
+        to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
+        mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
+    }
     int rc = mdb_txn_commit(d->wtxn);
     if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     d->wtxn = NULL;
     if(rc==0){
-        d->header_cache.updated_time = now_filetime();
         d->header_cache.map_size_bytes = db_current_mapsize(db_);
         mdb_env_sync(d->env, 1);
+        d->dirty = FALSE;
     }
     return rc==0;
 }
@@ -557,6 +567,7 @@ BOOL db_set_index_state(Db* db_, const IndexState* st){
 BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
     DbImpl* d = (DbImpl*)db_;
     if(!d->wtxn){ if(!db_begin_write(db_)) return FALSE; }
+    d->dirty = TRUE;
     int rc = 0;
     for(size_t i=0;i<count;i++){
         const DbRecord* r = &recs[i];
@@ -732,6 +743,7 @@ static BOOL db_delete_record(DbImpl* d, uint64_t id, const DbRecord* r){
 BOOL db_delete_path(Db* db_, const wchar_t* parent, const wchar_t* name){
     DbImpl* d = (DbImpl*)db_;
     if(!d->wtxn){ if(!db_begin_write(db_)) return FALSE; }
+    d->dirty = TRUE;
     uint64_t parent_id = db_intern_wstring(db_, parent);
     uint64_t name_id   = db_intern_wstring(db_, name);
     if(!parent_id || !name_id) return TRUE;
