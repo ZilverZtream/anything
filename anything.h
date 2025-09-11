@@ -117,6 +117,7 @@ typedef struct LiveUpdate {
     wchar_t  parent_path[MAX_LONG_PATH];
     wchar_t  name[MAX_PATH];
     uint8_t  op;
+    volatile LONG refcount;
 } LiveUpdate;
 
 void live_updates_init(void);
