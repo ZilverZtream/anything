@@ -1503,12 +1503,17 @@ static void difference_inplace(IdVec* a, const IdVec* b){
 
 // Collect candidate name string_ids via trigram intersection
 static void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const char* term, IdVec* out){
-    size_t len = strlen(term);
-    if(len < 3){
-        // fallback: too short; skip trigram and let filename_index iterate
+    // Restrict the length we process to avoid reading beyond the end of a
+    // malformed input string.
+    size_t len = strnlen(term, DB_BLOOM_MAX_BYTES);
+    if(len < 3 || len == DB_BLOOM_MAX_BYTES){
+        // fallback: too short or invalid; skip trigram and let filename_index iterate
         out->n=0; return;
     }
-    char* tmp=(char*)_malloca(len+1); memcpy(tmp, term, len+1); lowercase_ascii(tmp, len);
+    char* tmp=(char*)_malloca(len+1);
+    memcpy(tmp, term, len);
+    tmp[len]='\0';
+    lowercase_ascii(tmp, len);
     IdVec candidates; idvec_init(&candidates);
     for(size_t i=0;i+3<=len;i++){
         uint32_t key = ((uint8_t)tmp[i]<<16)|((uint8_t)tmp[i+1]<<8)|((uint8_t)tmp[i+2]);
@@ -1702,8 +1707,13 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
     sort_unique(&name_ids);
     if(name_ids.n>0){
         size_t keep=0;
-        size_t tlen=strlen(term);
-        char* tl=_strdup(term); lowercase_ascii(tl,tlen);
+        size_t tlen=strnlen(term, DB_BLOOM_MAX_BYTES);
+        if(tlen == DB_BLOOM_MAX_BYTES) { idvec_free(&name_ids); return; }
+        char* tl=(char*)malloc(tlen+1);
+        if(!tl){ idvec_free(&name_ids); return; }
+        memcpy(tl, term, tlen);
+        tl[tlen]='\0';
+        lowercase_ascii(tl,tlen);
         uint32_t hbuf[4096]; size_t hn=0;
         size_t limit = tlen > DB_BLOOM_MAX_BYTES ? DB_BLOOM_MAX_BYTES : tlen;
         size_t full = limit < DB_BLOOM_STRIDE_AFTER ? limit : DB_BLOOM_STRIDE_AFTER;
@@ -1746,9 +1756,15 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
     } else {
         MDB_cursor* cs=NULL; mdb_cursor_open(txn, dbi_strings,&cs);
         MDB_val sk,sv; int rc=mdb_cursor_get(cs,&sk,&sv,MDB_FIRST);
-        char* npat=_strdup(term); lowercase_ascii(npat,strlen(npat));
+        size_t npat_len = strnlen(term, DB_BLOOM_MAX_BYTES);
+        if(npat_len == DB_BLOOM_MAX_BYTES){ mdb_cursor_close(cs); idvec_free(&name_ids); return; }
+        char* npat=(char*)malloc(npat_len+1);
+        if(!npat){ mdb_cursor_close(cs); idvec_free(&name_ids); return; }
+        memcpy(npat, term, npat_len);
+        npat[npat_len]='\0';
+        lowercase_ascii(npat,npat_len);
         for(size_t j=0;npat[j];++j){ if(npat[j]=='_'||npat[j]=='-') npat[j]=' '; }
-        int maxd=(int)((strlen(npat)+4)/5);
+        int maxd=(int)((npat_len+4)/5);
         while(rc==0){
             uint64_t sid=*(uint64_t*)sk.mv_data;
             char* name=(char*)sv.mv_data; size_t nlen=sv.mv_size;

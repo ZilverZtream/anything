@@ -493,8 +493,16 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
 // ---- Trigram helpers ----
 
 static void extract_trigrams(const char* text, uint32_t** out_tris, size_t* out_count){
-    size_t len = strlen(text);
-    if(len < 3){ *out_tris = NULL; *out_count = 0; return; }
+    // Limit the amount of data we look at to avoid reading past the end of a
+    // malformed or extremely long string.  This mirrors the bloom filter limit
+    // used elsewhere in the codebase.
+    size_t len = strnlen(text, DB_BLOOM_MAX_BYTES);
+    if(len < 3 || len == DB_BLOOM_MAX_BYTES){
+        *out_tris = NULL;
+        *out_count = 0;
+        return;
+    }
+
     size_t need = len - 2;
     static uint32_t* pool = NULL;
     static size_t pool_cap = 0;
@@ -503,17 +511,20 @@ static void extract_trigrams(const char* text, uint32_t** out_tris, size_t* out_
         if(!nb){ *out_tris = NULL; *out_count = 0; return; }
         pool = nb; pool_cap = need;
     }
+
 #if defined(__SSE4_1__)
     size_t i = 0;
-    size_t simd_end = (len >= 16) ? len - 16 : 0;
-    for(; i <= simd_end; i += 4){
-        __m128i bytes = _mm_loadu_si128((const __m128i*)(text + i));
-        __m128i b0 = _mm_cvtepu8_epi32(bytes);
-        __m128i b1 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes,1));
-        __m128i b2 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes,2));
-        __m128i t  = _mm_or_si128(_mm_slli_epi32(b0,16),
-                          _mm_or_si128(_mm_slli_epi32(b1,8), b2));
-        _mm_storeu_si128((__m128i*)(pool + i), t);
+    if(len >= 16){
+        size_t simd_end = len - 16;
+        for(; i <= simd_end; i += 4){
+            __m128i bytes = _mm_loadu_si128((const __m128i*)(text + i));
+            __m128i b0 = _mm_cvtepu8_epi32(bytes);
+            __m128i b1 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes,1));
+            __m128i b2 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes,2));
+            __m128i t  = _mm_or_si128(_mm_slli_epi32(b0,16),
+                              _mm_or_si128(_mm_slli_epi32(b1,8), b2));
+            _mm_storeu_si128((__m128i*)(pool + i), t);
+        }
     }
     for(; i < need; ++i){
         pool[i] = ((uint8_t)text[i]<<16)|((uint8_t)text[i+1]<<8)|((uint8_t)text[i+2]);
