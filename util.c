@@ -322,8 +322,15 @@ void compute_drive_signature(const wchar_t* drive, uint8_t sig[32]){
     }
     char vol_utf8[128];
     to_utf8(vol, vol_utf8, sizeof(vol_utf8));
+    char vol_safe[64];
+#ifdef _MSC_VER
+    strncpy_s(vol_safe, sizeof(vol_safe), vol_utf8, _TRUNCATE);
+#else
+    strncpy(vol_safe, vol_utf8, sizeof(vol_safe) - 1);
+    vol_safe[sizeof(vol_safe) - 1] = 0;
+#endif
     char data[256];
-    sprintf_s(data, sizeof(data), "%08X:%s:%llu", serial, vol_utf8, totalb.QuadPart);
+    sprintf_s(data, sizeof(data), "%08X:%s:%llu", serial, vol_safe, totalb.QuadPart);
     uint64_t h1 = hash64(data, strlen(data));
     uint64_t h2 = hash64(&h1, sizeof(h1));
     uint64_t h3 = hash64(&h2, sizeof(h2));
