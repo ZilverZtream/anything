@@ -1733,7 +1733,7 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
             MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
             if(mdb_get(txn, dbi_smeta,&k,&v)!=0 || v.mv_size<sizeof(StringMeta)) continue;
             const StringMeta* sm = (const StringMeta*)v.mv_data;
-            if(sm->bloom_offset + 8192 > g_bloom_size) continue;
+            if(sm->bloom_offset >= g_bloom_size || g_bloom_size - sm->bloom_offset < 8192) continue;
             const uint8_t* bloom = bloom_readonly_base + sm->bloom_offset;
             BOOL ok=TRUE;
             for(size_t j=0;j<hn;j++){
