@@ -91,6 +91,8 @@ typedef struct DbHeader {
     uint64_t created_time;
     uint64_t updated_time;
     uint64_t map_size_bytes;
+    uint64_t generation;
+    uint64_t journal_seq;
 } DbHeader;
 
 typedef struct DbWorkItem {

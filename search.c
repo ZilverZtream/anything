@@ -162,12 +162,12 @@ static const uint8_t* bloom_readonly_base = NULL;
 static size_t g_bloom_size = 0;
 // Global database path for caching term results
 static wchar_t g_db_path[MAX_PATH]={0};
-static uint64_t g_db_updated_time = 0;
+static uint64_t g_db_generation = 0;
 
 // Magic marker and version for cache files so we can detect incompatible
 // formats and upgrade transparently.
 #define CACHE_MAGIC   0xCACEF00D
-#define CACHE_VERSION 1
+#define CACHE_VERSION 2
 static BOOL open_bloom(const wchar_t* dbPath){
     wchar_t bp[MAX_PATH]; swprintf(bp, MAX_PATH, L"%s\\bloom.dat", dbPath);
     HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -593,11 +593,12 @@ static void idvec_free(IdVec* v){ free(v->ids); v->ids=NULL; v->n=v->cap=0; }
 // Result cache — last query & rec_ids
 typedef struct {
     uint32_t magic;
-    uint32_t version;
+    uint16_t version;
+    uint16_t pad;
+    uint64_t generation;
+    uint64_t bloom_size;
     uint64_t sig;
     uint32_t count;
-    uint64_t updated_time;
-    uint64_t bloom_size;
     // followed by rec_ids[count]
 } CacheHeader;
 
@@ -658,7 +659,7 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     if(h->magic == CACHE_MAGIC &&
        h->version == CACHE_VERSION &&
        h->sig == sig &&
-       h->updated_time == g_db_updated_time &&
+       h->generation == g_db_generation &&
        h->bloom_size == g_bloom_size &&
        sz >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
         out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
@@ -683,10 +684,11 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     CacheHeader* h = (CacheHeader*)base;
     h->magic = CACHE_MAGIC;
     h->version = CACHE_VERSION;
+    h->pad = 0;
+    h->generation = g_db_generation;
+    h->bloom_size = g_bloom_size;
     h->sig = hash64(qstr, strlen(qstr));
     h->count = (uint32_t)ids->n;
-    h->updated_time = g_db_updated_time;
-    h->bloom_size = g_bloom_size;
     memcpy(base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
     prune_cache_dir(cachePath);
@@ -731,7 +733,7 @@ static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
     if(h->magic == CACHE_MAGIC &&
        h->version == CACHE_VERSION &&
        h->sig == sig &&
-       h->updated_time == g_db_updated_time &&
+       h->generation == g_db_generation &&
        h->bloom_size == g_bloom_size &&
        sz >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
         out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
@@ -762,10 +764,11 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     CacheHeader* h = (CacheHeader*)base;
     h->magic = CACHE_MAGIC;
     h->version = CACHE_VERSION;
+    h->pad = 0;
+    h->generation = g_db_generation;
+    h->bloom_size = g_bloom_size;
     h->sig = sig;
     h->count = (uint32_t)ids->n;
-    h->updated_time = g_db_updated_time;
-    h->bloom_size = g_bloom_size;
     memcpy(base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
     prune_cache_dir(cachePath);
@@ -1394,7 +1397,7 @@ int wmain(int argc, wchar_t** argv){
     Db* hdr_db = NULL;
     const DbHeader* hdr = db_open_readonly(dbPath, &hdr_db);
     if(!hdr){ output_error(json_output, "db open failed"); free_search_query(&q); tokenlist_free(&tokens); return 1; }
-    g_db_updated_time = hdr->updated_time;
+    g_db_generation = hdr->generation;
     db_close(hdr_db);
     if(!open_bloom(dbPath)){ output_error(json_output, "bloom open failed"); free_search_query(&q); tokenlist_free(&tokens); return 1; }
 
