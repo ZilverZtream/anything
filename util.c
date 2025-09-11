@@ -525,6 +525,7 @@ typedef struct {
     size_t remaining;
     uint8_t* item;
     BOOL loaded;
+    wchar_t path[MAX_PATH];
 } SortChunk;
 
 static void heap_push(size_t* heap, size_t* heap_size, size_t idx,
@@ -599,6 +600,10 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
         chunks[chunks_n].remaining=m;
         chunks[chunks_n].item=(uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
         chunks[chunks_n].loaded=FALSE;
+        chunks[chunks_n].path[0]=0;
+        if(wcscpy_s(chunks[chunks_n].path, MAX_PATH, file)!=0){
+            CloseHandle(h); goto fail;
+        }
         chunks_n++;
         offset += m;
     }
@@ -629,16 +634,25 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
                 heap_push(heap, &heap_sz, best, chunks, cmp);
             } else {
                 chunks[best].loaded=FALSE;
+                CloseHandle(chunks[best].h);
+                chunks[best].h = INVALID_HANDLE_VALUE;
+                DeleteFileW(chunks[best].path);
+                chunks[best].path[0] = 0;
             }
         } else {
             chunks[best].loaded=FALSE;
+            CloseHandle(chunks[best].h);
+            chunks[best].h = INVALID_HANDLE_VALUE;
+            DeleteFileW(chunks[best].path);
+            chunks[best].path[0] = 0;
         }
     }
     free(heap);
 
     for(size_t i=0;i<chunks_n;i++){
         if(chunks[i].item) VirtualFree(chunks[i].item,0,MEM_RELEASE);
-        CloseHandle(chunks[i].h);
+        if(chunks[i].h!=INVALID_HANDLE_VALUE) CloseHandle(chunks[i].h);
+        if(chunks[i].path[0]) DeleteFileW(chunks[i].path);
     }
     free(chunks);
     return TRUE;
@@ -648,6 +662,7 @@ fail:
         for(size_t i=0;i<chunks_n;i++){
             if(chunks[i].item) VirtualFree(chunks[i].item,0,MEM_RELEASE);
             if(chunks[i].h!=INVALID_HANDLE_VALUE) CloseHandle(chunks[i].h);
+            if(chunks[i].path[0]) DeleteFileW(chunks[i].path);
         }
     }
     free(chunks);
