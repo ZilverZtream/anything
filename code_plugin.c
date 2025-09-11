@@ -178,7 +178,7 @@ static wchar_t* parse_file(const wchar_t* path){
     if(!out){ free(data); return NULL; }
     out[0]=0;
 
-    char* ctx=NULL;
+    char* ctx = NULL;
 #ifdef _WIN32
     char* line = strtok_s(data, "\n\r", &ctx);
 #else
