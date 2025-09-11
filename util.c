@@ -518,6 +518,44 @@ typedef struct {
     BOOL loaded;
 } SortChunk;
 
+static void heap_push(size_t* heap, size_t* heap_size, size_t idx,
+                      SortChunk* chunks,
+                      int (*cmp)(const void*, const void*)){
+    size_t i = (*heap_size)++;
+    heap[i] = idx;
+    while(i>0){
+        size_t p = (i-1)/2;
+        if(cmp(chunks[heap[i]].item, chunks[heap[p]].item) < 0){
+            size_t tmp = heap[i];
+            heap[i] = heap[p];
+            heap[p] = tmp;
+            i = p;
+        } else break;
+    }
+}
+
+static size_t heap_pop(size_t* heap, size_t* heap_size, SortChunk* chunks,
+                       int (*cmp)(const void*, const void*)){
+    size_t result = heap[0];
+    heap[0] = heap[--(*heap_size)];
+    size_t i = 0;
+    while(TRUE){
+        size_t l = 2*i + 1;
+        size_t r = 2*i + 2;
+        if(l >= *heap_size) break;
+        size_t m = l;
+        if(r < *heap_size && cmp(chunks[heap[r]].item, chunks[heap[l]].item) < 0)
+            m = r;
+        if(cmp(chunks[heap[m]].item, chunks[heap[i]].item) < 0){
+            size_t tmp = heap[i];
+            heap[i] = heap[m];
+            heap[m] = tmp;
+            i = m;
+        } else break;
+    }
+    return result;
+}
+
 BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
                    int (*cmp)(const void*, const void*)){
     if(!base || !cmp || size==0) return FALSE;
@@ -563,21 +601,23 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
         }
     }
 
+    size_t* heap = (size_t*)malloc(chunks_n * sizeof(size_t));
+    if(!heap) goto fail;
+    size_t heap_sz = 0;
+    for(size_t i=0;i<chunks_n;i++){
+        if(chunks[i].loaded) heap_push(heap, &heap_sz, i, chunks, cmp);
+    }
+
     size_t out_idx=0;
-    while(TRUE){
-        int best=-1;
-        for(size_t i=0;i<chunks_n;i++){
-            if(chunks[i].loaded){
-                if(best==-1 || cmp(chunks[i].item, chunks[best].item)<0) best=(int)i;
-            }
-        }
-        if(best==-1) break;
+    while(heap_sz>0){
+        size_t best = heap_pop(heap, &heap_sz, chunks, cmp);
         memcpy((uint8_t*)base + out_idx*size, chunks[best].item, size);
         out_idx++;
         if(chunks[best].remaining>0){
             DWORD rd=0;
             if(ReadFile(chunks[best].h, chunks[best].item, (DWORD)size, &rd, NULL) && rd==size){
                 chunks[best].remaining--; chunks[best].loaded=TRUE;
+                heap_push(heap, &heap_sz, best, chunks, cmp);
             } else {
                 chunks[best].loaded=FALSE;
             }
@@ -585,6 +625,7 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
             chunks[best].loaded=FALSE;
         }
     }
+    free(heap);
 
     for(size_t i=0;i<chunks_n;i++){
         if(chunks[i].item) VirtualFree(chunks[i].item,0,MEM_RELEASE);
@@ -593,6 +634,7 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
     free(chunks);
     return TRUE;
 fail:
+    if(heap) free(heap);
     if(chunks){
         for(size_t i=0;i<chunks_n;i++){
             if(chunks[i].item) VirtualFree(chunks[i].item,0,MEM_RELEASE);
