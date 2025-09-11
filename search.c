@@ -1006,6 +1006,117 @@ static void traditional_intersect(IdVec* a, const IdVec* b){
     a->n=w;
 }
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
+#include <immintrin.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+static int cpu_has_avx2(void){
+#if defined(__GNUC__)
+    return __builtin_cpu_supports("avx2");
+#elif defined(_MSC_VER)
+    int info[4]; __cpuid(info, 0); if(info[0] >= 7){ __cpuidex(info,7,0); return (info[1] & (1<<5)) != 0; } return 0;
+#else
+    return 0;
+#endif
+}
+static void intersect_avx2(IdVec* a, const IdVec* b){
+#if defined(__AVX2__)
+    size_t i=0,j=0,w=0;
+    while(i<a->n && j<b->n){
+        if(j+4<=b->n){
+            __m256i bx=_mm256_loadu_si256((const __m256i*)(b->ids+j));
+            __m256i xx=_mm256_set1_epi64x(a->ids[i]);
+            __m256i cmp=_mm256_cmpeq_epi64(xx,bx);
+            int mask=_mm256_movemask_pd(_mm256_castsi256_pd(cmp));
+            if(mask){
+                int lane=__builtin_ctz(mask);
+                a->ids[w++]=a->ids[i++];
+                j += lane+1;
+                continue;
+            }
+            if(a->ids[i] > b->ids[j+3]){ j+=4; continue; }
+        }
+        uint64_t x=a->ids[i], y=b->ids[j];
+        if(x==y){ a->ids[w++]=x; i++; j++; }
+        else if(x<y) i++;
+        else j++;
+    }
+    a->n=w;
+#else
+    traditional_intersect(a,b);
+#endif
+}
+#else
+static int cpu_has_avx2(void){ return 0; }
+static void intersect_avx2(IdVec* a, const IdVec* b){ traditional_intersect(a,b); }
+#endif
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#if defined(__linux__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#endif
+static int cpu_has_neon(void){
+#if defined(__aarch64__)
+    return 1;
+#elif defined(__linux__)
+    return (getauxval(AT_HWCAP) & HWCAP_NEON) != 0;
+#else
+    return 0;
+#endif
+}
+static void intersect_neon(IdVec* a, const IdVec* b){
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    size_t i=0,j=0,w=0;
+    while(i<a->n && j<b->n){
+        if(j+2<=b->n){
+            uint64x2_t bv=vld1q_u64(b->ids+j);
+            uint64x2_t xv=vdupq_n_u64(a->ids[i]);
+            uint64x2_t cmp=vceqq_u64(xv,bv);
+            uint64_t m0=vgetq_lane_u64(cmp,0);
+            uint64_t m1=vgetq_lane_u64(cmp,1);
+            if(m0){
+                a->ids[w++]=a->ids[i++];
+                j+=1;
+                continue;
+            }
+            if(m1){
+                a->ids[w++]=a->ids[i++];
+                j+=2;
+                continue;
+            }
+            if(a->ids[i] > b->ids[j+1]){ j+=2; continue; }
+        }
+        uint64_t x=a->ids[i], y=b->ids[j];
+        if(x==y){ a->ids[w++]=x; i++; j++; }
+        else if(x<y) i++;
+        else j++;
+    }
+    a->n=w;
+#else
+    traditional_intersect(a,b);
+#endif
+}
+#else
+static int cpu_has_neon(void){ return 0; }
+static void intersect_neon(IdVec* a, const IdVec* b){ traditional_intersect(a,b); }
+#endif
+
+static void simd_intersect(IdVec* a, const IdVec* b){
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
+    static int use_avx2=-1;
+    if(use_avx2==-1) use_avx2=cpu_has_avx2();
+    if(use_avx2){ intersect_avx2(a,b); return; }
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    static int use_neon=-1;
+    if(use_neon==-1) use_neon=cpu_has_neon();
+    if(use_neon){ intersect_neon(a,b); return; }
+#endif
+    traditional_intersect(a,b);
+}
+
 static void galloping_intersect(IdVec* a, const IdVec* b){
     if(a->n==0 || b->n==0){ a->n=0; return; }
     if(a->n * 8 < b->n){
@@ -1016,7 +1127,7 @@ static void galloping_intersect(IdVec* a, const IdVec* b){
         }
         a->n=w;
     } else {
-        traditional_intersect(a, b);
+        simd_intersect(a, b);
     }
 }
 
