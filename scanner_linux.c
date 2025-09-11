@@ -25,7 +25,7 @@ struct FileScanner {
     int inotify_fd;
     pthread_t thread;
     MPMCQueue* outq;
-    HANDLE cancel;
+    CancelToken* cancel;
     char root[PATH_MAX];
     BOOL is_network;
     NetworkScanner* net;
@@ -112,8 +112,8 @@ static void* thread_proc(void* arg){
     return NULL;
 }
 
-FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent){
-    (void)threads; (void)cancelEvent;
+FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, CancelToken* cancelToken){
+    (void)threads; (void)cancelToken;
     char tmp[PATH_MAX];
     wcstombs(tmp, rootPath, PATH_MAX);
 #if !defined(__ANDROID__)
@@ -123,7 +123,7 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
             FileScanner* s = (FileScanner*)calloc(1, sizeof(FileScanner));
             if(!s) return NULL;
             s->is_network = TRUE;
-            s->net = NetworkScanner_Start(rootPath, threads, outQueue, cancelEvent);
+            s->net = NetworkScanner_Start(rootPath, threads, outQueue, cancelToken);
             if(!s->net){ free(s); return NULL; }
             return s;
         }
@@ -133,7 +133,7 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
     if(!s) return NULL;
     wcstombs(s->root, rootPath, PATH_MAX);
     s->outq = outQueue;
-    s->cancel = cancelEvent;
+    s->cancel = cancelToken;
     s->inotify_fd = inotify_init1(0);
     if(s->inotify_fd < 0){ free(s); return NULL; }
     inotify_add_watch(s->inotify_fd, s->root, IN_CREATE|IN_MODIFY|IN_DELETE|IN_MOVED_TO|IN_MOVED_FROM);

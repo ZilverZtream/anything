@@ -14,8 +14,6 @@
 #include <windows.h>
 #else
 #include <unistd.h>
-#define WAIT_OBJECT_0 0
-static int WaitForSingleObject(HANDLE h,unsigned int ms){(void)h;(void)ms;return 1;}
 #define Sleep(ms) usleep((ms)*1000)
 static int wcscpy_s(wchar_t* dst,size_t dstcch,const wchar_t* src){
     if(!dst||!src||dstcch==0) return 1; wcsncpy(dst,src,dstcch); dst[dstcch-1]=0; return 0;
@@ -134,7 +132,7 @@ static void process_record(cJSON* rec){
     wi->attributes=0; wi->stage=INDEX_FULL_CONTENT; wi->op=WI_ADD;
     wi->content=wcontent; wi->preview=NULL; wi->clone_id=0;
     int tries=0; while(!MPMC_Push(g_host.queue,wi)){
-        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){ if(wcontent) free(wcontent); wi_free(wi); return; }
+        if(is_cancelled(g_host.cancel_token) || tries++>1000){ if(wcontent) free(wcontent); wi_free(wi); return; }
         Sleep(0);
     }
 }
@@ -161,7 +159,7 @@ static void scan(void){
     }
     cJSON* recs=cJSON_GetObjectItemCaseSensitive(root,"records");
     if(cJSON_IsArray(recs)){
-        cJSON* r=NULL; cJSON_ArrayForEach(r,recs){ if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break; if(cJSON_IsObject(r)) process_record(r); }
+        cJSON* r=NULL; cJSON_ArrayForEach(r,recs){ if(is_cancelled(g_host.cancel_token)) break; if(cJSON_IsObject(r)) process_record(r); }
     }
 
 cleanup:

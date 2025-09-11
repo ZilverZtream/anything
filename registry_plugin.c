@@ -42,7 +42,7 @@ static void push_item(const wchar_t* parent, const wchar_t* name, const wchar_t*
 
     int tries = 0;
     while(!MPMC_Push(g_host.queue, wi)){
-        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
+        if(is_cancelled(g_host.cancel_token) || tries++>1000){
             if(wi->content) free(wi->content);
             aligned_free(wi);
             return;
@@ -52,7 +52,7 @@ static void push_item(const wchar_t* parent, const wchar_t* name, const wchar_t*
 }
 
 static void scan_key(HKEY key, const wchar_t* path){
-    if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) return;
+    if(is_cancelled(g_host.cancel_token)) return;
 
     DWORD val_count=0, max_val_name=0, max_val_len=0;
     if(RegQueryInfoKeyW(key,NULL,NULL,NULL,NULL,NULL,NULL,&val_count,&max_val_name,&max_val_len,NULL,NULL)!=ERROR_SUCCESS){

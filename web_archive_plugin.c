@@ -28,8 +28,6 @@
 char* strdup(const char*);
 int posix_memalign(void**, size_t, size_t);
 int usleep(unsigned int);
-#define WAIT_OBJECT_0 0
-static int WaitForSingleObject(HANDLE h, unsigned int ms){(void)h;(void)ms;return 1;}
 #define Sleep(ms) usleep((ms)*1000)
 static int wcscpy_s(wchar_t* dst,size_t dstcch,const wchar_t* src){if(!dst||!src||dstcch==0) return 1; wcsncpy(dst,src,dstcch); dst[dstcch-1]=0; return 0;}
 #endif
@@ -214,7 +212,7 @@ static void push_page(const char* url,const char* title,const char* text){
     if(text){ size_t wlen=mbstowcs(NULL,text,0); if(wlen!=(size_t)-1){ wcontent=(wchar_t*)malloc((wlen+1)*sizeof(wchar_t)); if(wcontent) mbstowcs(wcontent,text,wlen+1); } }
     wi->content=wcontent;
     int tries=0; while(!MPMC_Push(g_host.queue,wi)){
-        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){ if(wcontent) free(wcontent); wi_free(wi); return; }
+        if(is_cancelled(g_host.cancel_token) || tries++>1000){ if(wcontent) free(wcontent); wi_free(wi); return; }
         Sleep(0); }
 }
 
@@ -241,7 +239,7 @@ static void scan_chromium_variant(const char* hist,const char* bm){
                 const unsigned char* u=sqlite3_column_text(stmt,0);
                 const unsigned char* t=sqlite3_column_text(stmt,1);
                 process_url((const char*)u,(const char*)t);
-                if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+                if(is_cancelled(g_host.cancel_token)) break;
             }
             sqlite3_finalize(stmt);
         }
@@ -346,7 +344,7 @@ static void scan_opera_gx(void){
 static void scan_firefox_db(const char* path){
     sqlite3* db=NULL; if(sqlite3_open(path,&db)!=SQLITE_OK) return; const char* sql="SELECT url,title FROM moz_places";
     sqlite3_stmt* stmt=NULL; if(sqlite3_prepare_v2(db,sql,-1,&stmt,NULL)==SQLITE_OK){
-        while(sqlite3_step(stmt)==SQLITE_ROW){ const unsigned char* u=sqlite3_column_text(stmt,0); const unsigned char* t=sqlite3_column_text(stmt,1); process_url((const char*)u,(const char*)t); if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break; }
+        while(sqlite3_step(stmt)==SQLITE_ROW){ const unsigned char* u=sqlite3_column_text(stmt,0); const unsigned char* t=sqlite3_column_text(stmt,1); process_url((const char*)u,(const char*)t); if(is_cancelled(g_host.cancel_token)) break; }
         sqlite3_finalize(stmt); }
     sqlite3_close(db);
 }
@@ -386,7 +384,7 @@ static void parse_safari_bookmarks(const char* path){
 
 static void scan_safari(void){
     const char* home=getenv("HOME"); if(!home) return; char hist[PATH_MAX]; snprintf(hist,sizeof(hist),"%s/Library/Safari/History.db",home);
-    sqlite3* db=NULL; if(sqlite3_open(hist,&db)==SQLITE_OK){ const char* sql="SELECT url,title FROM history_items"; sqlite3_stmt* stmt=NULL; if(sqlite3_prepare_v2(db,sql,-1,&stmt,NULL)==SQLITE_OK){ while(sqlite3_step(stmt)==SQLITE_ROW){ const unsigned char* u=sqlite3_column_text(stmt,0); const unsigned char* t=sqlite3_column_text(stmt,1); process_url((const char*)u,(const char*)t); if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break; } sqlite3_finalize(stmt); } sqlite3_close(db); }
+    sqlite3* db=NULL; if(sqlite3_open(hist,&db)==SQLITE_OK){ const char* sql="SELECT url,title FROM history_items"; sqlite3_stmt* stmt=NULL; if(sqlite3_prepare_v2(db,sql,-1,&stmt,NULL)==SQLITE_OK){ while(sqlite3_step(stmt)==SQLITE_ROW){ const unsigned char* u=sqlite3_column_text(stmt,0); const unsigned char* t=sqlite3_column_text(stmt,1); process_url((const char*)u,(const char*)t); if(is_cancelled(g_host.cancel_token)) break; } sqlite3_finalize(stmt); } sqlite3_close(db); }
     char bm[PATH_MAX]; snprintf(bm,sizeof(bm),"%s/Library/Safari/Bookmarks.plist",home); parse_safari_bookmarks(bm);
 }
 #endif

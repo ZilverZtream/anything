@@ -14,8 +14,6 @@
 #include <windows.h>
 #else
 #include <unistd.h>
-#define WAIT_OBJECT_0 0
-static int WaitForSingleObject(HANDLE h, unsigned int ms){(void)h;(void)ms;return 1;}
 #define Sleep(ms) usleep((ms)*1000)
 static int wcscpy_s(wchar_t* dst,size_t dstcch,const wchar_t* src){
     if(!dst||!src||dstcch==0) return 1; wcsncpy(dst,src,dstcch); dst[dstcch-1]=0; return 0;
@@ -149,7 +147,7 @@ static void process_message(const char* id, const char* token_utf8){
     wi->attributes=0; wi->stage=INDEX_FULL_CONTENT; wi->op=WI_ADD;
     wi->content=wcontent; wi->preview=NULL; wi->clone_id=0;
     int tries=0; while(!MPMC_Push(g_host.queue,wi)){
-        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
+        if(is_cancelled(g_host.cancel_token) || tries++>1000){
             goto cleanup;
         }
         Sleep(0);
@@ -187,7 +185,7 @@ static void scan(void){
         cJSON* m=NULL; cJSON_ArrayForEach(m,msgs){
             cJSON* id=cJSON_GetObjectItem(m,"id");
             if(cJSON_IsString(id)) process_message(id->valuestring,token_utf8);
-            if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+            if(is_cancelled(g_host.cancel_token)) break;
         }
     }
 
