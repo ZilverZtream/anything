@@ -366,9 +366,21 @@ BOOL db_compress(Db* db_, const wchar_t* out_path){
 }
 
 // String interning helpers
-static BOOL str_by_id(DbImpl* d, MDB_txn* txn, uint64_t id, MDB_val* out){
-    MDB_val k; k.mv_data = &id; k.mv_size = sizeof(id);
-    return mdb_get(txn, d->dbi_strings, &k, out)==0;
+static BOOL str_by_id_with_retry(DbImpl* d, uint64_t id, MDB_val* out, int max_retries){
+    MDB_val key; key.mv_data = &id; key.mv_size = sizeof(id);
+    if(d->wtxn){
+        return mdb_get(d->wtxn, d->dbi_strings, &key, out) == 0;
+    }
+    for(int i = 0; i < max_retries; ++i){
+        MDB_txn* txn;
+        if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &txn) == 0){
+            int rc = mdb_get(txn, d->dbi_strings, &key, out);
+            mdb_txn_abort(txn);
+            if(rc == 0) return TRUE;
+        }
+        Sleep(1 << i);
+    }
+    return FALSE;
 }
 
 uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
@@ -607,7 +619,7 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
         // extension_index & trigrams from name
         // Fetch UTF-8 name by id
         MDB_val namev;
-        if(str_by_id(d, d->wtxn, r->name_str_id, &namev)){
+        if(str_by_id_with_retry(d, r->name_str_id, &namev, 5)){
             // ensure bloom meta exists
             MDB_val mk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, mv;
             if(mdb_get(d->wtxn, d->dbi_string_meta, &mk, &mv)!=0){
@@ -633,7 +645,7 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
             rc = mdb_put(d->wtxn, d->dbi_content_index, &ck, &cv, MDB_NODUPDATA);
             if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d,rc); return FALSE; }
             MDB_val cvstr;
-            if(str_by_id(d, d->wtxn, r->content_str_id, &cvstr)){
+            if(str_by_id_with_retry(d, r->content_str_id, &cvstr, 5)){
                 MDB_val mk={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, mv;
                 if(mdb_get(d->wtxn, d->dbi_string_meta, &mk, &mv)!=0){
                     uint8_t bloom[8192];
@@ -713,7 +725,7 @@ static BOOL db_delete_record(DbImpl* d, uint64_t id, const DbRecord* r){
     mdb_del(d->wtxn, d->dbi_attr_index, &ak, &av);
 
     MDB_val namev;
-    if(str_by_id(d, d->wtxn, r->name_str_id, &namev)){
+    if(str_by_id_with_retry(d, r->name_str_id, &namev, 5)){
         char ext[32]; split_extension_utf8((const char*)namev.mv_data, ext, sizeof(ext));
         if(ext[0]){
             MDB_val ek={.mv_data=ext,.mv_size=strlen(ext)}, ev={.mv_data=&id,.mv_size=sizeof(id)};
@@ -726,7 +738,7 @@ static BOOL db_delete_record(DbImpl* d, uint64_t id, const DbRecord* r){
         MDB_val ck,cv; to_mdb_val(&r->content_str_id, sizeof(r->content_str_id), &ck); to_mdb_val(&id, sizeof(id), &cv);
         mdb_del(d->wtxn, d->dbi_content_index, &ck, &cv);
         MDB_val cvstr;
-        if(str_by_id(d, d->wtxn, r->content_str_id, &cvstr)){
+        if(str_by_id_with_retry(d, r->content_str_id, &cvstr, 5)){
             remove_trigrams(d, (const char*)cvstr.mv_data, r->content_str_id);
         }
     }
