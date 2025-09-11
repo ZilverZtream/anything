@@ -10,6 +10,7 @@
 #include <string.h>
 #include <shlwapi.h>
 #include <immintrin.h>
+#include <limits.h>
 #pragma comment(lib, "shlwapi.lib")
 
 #include "database.h"
@@ -508,6 +509,11 @@ static void extract_trigrams(const char* text, uint32_t** out_tris, size_t* out_
     static uint32_t* pool = NULL;
     static size_t pool_cap = 0;
     if(pool_cap < need){
+        if(need > SIZE_MAX / sizeof(uint32_t)){
+            *out_tris = NULL;
+            *out_count = 0;
+            return;
+        }
         uint32_t* nb = (uint32_t*)realloc(pool, need * sizeof(uint32_t));
         if(!nb){ *out_tris = NULL; *out_count = 0; return; }
         pool = nb; pool_cap = need;

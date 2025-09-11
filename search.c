@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
 #pragma comment(lib, "shlwapi.lib")
 
 #ifndef _WIN32
@@ -805,6 +806,28 @@ typedef struct CacheEntry {
     struct CacheEntry* next;
 } CacheEntry;
 
+static BOOL mul_size(size_t a, size_t b, size_t* out){
+    if(a && b > SIZE_MAX / a) return FALSE;
+    *out = a * b;
+    return TRUE;
+}
+
+static BOOL add_size(size_t a, size_t b, size_t* out){
+    if(a > SIZE_MAX - b) return FALSE;
+    *out = a + b;
+    return TRUE;
+}
+
+static BOOL cache_size(size_t count, size_t* total, size_t* ids_bytes){
+    size_t ids;
+    if(!mul_size(count, sizeof(uint64_t), &ids)) return FALSE;
+    size_t tot;
+    if(!add_size(sizeof(CacheHeader), ids, &tot)) return FALSE;
+    if(total) *total = tot;
+    if(ids_bytes) *ids_bytes = ids;
+    return TRUE;
+}
+
 static int cmp_cache_entry(const void* a, const void* b){
     const CacheEntry* const* x = (const CacheEntry* const*)a;
     const CacheEntry* const* y = (const CacheEntry* const*)b;
@@ -902,17 +925,21 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     if(!base){ CloseHandle(m); CloseHandle(f); return FALSE; }
     const CacheHeader* h = (const CacheHeader*)base;
     BOOL ok = FALSE;
+    size_t need, ids_bytes;
     if(h->magic == CACHE_MAGIC &&
        h->version == CACHE_VERSION &&
        h->sig == sig &&
        h->generation == g_db_generation &&
        h->bloom_size == g_bloom_size &&
        h->count <= CACHE_MAX_ENTRIES &&
-       sz >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
-        out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
-        memcpy(out->ids, base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
-        out->n = h->count; out->cap = h->count;
-        ok = TRUE;
+       cache_size(h->count, &need, &ids_bytes) &&
+       (size_t)sz >= need){
+        out->ids = (uint64_t*)malloc(ids_bytes);
+        if(out->ids){
+            memcpy(out->ids, base+sizeof(CacheHeader), ids_bytes);
+            out->n = h->count; out->cap = h->count;
+            ok = TRUE;
+        }
     }
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
     return ok;
@@ -929,17 +956,21 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     if(base == MAP_FAILED){ close(fd); return FALSE; }
     const CacheHeader* h = (const CacheHeader*)base;
     BOOL ok = FALSE;
+    size_t need, ids_bytes;
     if(h->magic == CACHE_MAGIC &&
        h->version == CACHE_VERSION &&
        h->sig == sig &&
        h->generation == g_db_generation &&
        h->bloom_size == g_bloom_size &&
        h->count <= CACHE_MAX_ENTRIES &&
-       (size_t)st.st_size >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
-        out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
-        memcpy(out->ids, (const uint8_t*)base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
-        out->n = h->count; out->cap = h->count;
-        ok = TRUE;
+       cache_size(h->count, &need, &ids_bytes) &&
+       (size_t)st.st_size >= need){
+        out->ids = (uint64_t*)malloc(ids_bytes);
+        if(out->ids){
+            memcpy(out->ids, (const uint8_t*)base+sizeof(CacheHeader), ids_bytes);
+            out->n = h->count; out->cap = h->count;
+            ok = TRUE;
+        }
     }
     munmap(base, st.st_size); close(fd);
     return ok;
@@ -954,7 +985,9 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
     HANDLE f = CreateFileW(lp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return;
-    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, (DWORD)(sizeof(CacheHeader)+ids->n*sizeof(uint64_t)), NULL);
+    size_t total, ids_bytes;
+    if(!cache_size(ids->n, &total, &ids_bytes) || total > UINT32_MAX){ CloseHandle(f); return; }
+    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, (DWORD)total, NULL);
     if(!m){ CloseHandle(f); return; }
     BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_WRITE, 0,0,0);
     if(!base){ CloseHandle(m); CloseHandle(f); return; }
@@ -966,7 +999,7 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     h->bloom_size = g_bloom_size;
     h->sig = hash64(qstr, strlen(qstr));
     h->count = (uint32_t)ids->n;
-    memcpy(base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
+    memcpy(base+sizeof(CacheHeader), ids->ids, ids_bytes);
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
     prune_cache_dir(cachePath);
 #else
@@ -974,7 +1007,8 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     to_utf8(dbPath, path, sizeof(path));
     char* p = strrchr(path, '/'); if(!p) return;
     snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_%016llx.tmp", (unsigned long long)sig);
-    size_t sz = sizeof(CacheHeader)+ids->n*sizeof(uint64_t);
+    size_t sz, ids_bytes;
+    if(!cache_size(ids->n, &sz, &ids_bytes)) return;
     int fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0666);
     if(fd < 0) return;
     if(ftruncate(fd, (off_t)sz) != 0){ close(fd); return; }
@@ -988,7 +1022,7 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     h->bloom_size = g_bloom_size;
     h->sig = hash64(qstr, strlen(qstr));
     h->count = (uint32_t)ids->n;
-    memcpy((uint8_t*)base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
+    memcpy((uint8_t*)base+sizeof(CacheHeader), ids->ids, ids_bytes);
     msync(base, sz, MS_SYNC);
     munmap(base, sz); close(fd);
     prune_cache_dir(path);
@@ -1033,17 +1067,21 @@ static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
     if(!base){ CloseHandle(m); CloseHandle(f); return FALSE; }
     const CacheHeader* h = (const CacheHeader*)base;
     BOOL ok = FALSE;
+    size_t need, ids_bytes;
     if(h->magic == CACHE_MAGIC &&
        h->version == CACHE_VERSION &&
        h->sig == sig &&
        h->generation == g_db_generation &&
        h->bloom_size == g_bloom_size &&
        h->count <= CACHE_MAX_ENTRIES &&
-       sz >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
-        out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
-        memcpy(out->ids, base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
-        out->n = h->count; out->cap = h->count;
-        ok = TRUE;
+       cache_size(h->count, &need, &ids_bytes) &&
+       (size_t)sz >= need){
+        out->ids = (uint64_t*)malloc(ids_bytes);
+        if(out->ids){
+            memcpy(out->ids, base+sizeof(CacheHeader), ids_bytes);
+            out->n = h->count; out->cap = h->count;
+            ok = TRUE;
+        }
     }
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
     return ok;
@@ -1060,17 +1098,21 @@ static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
     if(base == MAP_FAILED){ close(fd); return FALSE; }
     const CacheHeader* h = (const CacheHeader*)base;
     BOOL ok = FALSE;
+    size_t need, ids_bytes;
     if(h->magic == CACHE_MAGIC &&
        h->version == CACHE_VERSION &&
        h->sig == sig &&
        h->generation == g_db_generation &&
        h->bloom_size == g_bloom_size &&
        h->count <= CACHE_MAX_ENTRIES &&
-       (size_t)st.st_size >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
-        out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
-        memcpy(out->ids, (const uint8_t*)base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
-        out->n = h->count; out->cap = h->count;
-        ok = TRUE;
+       cache_size(h->count, &need, &ids_bytes) &&
+       (size_t)st.st_size >= need){
+        out->ids = (uint64_t*)malloc(ids_bytes);
+        if(out->ids){
+            memcpy(out->ids, (const uint8_t*)base+sizeof(CacheHeader), ids_bytes);
+            out->n = h->count; out->cap = h->count;
+            ok = TRUE;
+        }
     }
     munmap(base, st.st_size); close(fd);
     return ok;
@@ -1091,7 +1133,9 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
     HANDLE f = CreateFileW(lp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return;
-    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, (DWORD)(sizeof(CacheHeader)+ids->n*sizeof(uint64_t)), NULL);
+    size_t total, ids_bytes;
+    if(!cache_size(ids->n, &total, &ids_bytes) || total > UINT32_MAX){ CloseHandle(f); return; }
+    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, (DWORD)total, NULL);
     if(!m){ CloseHandle(f); return; }
     BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_WRITE, 0,0,0);
     if(!base){ CloseHandle(m); CloseHandle(f); return; }
@@ -1103,7 +1147,7 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     h->bloom_size = g_bloom_size;
     h->sig = sig;
     h->count = (uint32_t)ids->n;
-    memcpy(base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
+    memcpy(base+sizeof(CacheHeader), ids->ids, ids_bytes);
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
     prune_cache_dir(cachePath);
 #else
@@ -1111,7 +1155,8 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     to_utf8(g_db_path, path, sizeof(path));
     char* p = strrchr(path, '/'); if(!p) return;
     snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_term_%016llx.tmp", (unsigned long long)sig);
-    size_t sz = sizeof(CacheHeader)+ids->n*sizeof(uint64_t);
+    size_t sz, ids_bytes;
+    if(!cache_size(ids->n, &sz, &ids_bytes)) return;
     int fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0666);
     if(fd < 0) return;
     if(ftruncate(fd, (off_t)sz) != 0){ close(fd); return; }
@@ -1125,7 +1170,7 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     h->bloom_size = g_bloom_size;
     h->sig = sig;
     h->count = (uint32_t)ids->n;
-    memcpy((uint8_t*)base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
+    memcpy((uint8_t*)base+sizeof(CacheHeader), ids->ids, ids_bytes);
     msync(base, sz, MS_SYNC);
     munmap(base, sz); close(fd);
     prune_cache_dir(path);
