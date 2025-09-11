@@ -22,6 +22,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <limits.h>
 #endif
 
@@ -915,14 +916,16 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     wchar_t* p = path_dirname_w(cachePath); if(!p) return FALSE;
     swprintf(p+1, (size_t)(MAX_LONG_PATH-(p+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
     wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
-    HANDLE f = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE f = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return FALSE;
+    OVERLAPPED ov = {0};
+    if(!LockFileEx(f, 0, 0, MAXDWORD, MAXDWORD, &ov)){ CloseHandle(f); return FALSE; }
     DWORD sz = GetFileSize(f, NULL);
-    if(sz < sizeof(CacheHeader)){ CloseHandle(f); return FALSE; }
+    if(sz < sizeof(CacheHeader)){ UnlockFileEx(f, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(f); return FALSE; }
     HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
-    if(!m){ CloseHandle(f); return FALSE; }
+    if(!m){ UnlockFileEx(f, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(f); return FALSE; }
     BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0);
-    if(!base){ CloseHandle(m); CloseHandle(f); return FALSE; }
+    if(!base){ CloseHandle(m); UnlockFileEx(f, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(f); return FALSE; }
     const CacheHeader* h = (const CacheHeader*)base;
     BOOL ok = FALSE;
     size_t need, ids_bytes;
@@ -941,7 +944,10 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
             ok = TRUE;
         }
     }
-    UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
+    UnmapViewOfFile(base);
+    CloseHandle(m);
+    UnlockFileEx(f, 0, MAXDWORD, MAXDWORD, &ov);
+    CloseHandle(f);
     return ok;
 #else
     char path[PATH_MAX];
@@ -950,6 +956,7 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_%016llx.tmp", (unsigned long long)sig);
     int fd = open(path, O_RDONLY);
     if(fd < 0) return FALSE;
+    if(flock(fd, LOCK_SH) != 0){ close(fd); return FALSE; }
     struct stat st; if(fstat(fd, &st) < 0){ close(fd); return FALSE; }
     if(st.st_size < (off_t)sizeof(CacheHeader)){ close(fd); return FALSE; }
     void* base = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
@@ -972,7 +979,8 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
             ok = TRUE;
         }
     }
-    munmap(base, st.st_size); close(fd);
+    munmap(base, st.st_size);
+    close(fd);
     return ok;
 #endif
 }
@@ -983,14 +991,20 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     wchar_t* p = path_dirname_w(cachePath); if(!p) return;
     swprintf(p+1, (size_t)(MAX_LONG_PATH-(p+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
     wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
-    HANDLE f = CreateFileW(lp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-    if(f==INVALID_HANDLE_VALUE) return;
+    HANDLE lock = CreateFileW(lp, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, 0, NULL);
+    if(lock==INVALID_HANDLE_VALUE) return;
+    OVERLAPPED ov = {0};
+    if(!LockFileEx(lock, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &ov)){ CloseHandle(lock); return; }
+    wchar_t tmpPath[MAX_LONG_PATH];
+    swprintf(tmpPath, MAX_LONG_PATH, L"%s.tmp", lp);
+    HANDLE f = CreateFileW(tmpPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if(f==INVALID_HANDLE_VALUE){ UnlockFileEx(lock, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(lock); return; }
     size_t total, ids_bytes;
-    if(!cache_size(ids->n, &total, &ids_bytes) || total > UINT32_MAX){ CloseHandle(f); return; }
+    if(!cache_size(ids->n, &total, &ids_bytes) || total > UINT32_MAX){ CloseHandle(f); DeleteFileW(tmpPath); UnlockFileEx(lock, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(lock); return; }
     HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, (DWORD)total, NULL);
-    if(!m){ CloseHandle(f); return; }
+    if(!m){ CloseHandle(f); DeleteFileW(tmpPath); UnlockFileEx(lock, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(lock); return; }
     BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_WRITE, 0,0,0);
-    if(!base){ CloseHandle(m); CloseHandle(f); return; }
+    if(!base){ CloseHandle(m); CloseHandle(f); DeleteFileW(tmpPath); UnlockFileEx(lock, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(lock); return; }
     CacheHeader* h = (CacheHeader*)base;
     h->magic = CACHE_MAGIC;
     h->version = CACHE_VERSION;
@@ -1000,7 +1014,14 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     h->sig = hash64(qstr, strlen(qstr));
     h->count = (uint32_t)ids->n;
     memcpy(base+sizeof(CacheHeader), ids->ids, ids_bytes);
-    UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
+    FlushViewOfFile(base, (SIZE_T)total);
+    UnmapViewOfFile(base);
+    CloseHandle(m);
+    FlushFileBuffers(f);
+    CloseHandle(f);
+    MoveFileExW(tmpPath, lp, MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
+    UnlockFileEx(lock, 0, MAXDWORD, MAXDWORD, &ov);
+    CloseHandle(lock);
     prune_cache_dir(cachePath);
 #else
     char path[PATH_MAX];
@@ -1009,11 +1030,16 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_%016llx.tmp", (unsigned long long)sig);
     size_t sz, ids_bytes;
     if(!cache_size(ids->n, &sz, &ids_bytes)) return;
-    int fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0666);
-    if(fd < 0) return;
-    if(ftruncate(fd, (off_t)sz) != 0){ close(fd); return; }
+    int lock_fd = open(path, O_RDWR|O_CREAT, 0666);
+    if(lock_fd < 0) return;
+    if(flock(lock_fd, LOCK_EX) != 0){ close(lock_fd); return; }
+    char tmp_template[PATH_MAX];
+    snprintf(tmp_template, sizeof(tmp_template), "%s.tmpXXXXXX", path);
+    int fd = mkstemp(tmp_template);
+    if(fd < 0){ flock(lock_fd, LOCK_UN); close(lock_fd); return; }
+    if(ftruncate(fd, (off_t)sz) != 0){ close(fd); unlink(tmp_template); flock(lock_fd, LOCK_UN); close(lock_fd); return; }
     void* base = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if(base == MAP_FAILED){ close(fd); return; }
+    if(base == MAP_FAILED){ close(fd); unlink(tmp_template); flock(lock_fd, LOCK_UN); close(lock_fd); return; }
     CacheHeader* h = (CacheHeader*)base;
     h->magic = CACHE_MAGIC;
     h->version = CACHE_VERSION;
@@ -1024,7 +1050,12 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     h->count = (uint32_t)ids->n;
     memcpy((uint8_t*)base+sizeof(CacheHeader), ids->ids, ids_bytes);
     msync(base, sz, MS_SYNC);
-    munmap(base, sz); close(fd);
+    munmap(base, sz);
+    fsync(fd);
+    close(fd);
+    rename(tmp_template, path);
+    flock(lock_fd, LOCK_UN);
+    close(lock_fd);
     prune_cache_dir(path);
 #endif
 }
