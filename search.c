@@ -39,7 +39,10 @@ static size_t g_bloom_size = 0;
 static wchar_t g_db_path[MAX_PATH]={0};
 static uint64_t g_db_updated_time = 0;
 
-#define CACHE_MAGIC 0xCACEF00D00000001ULL
+// Magic marker and version for cache files so we can detect incompatible
+// formats and upgrade transparently.
+#define CACHE_MAGIC   0xCACEF00D
+#define CACHE_VERSION 1
 static BOOL open_bloom(const wchar_t* dbPath){
     wchar_t bp[MAX_PATH]; swprintf(bp, MAX_PATH, L"%s\\bloom.dat", dbPath);
     HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -424,7 +427,8 @@ static void idvec_free(IdVec* v){ free(v->ids); v->ids=NULL; v->n=v->cap=0; }
 
 // Result cache — last query & rec_ids
 typedef struct {
-    uint64_t magic;
+    uint32_t magic;
+    uint32_t version;
     uint64_t sig;
     uint32_t count;
     uint64_t updated_time;
@@ -487,6 +491,7 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     const CacheHeader* h = (const CacheHeader*)base;
     BOOL ok = FALSE;
     if(h->magic == CACHE_MAGIC &&
+       h->version == CACHE_VERSION &&
        h->sig == sig &&
        h->updated_time == g_db_updated_time &&
        h->bloom_size == g_bloom_size &&
@@ -512,6 +517,7 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     if(!base){ CloseHandle(m); CloseHandle(f); return; }
     CacheHeader* h = (CacheHeader*)base;
     h->magic = CACHE_MAGIC;
+    h->version = CACHE_VERSION;
     h->sig = hash64(qstr, strlen(qstr));
     h->count = (uint32_t)ids->n;
     h->updated_time = g_db_updated_time;
@@ -558,6 +564,7 @@ static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
     const CacheHeader* h = (const CacheHeader*)base;
     BOOL ok = FALSE;
     if(h->magic == CACHE_MAGIC &&
+       h->version == CACHE_VERSION &&
        h->sig == sig &&
        h->updated_time == g_db_updated_time &&
        h->bloom_size == g_bloom_size &&
@@ -589,6 +596,7 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     if(!base){ CloseHandle(m); CloseHandle(f); return; }
     CacheHeader* h = (CacheHeader*)base;
     h->magic = CACHE_MAGIC;
+    h->version = CACHE_VERSION;
     h->sig = sig;
     h->count = (uint32_t)ids->n;
     h->updated_time = g_db_updated_time;
