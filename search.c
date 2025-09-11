@@ -31,6 +31,123 @@
 #include <pcre2.h>
 #endif
 
+#ifndef _WIN32
+// Provide Win32-style critical section wrappers on POSIX systems
+typedef pthread_mutex_t CRITICAL_SECTION;
+static void InitializeCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_init(cs,NULL); }
+static void DeleteCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_destroy(cs); }
+static void EnterCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_lock(cs); }
+static void LeaveCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_unlock(cs); }
+#endif
+
+// ---- Lightweight IdMap --------------------------------------------------
+typedef struct {
+    uint32_t* keys;    // rec_id
+    uint16_t* vals;    // (stage<<8)|confidence
+    size_t cap;
+    size_t n;
+} IdMap;
+
+static void idmap_init(IdMap* m, size_t initial){
+    m->cap = 1;
+    while(m->cap < initial) m->cap <<= 1;
+    m->keys = (uint32_t*)malloc(m->cap * sizeof(uint32_t));
+    m->vals = (uint16_t*)malloc(m->cap * sizeof(uint16_t));
+    for(size_t i=0;i<m->cap;i++){ m->keys[i]=0xFFFFFFFFu; m->vals[i]=0; }
+    m->n = 0;
+}
+
+static void idmap_free(IdMap* m){
+    free(m->keys); free(m->vals); m->keys=NULL; m->vals=NULL; m->cap=m->n=0;
+}
+
+static BOOL idmap_get(IdMap* m, uint32_t key, uint16_t* out){
+    size_t mask = m->cap - 1; size_t i = key & mask;
+    for(;;){
+        uint32_t k = m->keys[i];
+        if(k == 0xFFFFFFFFu) return FALSE;
+        if(k == key){ if(out) *out = m->vals[i]; return TRUE; }
+        i = (i + 1) & mask;
+    }
+}
+
+static void idmap_grow(IdMap* m){
+    size_t oldcap = m->cap; uint32_t* oldk = m->keys; uint16_t* oldv = m->vals;
+    m->cap <<= 1; m->keys = (uint32_t*)malloc(m->cap*sizeof(uint32_t));
+    m->vals = (uint16_t*)malloc(m->cap*sizeof(uint16_t));
+    for(size_t i=0;i<m->cap;i++){ m->keys[i]=0xFFFFFFFFu; m->vals[i]=0; }
+    m->n = 0;
+    for(size_t i=0;i<oldcap;i++) if(oldk[i]!=0xFFFFFFFFu){
+        size_t mask=m->cap-1; size_t j=oldk[i]&mask;
+        while(m->keys[j]!=0xFFFFFFFFu) j=(j+1)&mask;
+        m->keys[j]=oldk[i]; m->vals[j]=oldv[i]; m->n++;
+    }
+    free(oldk); free(oldv);
+}
+
+static void idmap_set(IdMap* m, uint32_t key, uint16_t val){
+    if(m->n * 2 >= m->cap) idmap_grow(m);
+    size_t mask = m->cap - 1; size_t i = key & mask;
+    for(;;){
+        uint32_t k = m->keys[i];
+        if(k == 0xFFFFFFFFu){ m->keys[i]=key; m->vals[i]=val; m->n++; return; }
+        if(k == key){ m->vals[i]=val; return; }
+        i = (i + 1) & mask;
+    }
+}
+
+// ---- Progressive search state -------------------------------------------
+typedef struct {
+    uint32_t rec_id;
+    uint8_t  confidence;   // 0..100
+    uint8_t  stage;        // 0=name,1=meta,2=content
+} ProgHit;
+
+typedef struct {
+    CRITICAL_SECTION mu;
+    IdMap best;            // rec_id -> (stage<<8)|confidence
+    MPMCQueue* out;        // output queue to UI
+    BOOL done[3];          // completion flags per stage
+} ProgState;
+
+void prog_state_init(ProgState* ps, MPMCQueue* out){
+    InitializeCriticalSection(&ps->mu);
+    idmap_init(&ps->best, 1024);
+    ps->out = out;
+    ps->done[0]=ps->done[1]=ps->done[2]=FALSE;
+}
+
+void prog_state_release(ProgState* ps){
+    idmap_free(&ps->best);
+    DeleteCriticalSection(&ps->mu);
+}
+
+void prog_submit(ProgState* ps, const uint32_t* ids, size_t n, uint8_t stage, uint8_t conf){
+    EnterCriticalSection(&ps->mu);
+    for(size_t i=0;i<n;i++){
+        uint32_t id = ids[i];
+        uint16_t prev;
+        BOOL have = idmap_get(&ps->best, id, &prev);
+        uint8_t pst = have ? (uint8_t)(prev>>8) : 0;
+        uint8_t pconf = have ? (uint8_t)(prev & 0xFF) : 0;
+        if(!have || stage>pst || (stage==pst && conf>pconf)){
+            idmap_set(&ps->best, id, (uint16_t)((stage<<8)|conf));
+            ProgHit* h = (ProgHit*)malloc(sizeof(ProgHit));
+            h->rec_id = id; h->confidence = conf; h->stage = stage;
+            MPMC_Push(ps->out, h);
+        }
+    }
+    LeaveCriticalSection(&ps->mu);
+}
+
+void prog_mark_done(ProgState* ps, uint8_t stage){
+    if(stage<3){
+        EnterCriticalSection(&ps->mu);
+        ps->done[stage] = TRUE;
+        LeaveCriticalSection(&ps->mu);
+    }
+}
+
 typedef struct { uint32_t trigram_count; uint64_t bloom_offset; } StringMeta;
 static HANDLE bloom_mapping = NULL;
 static const uint8_t* bloom_readonly_base = NULL;
@@ -207,6 +324,115 @@ static void parallel_search(Query* q, Result* results){
         pthread_join(threads[i], NULL);
     }
 #endif
+}
+
+// Helpers for progressive search -------------------------------------------------
+
+static int cmp_u32(const void* a, const void* b){
+    uint32_t ua = *(const uint32_t*)a, ub = *(const uint32_t*)b;
+    return ua < ub ? -1 : (ua > ub);
+}
+
+static void sort_unique(uint32_t* ids, size_t* n){
+    if(!ids || *n==0) return;
+    qsort(ids, *n, sizeof(uint32_t), cmp_u32);
+    size_t w=0; uint32_t prev=0;
+    for(size_t i=0;i<*n;i++){
+        uint32_t v = ids[i];
+        if(i==0 || v!=prev){ ids[w++]=v; prev=v; }
+    }
+    *n = w;
+}
+
+static uint32_t* intersect_sorted(const uint32_t* a, size_t na, const uint32_t* b, size_t nb, size_t* out_n){
+    size_t i=0,j=0,k=0; size_t cap = na < nb ? na : nb;
+    uint32_t* out = (uint32_t*)malloc(cap * sizeof(uint32_t));
+    if(!out){ *out_n=0; return NULL; }
+    while(i<na && j<nb){
+        uint32_t va=a[i], vb=b[j];
+        if(va==vb){ out[k++]=va; i++; j++; }
+        else if(va<vb) i++; else j++;
+    }
+    *out_n = k;
+    return out;
+}
+
+static void results_to_ids(const Result* res, size_t n, uint32_t** out_ids, size_t* out_n){
+    if(n==0){ *out_ids=NULL; *out_n=0; return; }
+    uint32_t* ids=(uint32_t*)malloc(n*sizeof(uint32_t));
+    if(!ids){ *out_ids=NULL; *out_n=0; return; }
+    for(size_t i=0;i<n;i++) ids[i]=(uint32_t)res[i].dummy;
+    *out_ids = ids; *out_n = n; sort_unique(*out_ids, out_n);
+}
+
+#define INTERSECT_EAGER_MAX 100000u
+
+// Progressive version that reports early hits through ProgState
+static void progressive_search(Query* q, ProgState* ps){
+    uint32_t* stage_ids=NULL; size_t stage_n=0; // accumulates survivors
+
+    // ---- Stage 0 : names ---------------------------------------------------
+    int n0 = search_names(q, NULL);
+    Result* r0 = n0>0 ? (Result*)malloc(sizeof(Result)* (size_t)n0) : NULL;
+    if(r0 && n0>0) search_names(q, r0);
+    results_to_ids(r0, n0, &stage_ids, &stage_n);
+    if(r0) free(r0);
+    if(stage_n) prog_submit(ps, stage_ids, stage_n, 0, 60);
+    prog_mark_done(ps,0);
+
+    // ---- Stage 1 : metadata -----------------------------------------------
+    int n1 = search_metadata(q, NULL);
+    Result* r1 = n1>0 ? (Result*)malloc(sizeof(Result)*(size_t)n1) : NULL;
+    uint32_t* meta_ids=NULL; size_t meta_n=0;
+    if(r1 && n1>0){ search_metadata(q, r1); results_to_ids(r1, n1, &meta_ids, &meta_n); }
+    if(r1) free(r1);
+    if(meta_n){
+        if(stage_n > INTERSECT_EAGER_MAX){
+            prog_submit(ps, meta_ids, meta_n, 1, 75);
+            uint32_t* inter = intersect_sorted(stage_ids, stage_n, meta_ids, meta_n, &meta_n);
+            if(stage_ids) free(stage_ids);
+            if(meta_ids) free(meta_ids);
+            stage_ids = inter; stage_n = meta_n;
+            if(stage_n) prog_submit(ps, stage_ids, stage_n, 1, 80);
+        } else {
+            uint32_t* inter = intersect_sorted(stage_ids, stage_n, meta_ids, meta_n, &meta_n);
+            if(stage_ids) free(stage_ids);
+            if(meta_ids) free(meta_ids);
+            stage_ids = inter; stage_n = meta_n;
+            if(stage_n) prog_submit(ps, stage_ids, stage_n, 1, 75);
+        }
+    } else {
+        if(stage_ids){ free(stage_ids); stage_ids=NULL; stage_n=0; }
+    }
+    prog_mark_done(ps,1);
+
+    // ---- Stage 2 : content -------------------------------------------------
+    int n2 = search_content(q, NULL);
+    Result* r2 = n2>0 ? (Result*)malloc(sizeof(Result)*(size_t)n2) : NULL;
+    uint32_t* cont_ids=NULL; size_t cont_n=0;
+    if(r2 && n2>0){ search_content(q, r2); results_to_ids(r2, n2, &cont_ids, &cont_n); }
+    if(r2) free(r2);
+    if(cont_n){
+        if(stage_n > INTERSECT_EAGER_MAX){
+            prog_submit(ps, cont_ids, cont_n, 2, 95);
+            uint32_t* inter = intersect_sorted(stage_ids, stage_n, cont_ids, cont_n, &cont_n);
+            if(stage_ids) free(stage_ids);
+            if(cont_ids) free(cont_ids);
+            stage_ids = inter; stage_n = cont_n;
+            if(stage_n) prog_submit(ps, stage_ids, stage_n, 2, 100);
+        } else {
+            uint32_t* inter = intersect_sorted(stage_ids, stage_n, cont_ids, cont_n, &cont_n);
+            if(stage_ids) free(stage_ids);
+            if(cont_ids) free(cont_ids);
+            stage_ids = inter; stage_n = cont_n;
+            if(stage_n) prog_submit(ps, stage_ids, stage_n, 2, 95);
+        }
+    } else {
+        if(stage_ids){ free(stage_ids); stage_ids=NULL; stage_n=0; }
+    }
+    prog_mark_done(ps,2);
+
+    if(stage_ids) free(stage_ids);
 }
 
 typedef struct Node{ int type; TermType ttype; char* text; struct Node* left; struct Node* right; } Node;
