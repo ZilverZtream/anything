@@ -602,22 +602,39 @@ typedef struct {
     // followed by rec_ids[count]
 } CacheHeader;
 
-#define CACHE_FILE_LIMIT 128
-typedef struct {
-    uint64_t ts;
+#define CACHE_SIZE_LIMIT (128ULL*1024*1024) // 128 MB
+typedef struct CacheEntry {
+    uint64_t access_time;
+    uint64_t size;
     wchar_t path[MAX_PATH];
-} CacheFileInfo;
+    struct CacheEntry* next;
+} CacheEntry;
 
-static int cmp_cache_file(const void* a, const void* b){
-    const CacheFileInfo* x = (const CacheFileInfo*)a;
-    const CacheFileInfo* y = (const CacheFileInfo*)b;
-    return (x->ts>y->ts) - (x->ts<y->ts);
+static int cmp_cache_entry(const void* a, const void* b){
+    const CacheEntry* const* x = (const CacheEntry* const*)a;
+    const CacheEntry* const* y = (const CacheEntry* const*)b;
+    return ((*x)->access_time > (*y)->access_time) - ((*x)->access_time < (*y)->access_time);
+}
+
+static void evict_lru_cache_entries(CacheEntry* head, size_t max_size){
+    size_t total = 0, count = 0;
+    for(CacheEntry* e=head; e; e=e->next){ total += e->size; count++; }
+    if(total <= max_size) return;
+    CacheEntry** arr = (CacheEntry**)malloc(count*sizeof(CacheEntry*));
+    if(!arr) return;
+    size_t i=0; for(CacheEntry* e=head; e; e=e->next) arr[i++]=e;
+    qsort(arr, count, sizeof(CacheEntry*), cmp_cache_entry);
+    for(i=0; i<count && total>max_size; i++){
+        DeleteFileW(arr[i]->path);
+        if(arr[i]->size <= total) total -= arr[i]->size; else total = 0;
+    }
+    free(arr);
 }
 
 static void prune_cache_dir(const wchar_t* anyPath){
     wchar_t dir[MAX_PATH]; wcscpy_s(dir, MAX_PATH, anyPath);
     wchar_t* p = wcsrchr(dir, L'\\'); if(!p) return; *p = 0;
-    CacheFileInfo* files = NULL; size_t n=0, cap=0;
+    CacheEntry* head = NULL;
     const wchar_t* patterns[2] = {L"cache_*.tmp", L"cache_term_*.tmp"};
     for(int i=0;i<2;i++){
         wchar_t pat[MAX_PATH]; swprintf(pat, MAX_PATH, L"%s\\%s", dir, patterns[i]);
@@ -625,20 +642,29 @@ static void prune_cache_dir(const wchar_t* anyPath){
         if(h!=INVALID_HANDLE_VALUE){
             do{
                 if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)){
-                    if(n==cap){ cap=cap?cap*2:64; files=(CacheFileInfo*)realloc(files, cap*sizeof(CacheFileInfo)); }
-                    swprintf(files[n].path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
-                    ULARGE_INTEGER ui; ui.LowPart=fd.ftLastWriteTime.dwLowDateTime; ui.HighPart=fd.ftLastWriteTime.dwHighDateTime;
-                    files[n].ts = ui.QuadPart; n++;
+                    CacheEntry* e = (CacheEntry*)malloc(sizeof(CacheEntry));
+                    if(!e) continue;
+                    swprintf(e->path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+                    ULARGE_INTEGER ui;
+                    ui.LowPart = fd.ftLastAccessTime.dwLowDateTime;
+                    ui.HighPart = fd.ftLastAccessTime.dwHighDateTime;
+                    e->access_time = ui.QuadPart;
+                    ui.LowPart = fd.nFileSizeLow;
+                    ui.HighPart = fd.nFileSizeHigh;
+                    e->size = ui.QuadPart;
+                    e->next = head;
+                    head = e;
                 }
             }while(FindNextFileW(h,&fd));
             FindClose(h);
         }
     }
-    if(n>CACHE_FILE_LIMIT){
-        qsort(files, n, sizeof(CacheFileInfo), cmp_cache_file);
-        for(size_t i=0;i<n-CACHE_FILE_LIMIT;i++) DeleteFileW(files[i].path);
+    evict_lru_cache_entries(head, CACHE_SIZE_LIMIT);
+    while(head){
+        CacheEntry* next = head->next;
+        free(head);
+        head = next;
     }
-    free(files);
 }
 
 static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
