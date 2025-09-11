@@ -73,6 +73,13 @@ static uint32_t hash32_seed(const void* data, size_t len, uint32_t seed){
     for(size_t i=0;i<len;i++){ h ^= p[i]; h *= 16777619u; }
     return h;
 }
+
+static uint32_t optimal_hash_count(size_t string_len, size_t bloom_bits){
+    if(string_len == 0) return 1;
+    uint32_t k = (uint32_t)(((double)bloom_bits / (double)string_len) * 0.693147);
+    if(k == 0) k = 1;
+    return k;
+}
 static void build_bloom_hashes_simd(const char* tri, uint32_t* out4){
     __m128i seeds = _mm_set_epi32(0x1F1F1F1F, 0x5A5A5A5A, 0x3C3C3C3C, 0xA5A5A5A5);
     uint32_t t= (uint8_t)tri[0] | ((uint32_t)(uint8_t)tri[1]<<8) | ((uint32_t)(uint8_t)tri[2]<<16);
@@ -101,16 +108,27 @@ static uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom){
     lowercase_ascii(tmp, limit);
 
     size_t full = limit < DB_BLOOM_STRIDE_AFTER ? limit : DB_BLOOM_STRIDE_AFTER;
+
+    size_t tri_full = full >= 3 ? (full - 2) : 0;
+    size_t tri_sampled = 0;
+    if(limit > full){
+        size_t rem = limit - full;
+        if(rem > 3) tri_sampled = ((rem - 3) / DB_BLOOM_STRIDE) + 1;
+    }
+    size_t tri_est = tri_full + tri_sampled;
+    uint32_t hash_count = optimal_hash_count(tri_est ? tri_est : 1, 65536);
+    if(hash_count > 4) hash_count = 4;
+
     for(size_t i=0; i + 3 <= full; ++i){
         uint32_t hs[4];
         build_bloom_hashes_simd(&tmp[i], hs);
-        bloom_set(bloom, hs[0]); bloom_set(bloom, hs[1]); bloom_set(bloom, hs[2]); bloom_set(bloom, hs[3]);
+        for(uint32_t j=0; j<hash_count; ++j){ bloom_set(bloom, hs[j]); }
         tcount++;
     }
     for(size_t i=full; i + 3 <= limit; i += DB_BLOOM_STRIDE){
         uint32_t hs[4];
         build_bloom_hashes_simd(&tmp[i], hs);
-        bloom_set(bloom, hs[0]); bloom_set(bloom, hs[1]); bloom_set(bloom, hs[2]); bloom_set(bloom, hs[3]);
+        for(uint32_t j=0; j<hash_count; ++j){ bloom_set(bloom, hs[j]); }
         tcount++;
     }
     if(heap) free(tmp);
