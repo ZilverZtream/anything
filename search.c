@@ -962,23 +962,14 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
     float final = fname_score*W_FILENAME + content_score*W_CONTENT + meta_score*W_METADATA + recency_score*W_RECENCY;
     return final;
 }
-static size_t lower_bound_u64(const uint64_t* arr, size_t n, uint64_t x){
+static size_t binary_search_ge(const uint64_t* arr, size_t n, uint64_t x){
     size_t lo=0, hi=n;
     while(lo<hi){ size_t mid=lo+((hi-lo)>>1); if(arr[mid]<x) lo=mid+1; else hi=mid; }
     return lo;
 }
 
-static void intersect_inplace(IdVec* a, const IdVec* b){
+static void traditional_intersect(IdVec* a, const IdVec* b){
     if(a->n==0 || b->n==0){ a->n=0; return; }
-    // If one list is much smaller, binary search into the larger (galloping).
-    if(a->n*8 < b->n){
-        size_t w=0, j=0;
-        for(size_t i=0;i<a->n;i++){
-            j += lower_bound_u64(b->ids+j, b->n-j, a->ids[i]);
-            if(j<b->n && b->ids[j]==a->ids[i]){ a->ids[w++]=a->ids[i]; j++; }
-        }
-        a->n=w; return;
-    }
     size_t i=0,j=0,w=0;
     while(i<a->n && j<b->n){
         uint64_t x=a->ids[i], y=b->ids[j];
@@ -987,6 +978,20 @@ static void intersect_inplace(IdVec* a, const IdVec* b){
         else j++;
     }
     a->n=w;
+}
+
+static void galloping_intersect(IdVec* a, const IdVec* b){
+    if(a->n==0 || b->n==0){ a->n=0; return; }
+    if(a->n * 8 < b->n){
+        size_t w=0, j=0;
+        for(size_t i=0;i<a->n;i++){
+            j += binary_search_ge(b->ids + j, b->n - j, a->ids[i]);
+            if(j<b->n && b->ids[j]==a->ids[i]){ a->ids[w++]=a->ids[i]; j++; }
+        }
+        a->n=w;
+    } else {
+        traditional_intersect(a, b);
+    }
 }
 
 static void union_inplace(IdVec* a, const IdVec* b){
@@ -1050,7 +1055,7 @@ static void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const 
         sort_unique(&gram);
         if(i==0){ candidates = gram; } else {
             sort_unique(&candidates);
-            intersect_inplace(&candidates, &gram);
+            galloping_intersect(&candidates, &gram);
             idvec_free(&gram);
         }
         if(candidates.n==0) break;
@@ -1323,7 +1328,7 @@ static void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fn
         eval_node(n->left, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &L);
         eval_node(n->right, txn, dbi_strings, dbi_fname, dbi_trigram, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_ext, dbi_strrev, dbi_date, &R);
         sort_unique(&L); sort_unique(&R);
-        if(n->type==TOK_AND){ intersect_inplace(&L,&R); } else { union_inplace(&L,&R); }
+        if(n->type==TOK_AND){ galloping_intersect(&L,&R); } else { union_inplace(&L,&R); }
         idvec_free(&R);
         *out=L; return;
     }
@@ -1456,7 +1461,7 @@ int wmain(int argc, wchar_t** argv){
     if(q.size_min>0 || q.size_max<~0ULL){
         IdVec sz; idvec_init(&sz);
         records_for_range(txn, dbi_size, q.size_min, q.size_max, &sz);
-        if(rec_ids.n>0){ intersect_inplace(&rec_ids,&sz); idvec_free(&sz); }
+        if(rec_ids.n>0){ galloping_intersect(&rec_ids,&sz); idvec_free(&sz); }
         else { rec_ids = sz; }
     }
     if(q.date_min_day>0 || q.date_max_day<~0ULL){
@@ -1464,7 +1469,7 @@ int wmain(int argc, wchar_t** argv){
         uint64_t maxft = day_to_filetime(q.date_max_day+1) - 1;
         IdVec dt; idvec_init(&dt);
         records_for_range(txn, dbi_mtime, minft, maxft, &dt);
-        if(rec_ids.n>0){ intersect_inplace(&rec_ids,&dt); idvec_free(&dt); }
+        if(rec_ids.n>0){ galloping_intersect(&rec_ids,&dt); idvec_free(&dt); }
         else { rec_ids = dt; }
     }
 
