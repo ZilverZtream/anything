@@ -1,5 +1,6 @@
 
 #include "util.h"
+#include "anything.h"
 #include <shlwapi.h>
 #include <string.h>
 #include <wchar.h>
@@ -97,6 +98,16 @@ void lowercase_wchar(wchar_t* s){
     for(size_t i=0;s[i];++i){
         if(s[i]>='A' && s[i]<='Z') s[i] = (wchar_t)(s[i]-L'A'+L'a');
     }
+}
+void make_long_path(const wchar_t* in, wchar_t* out, size_t outcch){
+#ifdef _WIN32
+    if(!in || !out || outcch==0){ if(out && outcch) out[0]=0; return; }
+    if(wcsncmp(in,L"\\\\?\\",4)==0){ wcsncpy_s(out,outcch,in,_TRUNCATE); return; }
+    if(wcsncmp(in,L"\\\\",2)==0){ swprintf(out,outcch,L"\\\\?\\UNC\\%s", in+2); }
+    else { swprintf(out,outcch,L"\\\\?\\%s", in); }
+#else
+    wcsncpy_s(out,outcch,in,_TRUNCATE);
+#endif
 }
 BOOL path_join(wchar_t* dst, size_t dstcch, const wchar_t* a, const wchar_t* b){
     if(!dst || !a || !b) return FALSE;
@@ -240,7 +251,9 @@ uint64_t crc64(const void* data, size_t len){
 
 uint64_t crc64_file(const wchar_t* path){
     if(!path) return 0;
-    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    wchar_t lp[MAX_LONG_PATH];
+    make_long_path(path, lp, MAX_LONG_PATH);
+    HANDLE h = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if(h==INVALID_HANDLE_VALUE) return 0;
     uint8_t buf[64*1024];
     DWORD rd = 0;
@@ -532,7 +545,7 @@ typedef struct {
     size_t remaining;
     uint8_t* item;
     BOOL loaded;
-    wchar_t path[MAX_PATH];
+    wchar_t path[MAX_LONG_PATH];
 } SortChunk;
 #else
 typedef struct {
@@ -583,9 +596,11 @@ static size_t heap_pop(size_t* heap, size_t* heap_size, SortChunk* chunks,
 }
 
 #ifdef _WIN32
-static HANDLE tempfile_create(wchar_t path[MAX_PATH], const wchar_t* tmpdir){
+static HANDLE tempfile_create(wchar_t path[MAX_LONG_PATH], const wchar_t* tmpdir){
     if(!GetTempFileNameW(tmpdir, L"srt", 0, path)) return INVALID_HANDLE_VALUE;
-    return CreateFileW(path, GENERIC_READ|GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+    wchar_t lp[MAX_LONG_PATH];
+    make_long_path(path, lp, MAX_LONG_PATH);
+    return CreateFileW(lp, GENERIC_READ|GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                        FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE, NULL);
 }
 static BOOL chunk_write(HANDLE h, const void* buf, size_t bytes){
@@ -634,7 +649,7 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
     if(n <= max_items){ qsort(base, n, size, cmp); return TRUE; }
 
 #ifdef _WIN32
-    wchar_t tmpbuf[MAX_PATH];
+    wchar_t tmpbuf[MAX_LONG_PATH];
     if(!tmpdir){ GetTempPathW(MAX_PATH, tmpbuf); tmpdir = tmpbuf; }
 #else
     wchar_t tmpbuf[PATH_MAX];
@@ -654,7 +669,7 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
         size_t m = n - offset; if(m > max_items) m = max_items;
         qsort((uint8_t*)base + offset*size, m, size, cmp);
 #ifdef _WIN32
-        wchar_t file[MAX_PATH];
+        wchar_t file[MAX_LONG_PATH];
         HANDLE h = tempfile_create(file, tmpdir);
         if(h==INVALID_HANDLE_VALUE) goto fail;
         if(!chunk_write(h, (uint8_t*)base + offset*size, m*size)){
@@ -682,7 +697,7 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
         chunks=tmp;
 #ifdef _WIN32
         chunks[chunks_n].h=h;
-        wcscpy_s(chunks[chunks_n].path, MAX_PATH, file);
+        wcscpy_s(chunks[chunks_n].path, MAX_LONG_PATH, file);
 #else
         chunks[chunks_n].fd=fd;
         strncpy(chunks[chunks_n].path, file, PATH_MAX-1);

@@ -81,7 +81,8 @@ static errcode_t vhdx_open(const char* name, int flags, io_channel* out){
     int wlen = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
     wchar_t wname[MAX_LONG_PATH];
     MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, wlen);
-    HANDLE h = CreateFileW(wname, GENERIC_READ, FILE_SHARE_READ, NULL,
+    wchar_t lp[MAX_LONG_PATH]; make_long_path(wname, lp, MAX_LONG_PATH);
+    HANDLE h = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ, NULL,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if(h == INVALID_HANDLE_VALUE){ free(channel); return errno; }
     vhdx_priv* p = (vhdx_priv*)calloc(1,sizeof(vhdx_priv));
