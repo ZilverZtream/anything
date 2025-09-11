@@ -795,6 +795,8 @@ typedef struct {
 } CacheHeader;
 
 #define CACHE_SIZE_LIMIT (128ULL*1024*1024) // 128 MB
+#define CACHE_MAX_ENTRIES 100000000U
+#define CACHE_TTL_SECONDS (30ULL*24*60*60) // 30 days
 typedef struct CacheEntry {
     uint64_t access_time;
     uint64_t size;
@@ -808,13 +810,23 @@ static int cmp_cache_entry(const void* a, const void* b){
     return ((*x)->access_time > (*y)->access_time) - ((*x)->access_time < (*y)->access_time);
 }
 
-static void evict_lru_cache_entries(CacheEntry* head, size_t max_size){
+static void evict_lru_cache_entries(CacheEntry* head, size_t max_size, uint64_t ttl_seconds){
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER now; now.LowPart = ft.dwLowDateTime; now.HighPart = ft.dwHighDateTime;
+    uint64_t cutoff = now.QuadPart - ttl_seconds*10000000ULL; // FILETIME is 100ns units
     size_t total = 0, count = 0;
-    for(CacheEntry* e=head; e; e=e->next){ total += e->size; count++; }
+    for(CacheEntry* e=head; e; e=e->next){
+        if(e->access_time < cutoff){
+            DeleteFileW(e->path);
+        } else {
+            total += e->size;
+            count++;
+        }
+    }
     if(total <= max_size) return;
     CacheEntry** arr = (CacheEntry**)malloc(count*sizeof(CacheEntry*));
     if(!arr) return;
-    size_t i=0; for(CacheEntry* e=head; e; e=e->next) arr[i++]=e;
+    size_t i=0; for(CacheEntry* e=head; e; e=e->next){ if(e->access_time >= cutoff) arr[i++]=e; }
     qsort(arr, count, sizeof(CacheEntry*), cmp_cache_entry);
     for(i=0; i<count && total>max_size; i++){
         DeleteFileW(arr[i]->path);
@@ -859,7 +871,7 @@ static void prune_cache_dir(const wchar_t* anyPath){
             FindClose(h);
         }
     }
-    evict_lru_cache_entries(head, CACHE_SIZE_LIMIT);
+    evict_lru_cache_entries(head, CACHE_SIZE_LIMIT, CACHE_TTL_SECONDS);
     while(head){
         CacheEntry* next = head->next;
         free(head);
@@ -891,6 +903,7 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
        h->sig == sig &&
        h->generation == g_db_generation &&
        h->bloom_size == g_bloom_size &&
+       h->count <= CACHE_MAX_ENTRIES &&
        sz >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
         out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
         memcpy(out->ids, base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
@@ -917,6 +930,7 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
        h->sig == sig &&
        h->generation == g_db_generation &&
        h->bloom_size == g_bloom_size &&
+       h->count <= CACHE_MAX_ENTRIES &&
        (size_t)st.st_size >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
         out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
         memcpy(out->ids, (const uint8_t*)base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
@@ -1018,6 +1032,7 @@ static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
        h->sig == sig &&
        h->generation == g_db_generation &&
        h->bloom_size == g_bloom_size &&
+       h->count <= CACHE_MAX_ENTRIES &&
        sz >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
         out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
         memcpy(out->ids, base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
@@ -1044,6 +1059,7 @@ static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
        h->sig == sig &&
        h->generation == g_db_generation &&
        h->bloom_size == g_bloom_size &&
+       h->count <= CACHE_MAX_ENTRIES &&
        (size_t)st.st_size >= sizeof(CacheHeader)+h->count*sizeof(uint64_t)){
         out->ids = (uint64_t*)malloc(h->count*sizeof(uint64_t));
         memcpy(out->ids, (const uint8_t*)base+sizeof(CacheHeader), h->count*sizeof(uint64_t));
