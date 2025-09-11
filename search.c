@@ -161,7 +161,11 @@ void prog_mark_done(ProgState* ps, uint8_t stage){
 }
 
 typedef struct { uint32_t trigram_count; uint64_t bloom_offset; } StringMeta;
+#ifdef _WIN32
 static HANDLE bloom_mapping = NULL;
+#else
+static int bloom_fd = -1;
+#endif
 static const uint8_t* bloom_readonly_base = NULL;
 static size_t g_bloom_size = 0;
 // Global database path for caching term results
@@ -172,6 +176,7 @@ static uint64_t g_db_generation = 0;
 // formats and upgrade transparently.
 #define CACHE_MAGIC   0xCACEF00D
 #define CACHE_VERSION 2
+#ifdef _WIN32
 static BOOL open_bloom(const wchar_t* dbPath){
     wchar_t bp[MAX_PATH]; swprintf(bp, MAX_PATH, L"%s\\bloom.dat", dbPath);
     HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -190,6 +195,28 @@ static void close_bloom(void){
     if(bloom_mapping) CloseHandle(bloom_mapping);
     bloom_mapping=NULL;
 }
+#else
+static BOOL open_bloom(const wchar_t* dbPath){
+    char bp[MAX_PATH];
+    wcstombs(bp, dbPath, MAX_PATH);
+    char full[MAX_PATH];
+    snprintf(full, MAX_PATH, "%s/bloom.dat", bp);
+    bloom_fd = open(full, O_RDONLY);
+    if(bloom_fd < 0) return FALSE;
+    struct stat st;
+    if(fstat(bloom_fd, &st) != 0){ close(bloom_fd); bloom_fd = -1; return FALSE; }
+    g_bloom_size = (size_t)st.st_size;
+    bloom_readonly_base = (const uint8_t*)mmap(NULL, g_bloom_size, PROT_READ, MAP_SHARED, bloom_fd, 0);
+    if(bloom_readonly_base == MAP_FAILED){ close(bloom_fd); bloom_fd = -1; bloom_readonly_base = NULL; return FALSE; }
+    return TRUE;
+}
+static void close_bloom(void){
+    if(bloom_readonly_base && bloom_readonly_base != MAP_FAILED) munmap((void*)bloom_readonly_base, g_bloom_size);
+    bloom_readonly_base = NULL;
+    if(bloom_fd != -1) close(bloom_fd);
+    bloom_fd = -1;
+}
+#endif
 
 typedef struct {
     char* name_pattern;
