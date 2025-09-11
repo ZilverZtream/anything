@@ -113,7 +113,7 @@ typedef struct {
     uint32_t rec_id;
     uint8_t  confidence;   // 0..100
     uint8_t  stage;        // 0=name,1=meta,2=content
-} ProgHit;
+} ProgHit; // consumer must free instances popped from ps->out
 
 typedef struct {
     CRITICAL_SECTION mu;
@@ -130,6 +130,12 @@ void prog_state_init(ProgState* ps, MPMCQueue* out){
 }
 
 void prog_state_release(ProgState* ps){
+    if(ps->out){
+        void* p;
+        while(MPMC_Pop(ps->out, &p)){
+            free(p);
+        }
+    }
     idmap_free(&ps->best);
     DeleteCriticalSection(&ps->mu);
 }
@@ -144,7 +150,7 @@ void prog_submit(ProgState* ps, const uint32_t* ids, size_t n, uint8_t stage, ui
         uint8_t pconf = have ? (uint8_t)(prev & 0xFF) : 0;
         if(!have || stage>pst || (stage==pst && conf>pconf)){
             idmap_set(&ps->best, id, (uint16_t)((stage<<8)|conf));
-            ProgHit* h = (ProgHit*)malloc(sizeof(ProgHit));
+            ProgHit* h = (ProgHit*)malloc(sizeof(ProgHit)); // ownership passed to consumer
             h->rec_id = id; h->confidence = conf; h->stage = stage;
             MPMC_Push(ps->out, h);
         }
