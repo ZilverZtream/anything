@@ -6,6 +6,10 @@
 #include <wchar.h>
 #include "anything.h"
 
+#define DB_BLOOM_MAX_BYTES      (128*1024)  // only index first 128KB of any string
+#define DB_BLOOM_STRIDE_AFTER   (64*1024)   // process every trigram up to 64KB
+#define DB_BLOOM_STRIDE         2           // then sample every other trigram
+
 #ifdef __cplusplus
 extern "C" {
 #endif

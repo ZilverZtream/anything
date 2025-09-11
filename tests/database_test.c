@@ -58,6 +58,23 @@ static void test_trigram_bloom(){
     }
 }
 
+static void test_bloom_cap(){
+    size_t biglen = DB_BLOOM_MAX_BYTES + 1024;
+    char* big = (char*)malloc(biglen + 1);
+    assert(big);
+    for(size_t i=0;i<biglen;i++) big[i] = 'a' + (i % 26);
+    big[biglen] = '\0';
+    uint8_t bloom[8192];
+    uint32_t tc = build_bloom_for_name(big, bloom);
+    free(big);
+    size_t expected = DB_BLOOM_STRIDE_AFTER > 2 ? (DB_BLOOM_STRIDE_AFTER - 2) : 0;
+    size_t rem = DB_BLOOM_MAX_BYTES > DB_BLOOM_STRIDE_AFTER ? (DB_BLOOM_MAX_BYTES - DB_BLOOM_STRIDE_AFTER) : 0;
+    if(rem > 3){
+        expected += ((rem - 3) / DB_BLOOM_STRIDE) + 1;
+    }
+    assert(tc == expected);
+}
+
 static void test_db_put_records_and_get_by_path(){
     wchar_t path[MAX_PATH];
     make_temp_dir(path, MAX_PATH);
@@ -88,6 +105,7 @@ static void test_db_put_records_and_get_by_path(){
 int main(void){
     test_db_intern_wstring();
     test_trigram_bloom();
+    test_bloom_cap();
     test_db_put_records_and_get_by_path();
     printf("All database tests passed\n");
     return 0;

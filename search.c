@@ -950,7 +950,15 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
         size_t tlen=strlen(term);
         char* tl=_strdup(term); lowercase_ascii(tl,tlen);
         uint32_t hbuf[4096]; size_t hn=0;
-        for(size_t i=0;i+3<=tlen && hn<4096;i++){
+        size_t limit = tlen > DB_BLOOM_MAX_BYTES ? DB_BLOOM_MAX_BYTES : tlen;
+        size_t full = limit < DB_BLOOM_STRIDE_AFTER ? limit : DB_BLOOM_STRIDE_AFTER;
+        for(size_t i=0;i+3<=full && hn<4096;i++){
+            uint32_t h=2166136261u ^ 0xA5A5A5A5u; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
+            h=2166136261u ^ 0x3C3C3C3Cu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
+            h=2166136261u ^ 0x5A5A5A5Au; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
+            h=2166136261u ^ 0x1F1F1F1Fu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
+        }
+        for(size_t i=full;i+3<=limit && hn<4096;i+=DB_BLOOM_STRIDE){
             uint32_t h=2166136261u ^ 0xA5A5A5A5u; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
             h=2166136261u ^ 0x3C3C3C3Cu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
             h=2166136261u ^ 0x5A5A5A5Au; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;

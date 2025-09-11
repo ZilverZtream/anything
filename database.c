@@ -46,16 +46,31 @@ static void build_bloom_hashes_simd(const char* tri, uint32_t* out4){
     _mm_storeu_si128((__m128i*)out4, res);
 }
 static uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom){
+    // Bloom construction can be expensive on very large strings.  To keep the
+    // cost bounded we only process the first DB_BLOOM_MAX_BYTES bytes and, after
+    // DB_BLOOM_STRIDE_AFTER, we sample every DB_BLOOM_STRIDE-th trigram.
     ZeroMemory(bloom, 8192);
     uint32_t tcount = 0;
     size_t len = strlen(name_u8);
-    if(len<3) return 0;
+    if(len < 3) return 0;
+
+    size_t limit = len > DB_BLOOM_MAX_BYTES ? DB_BLOOM_MAX_BYTES : len;
     char stack_tmp[512];
-    BOOL heap = len + 1 > sizeof(stack_tmp);
-    char* tmp = heap ? (char*)malloc(len + 1) : stack_tmp;
+    BOOL heap = limit + 1 > sizeof(stack_tmp);
+    char* tmp = heap ? (char*)malloc(limit + 1) : stack_tmp;
     if(!tmp) return 0;
-    memcpy(tmp, name_u8, len + 1); lowercase_ascii(tmp, len);
-    for(size_t i=0;i+3<=len;i++){
+    memcpy(tmp, name_u8, limit);
+    tmp[limit] = '\0';
+    lowercase_ascii(tmp, limit);
+
+    size_t full = limit < DB_BLOOM_STRIDE_AFTER ? limit : DB_BLOOM_STRIDE_AFTER;
+    for(size_t i=0; i + 3 <= full; ++i){
+        uint32_t hs[4];
+        build_bloom_hashes_simd(&tmp[i], hs);
+        bloom_set(bloom, hs[0]); bloom_set(bloom, hs[1]); bloom_set(bloom, hs[2]); bloom_set(bloom, hs[3]);
+        tcount++;
+    }
+    for(size_t i=full; i + 3 <= limit; i += DB_BLOOM_STRIDE){
         uint32_t hs[4];
         build_bloom_hashes_simd(&tmp[i], hs);
         bloom_set(bloom, hs[0]); bloom_set(bloom, hs[1]); bloom_set(bloom, hs[2]); bloom_set(bloom, hs[3]);
