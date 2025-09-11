@@ -93,6 +93,7 @@ static uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom){
     // Bloom construction can be expensive on very large strings.  To keep the
     // cost bounded we only process the first DB_BLOOM_MAX_BYTES bytes and, after
     // DB_BLOOM_STRIDE_AFTER, we sample every DB_BLOOM_STRIDE-th trigram.
+    if(!name_u8 || !bloom) return 0;
     ZeroMemory(bloom, 8192);
     uint32_t tcount = 0;
     size_t len = strlen(name_u8);
@@ -699,7 +700,9 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
                 uint8_t bloom[8192];
                 uint32_t tc = build_bloom_for_name((const char*)namev.mv_data, bloom);
                 uint64_t off = d->bloom_offset;
-                DWORD wr; WriteFile(d->bloom_file, bloom, 8192, &wr, NULL);
+                if(off > UINT64_MAX - 8192){ set_error(d, DB_ERROR_OS, 0, "bloom file too large"); return FALSE; }
+                DWORD wr=0;
+                if(!WriteFile(d->bloom_file, bloom, 8192, &wr, NULL) || wr != 8192){ set_sys_error(d, GetLastError()); return FALSE; }
                 d->bloom_offset += wr;
                 StringMeta sm={.trigram_count=tc,.bloom_offset=off};
                 MDB_val smv={.mv_data=&sm,.mv_size=sizeof(sm)};
@@ -724,7 +727,9 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
                     uint8_t bloom[8192];
                     uint32_t tc = build_bloom_for_name((const char*)cvstr.mv_data, bloom);
                     uint64_t off = d->bloom_offset;
-                    DWORD wr; WriteFile(d->bloom_file, bloom, 8192, &wr, NULL);
+                    if(off > UINT64_MAX - 8192){ set_error(d, DB_ERROR_OS, 0, "bloom file too large"); return FALSE; }
+                    DWORD wr=0;
+                    if(!WriteFile(d->bloom_file, bloom, 8192, &wr, NULL) || wr != 8192){ set_sys_error(d, GetLastError()); return FALSE; }
                     d->bloom_offset += wr;
                     StringMeta sm={.trigram_count=tc,.bloom_offset=off};
                     MDB_val smv={.mv_data=&sm,.mv_size=sizeof(sm)};
