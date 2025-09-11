@@ -1,5 +1,6 @@
 #ifdef _WIN32
 #include <stdlib.h>
+#include <windows.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <gdiplus.h>
@@ -18,6 +19,10 @@ struct FileScanner {
 };
 
 FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, CancelToken* cancelToken){
+    if(threads <= 0){
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        threads = si.dwNumberOfProcessors;
+    }
     FileScanner* s = (FileScanner*)calloc(1, sizeof(FileScanner));
     if(!s) return NULL;
     if(PathIsUNCW(rootPath) || PathIsNetworkPathW(rootPath)){
