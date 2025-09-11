@@ -16,6 +16,8 @@
 
 #ifndef _WIN32
 #include <pthread.h>
+#include <unistd.h>
+#include <time.h>
 #endif
 
 #include "database.h"
@@ -88,59 +90,121 @@ static void tokenlist_free(TokenList* t){
 // Parallel search helpers
 typedef SearchQuery Query;
 typedef struct { uint64_t dummy; } Result;
-static void search_names(Query* q, Result* results){ (void)q; (void)results; }
-static void search_content(Query* q, Result* results){ (void)q; (void)results; }
-static void search_metadata(Query* q, Result* results){ (void)q; (void)results; }
+static int search_names(Query* q, Result* results){ (void)q; (void)results; return 0; }
+static int search_content(Query* q, Result* results){ (void)q; (void)results; return 0; }
+static int search_metadata(Query* q, Result* results){ (void)q; (void)results; return 0; }
+
+typedef int (*SearchFn)(Query*, Result*);
 
 typedef struct {
-    void (*fn)(Query*, Result*);
+    SearchFn fn;
     Query* q;
     Result* results;
 } SearchTask;
 
+typedef struct {
+    SearchTask* tasks;
+    int task_count;
 #ifdef _WIN32
-static DWORD WINAPI search_thread(void* param){
-    SearchTask* t = (SearchTask*)param;
-    t->fn(t->q, t->results);
+    volatile LONG next;
+#else
+    volatile int next;
+#endif
+} TaskQueue;
+
+#ifdef _WIN32
+static unsigned __stdcall pool_worker(void* param){
+    TaskQueue* q = (TaskQueue*)param;
+    for(;;){
+        LONG i = InterlockedIncrement(&q->next) - 1;
+        if(i >= q->task_count) break;
+        SearchTask t = q->tasks[i];
+        t.fn(t.q, t.results);
+    }
     return 0;
 }
-static void parallel_search(Query* q, Result* results){
-    SearchTask tasks[3] = {
-        {search_names, q, results},
-        {search_content, q, results},
-        {search_metadata, q, results},
-    };
-    HANDLE threads[3];
-    for(int i=0;i<3;i++){
-        uintptr_t h = _beginthreadex(NULL, 0, (unsigned (__stdcall *)(void*))search_thread, &tasks[i], 0, NULL);
-        threads[i] = (HANDLE)h;
-    }
-    WaitForMultipleObjects(3, threads, TRUE, INFINITE);
-    for(int i=0;i<3;i++){
-        CloseHandle(threads[i]);
-    }
-}
 #else
-static void* search_thread(void* param){
-    SearchTask* t = (SearchTask*)param;
-    t->fn(t->q, t->results);
+static void* pool_worker(void* param){
+    TaskQueue* q = (TaskQueue*)param;
+    for(;;){
+        int i = __sync_fetch_and_add(&q->next, 1);
+        if(i >= q->task_count) break;
+        SearchTask t = q->tasks[i];
+        t.fn(t.q, t.results);
+    }
     return NULL;
 }
+#endif
+
+static unsigned get_hw_threads(void){
+#ifdef _WIN32
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    return si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (unsigned)(n > 0 ? n : 1);
+#endif
+}
+
+static double g_stage1_ms_avg = 0.0;
+
 static void parallel_search(Query* q, Result* results){
-    SearchTask tasks[3] = {
-        {search_names, q, results},
+    unsigned hw = get_hw_threads();
+    unsigned pool_size = hw < 3 ? hw : 3;
+
+#ifdef _WIN32
+    LARGE_INTEGER freq,start,end;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    int id_count = search_names(q, results);
+    QueryPerformanceCounter(&end);
+    double ms = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
+#else
+    struct timespec ts_start, ts_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    int id_count = search_names(q, results);
+    clock_gettime(CLOCK_MONOTONIC, &ts_end);
+    double ms = (double)(ts_end.tv_sec - ts_start.tv_sec)*1000.0 + (double)(ts_end.tv_nsec - ts_start.tv_nsec)/1e6;
+#endif
+
+    const double ALPHA = 0.2;
+    if(g_stage1_ms_avg==0.0) g_stage1_ms_avg = ms;
+    else g_stage1_ms_avg = g_stage1_ms_avg*(1.0-ALPHA) + ms*ALPHA;
+
+    const int ID_THRESHOLD = 100;
+    if(pool_size <= 1 || id_count <= ID_THRESHOLD || g_stage1_ms_avg < 1.0){
+        search_content(q, results);
+        search_metadata(q, results);
+        return;
+    }
+
+    SearchTask tasks[2] = {
         {search_content, q, results},
         {search_metadata, q, results},
     };
-    pthread_t threads[3];
-    for(int i=0;i<3;i++){
-        pthread_create(&threads[i], NULL, search_thread, &tasks[i]);
+    TaskQueue queue = { tasks, 2, 0 };
+    unsigned workers = pool_size;
+    if(workers > 2) workers = 2;
+
+#ifdef _WIN32
+    HANDLE threads[3];
+    for(unsigned i=0;i<workers;i++){
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, pool_worker, &queue, 0, NULL);
     }
-    for(int i=0;i<3;i++){
+    WaitForMultipleObjects(workers, threads, TRUE, INFINITE);
+    for(unsigned i=0;i<workers;i++){
+        CloseHandle(threads[i]);
+    }
+#else
+    pthread_t threads[3];
+    for(unsigned i=0;i<workers;i++){
+        pthread_create(&threads[i], NULL, pool_worker, &queue);
+    }
+    for(unsigned i=0;i<workers;i++){
         pthread_join(threads[i], NULL);
     }
-}
 #endif
+}
 
 typedef struct Node{ int type; TermType ttype; char* text; struct Node* left; struct Node* right; } Node;
 static void free_node(Node* n){ if(!n)return; free_node(n->left); free_node(n->right); if(n->type==TOK_TERM && n->text) free(n->text); free(n); }
