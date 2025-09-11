@@ -17,21 +17,21 @@ struct FileScanner {
     } u;
 };
 
-FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent){
+FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, CancelToken* cancelToken){
     FileScanner* s = (FileScanner*)calloc(1, sizeof(FileScanner));
     if(!s) return NULL;
     if(PathIsUNCW(rootPath) || PathIsNetworkPathW(rootPath)){
-        s->u.net = NetworkScanner_Start(rootPath, threads, outQueue, cancelEvent);
+        s->u.net = NetworkScanner_Start(rootPath, threads, outQueue, cancelToken);
         if(!s->u.net){ free(s); return NULL; }
         s->kind = FS_NETWORK;
         return s;
     }
-    s->u.ntfs = NTFSScanner_Start(rootPath, threads, outQueue, cancelEvent);
+    s->u.ntfs = NTFSScanner_Start(rootPath, threads, outQueue, cancelToken);
     if(s->u.ntfs){
         s->kind = FS_NTFS;
         return s;
     }
-    s->u.gen = GenericScanner_Start(rootPath, threads, outQueue, cancelEvent);
+    s->u.gen = GenericScanner_Start(rootPath, threads, outQueue, cancelToken);
     if(!s->u.gen){
         free(s);
         return NULL;

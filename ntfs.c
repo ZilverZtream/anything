@@ -122,7 +122,7 @@ static FrnEntry* frnmap_get(FrnMap* m, uint64_t frn){
 typedef struct USNScanner {
     HANDLE hVol;
     MPMCQueue* outq;
-    HANDLE cancel;
+    CancelToken* cancel;
     wchar_t volRoot[8]; // e.g., L"C:\\"
     wchar_t volPrefix[8]; // e.g., L"\\\\.\\C:" or root path for path building "C:\"
     FrnMap map;
@@ -174,7 +174,7 @@ static DWORD WINAPI usn_thread(void* p){
     // first, fill the FRN map
     frnmap_init(&s->map, 1<<20);
     for(;;){
-        if(WaitForSingleObject(s->cancel, 0)==WAIT_OBJECT_0) break;
+        if(is_cancelled(s->cancel)) break;
         if(!DeviceIoControl(s->hVol, FSCTL_ENUM_USN_DATA, &med, sizeof(med), buf, 16*1024*1024, &bytes, NULL)){
             DWORD e = GetLastError(); if(e==ERROR_HANDLE_EOF) break; else { break; }
         }
@@ -222,10 +222,10 @@ static DWORD WINAPI usn_thread(void* p){
     return 0;
 }
 
-NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue* outQueue, HANDLE cancelEvent){
+NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue* outQueue, CancelToken* cancelToken){
     (void)threads;
     USNScanner* s = (USNScanner*)calloc(1,sizeof(USNScanner));
-    s->outq = outQueue; s->cancel = cancelEvent;
+    s->outq = outQueue; s->cancel = cancelToken;
     wcscpy_s(s->volRoot, 8, volumeRoot);
     volume_from_root(volumeRoot, s->volPrefix, 8);
     s->hVol = CreateFileW(s->volPrefix, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
@@ -250,7 +250,7 @@ void NTFSScanner_Free(NTFSScanner* s_){
 // USN tailer: read new records and emit updates
 typedef struct TailCtx {
     HANDLE hVol;
-    HANDLE cancel;
+    CancelToken* cancel;
     MPMCQueue* outq;
     wchar_t root[8];
     HANDLE thread;
@@ -272,7 +272,7 @@ static DWORD WINAPI tail_thread(void* p){
     readData.BytesToWaitFor = 0; // poll
     readData.Timeout = 0;
     for(;;){
-        if(WaitForSingleObject(t->cancel, 0)==WAIT_OBJECT_0) break;
+        if(is_cancelled(t->cancel)) break;
         if(!DeviceIoControl(t->hVol, FSCTL_READ_USN_JOURNAL, &readData, sizeof(readData), buf, 1024*1024, &bytes, NULL)){
             Sleep(50); continue;
         }
@@ -345,13 +345,13 @@ static DWORD WINAPI tail_thread(void* p){
     return 0;
 }
 
-HANDLE StartUSNTailer(const wchar_t* volumeRoot, MPMCQueue* outQueue, HANDLE cancelEvent){
+HANDLE StartUSNTailer(const wchar_t* volumeRoot, MPMCQueue* outQueue, CancelToken* cancelToken){
     wchar_t volprefix[8];
     if(!volume_from_root(volumeRoot, volprefix, 8)) return NULL;
     HANDLE hVol = CreateFileW(volprefix, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if(hVol==INVALID_HANDLE_VALUE) return NULL;
     TailCtx* t = (TailCtx*)calloc(1,sizeof(TailCtx));
-    t->hVol=hVol; t->cancel=cancelEvent; t->outq=outQueue;
+    t->hVol=hVol; t->cancel=cancelToken; t->outq=outQueue;
     wcscpy_s(t->root, 8, volumeRoot);
     t->thread = CreateThread(NULL,0,tail_thread,t,0,NULL);
     return t->thread;

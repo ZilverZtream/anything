@@ -642,7 +642,7 @@ typedef struct WriterCtx {
     int batch_size;
     volatile BOOL done;
     MPMCQueue queue;
-    HANDLE cancel_event;
+    CancelToken cancel;
     size_t grow_attempts;
 } WriterCtx;
 
@@ -840,7 +840,7 @@ static BOOL parse_args(int argc, wchar_t** argv, Args* a){
 static DWORD WINAPI scan_drive_thread(void* p){
     struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = p;
     (void)in->use_ntfs; // selection now handled internally
-    FileScanner* fs = FileScanner_Start(in->root, in->threads, &in->ctx->queue, in->ctx->cancel_event);
+    FileScanner* fs = FileScanner_Start(in->root, in->threads, &in->ctx->queue, &in->ctx->cancel);
     if(fs){
         FileScanner_Wait(fs);
         FileScanner_Free(fs);
@@ -889,11 +889,11 @@ int wmain(int argc, wchar_t** argv){
     }
 
     WriterCtx ctx = {0};
-    ctx.db = db; ctx.batch_size = args.batch; ctx.done=FALSE; ctx.cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ctx.db = db; ctx.batch_size = args.batch; ctx.done=FALSE; ctx.cancel.signaled = FALSE;
     if(!MPMC_Init(&ctx.queue, 1<<18)){
         fwprintf(stderr, L"MPMC_Init failed\n"); db_close(db); return 1;
     }
-    PluginHost ph = { &ctx.queue, ctx.cancel_event };
+    PluginHost ph = { &ctx.queue, &ctx.cancel };
     Plugin_LoadAll(L"plugins", &ph);
     HANDLE writer = CreateThread(NULL,0,DbWriterThread,&ctx,0,NULL);
 
@@ -945,7 +945,7 @@ int wmain(int argc, wchar_t** argv){
     Plugin_ScanAll();
 
     if(args.tail_changes && !args.all_drives){
-        HANDLE tailer = StartUSNTailer(args.rootPath, &ctx.queue, ctx.cancel_event);
+        HANDLE tailer = StartUSNTailer(args.rootPath, &ctx.queue, &ctx.cancel);
         if(tailer){
             wprintf(L"Tailing changes on %s. Press Ctrl+C to stop...\n", args.rootPath);
             Sleep(5000); // demo
@@ -976,6 +976,5 @@ int wmain(int argc, wchar_t** argv){
     Plugin_UnloadAll();
     db_close(db);
     MPMC_Destroy(&ctx.queue);
-    CloseHandle(ctx.cancel_event);
     return 0;
 }

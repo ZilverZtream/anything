@@ -10,13 +10,16 @@
 #else
 #include <pthread.h>
 #include <sys/types.h>
-// Use pthread_t for HANDLE on non-Windows platforms to provide a
-// concrete native handle type rather than a generic void pointer.
-typedef pthread_t HANDLE;
-typedef int BOOL;
 #include <stdint.h>
+#ifndef BOOL
+typedef int BOOL;
+#endif
+#ifndef LONG
 typedef int32_t LONG;
+#endif
+#ifndef LONG64
 typedef int64_t LONG64;
+#endif
 #ifndef TRUE
 #define TRUE 1
 #define FALSE 0
@@ -25,6 +28,14 @@ typedef int64_t LONG64;
 #define MAX_PATH 260
 #endif
 #endif
+
+typedef struct CancelToken {
+    volatile BOOL signaled;
+} CancelToken;
+
+static inline BOOL is_cancelled(const CancelToken* t){
+    return t && t->signaled;
+}
 
 #ifndef CACHE_LINE_SIZE
 #define CACHE_LINE_SIZE 64
@@ -132,25 +143,25 @@ BOOL MPMC_Pop(MPMCQueue* q, void** out);
 
 // ---- Generic scanner (multi-threaded with work stealing) ----
 typedef struct GenericScanner GenericScanner;
-GenericScanner* GenericScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent);
+GenericScanner* GenericScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, CancelToken* cancelToken);
 void GenericScanner_Wait(GenericScanner* s);
 void GenericScanner_Free(GenericScanner* s);
 
 // ---- Network share scanner ----
 typedef struct NetworkScanner NetworkScanner;
-NetworkScanner* NetworkScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent);
+NetworkScanner* NetworkScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, CancelToken* cancelToken);
 void NetworkScanner_Wait(NetworkScanner* s);
 void NetworkScanner_Free(NetworkScanner* s);
 
 // ---- NTFS USN-based scanner ----
 typedef struct NTFSScanner NTFSScanner;
-NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue* outQueue, HANDLE cancelEvent);
+NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue* outQueue, CancelToken* cancelToken);
 void NTFSScanner_Wait(NTFSScanner* s);
 void NTFSScanner_Free(NTFSScanner* s);
 
 // Change tailer via USN journal
 #ifdef _WIN32
-HANDLE StartUSNTailer(const wchar_t* volumeRoot, MPMCQueue* outQueue, HANDLE cancelEvent);
+HANDLE StartUSNTailer(const wchar_t* volumeRoot, MPMCQueue* outQueue, CancelToken* cancelToken);
 #endif
 
 #ifndef ANYTHING_NO_DB_TYPES

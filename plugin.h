@@ -7,7 +7,7 @@
 
 typedef struct PluginHost {
     MPMCQueue* queue;
-    HANDLE cancel_event;
+    CancelToken* cancel_token;
 } PluginHost;
 
 typedef struct AnythingPlugin {

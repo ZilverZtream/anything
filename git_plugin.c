@@ -22,8 +22,6 @@
 #include <unistd.h>
 #include <limits.h>
 #define _snwprintf swprintf
-#define WAIT_OBJECT_0 0
-static int WaitForSingleObject(HANDLE h, unsigned int ms){(void)h;(void)ms;return 1;}
 #define Sleep(ms) usleep((ms)*1000)
 static int wcscpy_s(wchar_t* dst, size_t dstcch, const wchar_t* src){
     if(!dst || !src || dstcch==0) return 1;
@@ -117,7 +115,7 @@ static void process_commit(const wchar_t* repo_path, git_repository* repo, const
     wi->preview = NULL;
     wi->clone_id = 0;
     while(!MPMC_Push(g_host.queue, wi)){
-        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0){
+        if(is_cancelled(g_host.cancel_token)){
             aligned_free(wi); free(wcontent); git_commit_free(commit); return;
         }
         Sleep(0);
@@ -127,7 +125,7 @@ static void process_commit(const wchar_t* repo_path, git_repository* repo, const
 
 #ifdef _WIN32
 static void scan_dir(const wchar_t* dir){
-    if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) return;
+    if(is_cancelled(g_host.cancel_token)) return;
     wchar_t pattern[MAX_LONG_PATH];
     _snwprintf(pattern, MAX_LONG_PATH, L"%s\\*.*", dir);
     WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pattern, &fd);
@@ -136,7 +134,7 @@ static void scan_dir(const wchar_t* dir){
         return;
     }
     do{
-        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+        if(is_cancelled(g_host.cancel_token)) break;
         if(fd.cFileName[0]==L'.' && (fd.cFileName[1]==0 || (fd.cFileName[1]==L'.' && fd.cFileName[2]==0))) continue;
         wchar_t full[MAX_LONG_PATH];
         _snwprintf(full, MAX_LONG_PATH, L"%s\\%s", dir, fd.cFileName);
@@ -164,7 +162,7 @@ static void scan_dir(const wchar_t* dir){
                         }
                         git_oid oid;
                         while(git_revwalk_next(&oid, walk)==0){
-                            if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+                            if(is_cancelled(g_host.cancel_token)) break;
                             process_commit(dir, repo, &oid);
                         }
                         git_revwalk_free(walk);
@@ -186,7 +184,7 @@ static void scan_dir(const wchar_t* dir){
 }
 #else
 static void scan_dir(const wchar_t* dir){
-    if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) return;
+    if(is_cancelled(g_host.cancel_token)) return;
     char dir_mb[PATH_MAX];
     wcstombs(dir_mb, dir, sizeof(dir_mb));
     DIR* d = opendir(dir_mb);
@@ -196,7 +194,7 @@ static void scan_dir(const wchar_t* dir){
     }
     struct dirent* ent;
     while((ent = readdir(d))){
-        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+        if(is_cancelled(g_host.cancel_token)) break;
         if(ent->d_name[0]=='.' && (ent->d_name[1]==0 || (ent->d_name[1]=='.' && ent->d_name[2]==0))) continue;
         char full_mb[PATH_MAX];
         snprintf(full_mb, sizeof(full_mb), "%s/%s", dir_mb, ent->d_name);
@@ -232,7 +230,7 @@ static void scan_dir(const wchar_t* dir){
                         }
                         git_oid oid;
                         while(git_revwalk_next(&oid, walk)==0){
-                            if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+                            if(is_cancelled(g_host.cancel_token)) break;
                             process_commit(dir, repo, &oid);
                         }
                         git_revwalk_free(walk);

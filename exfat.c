@@ -15,7 +15,7 @@ typedef struct DirTask {
 } DirTask;
 
 typedef struct GenericScanner {
-    HANDLE cancel;
+    CancelToken* cancel;
     int threads;
     MPMCQueue* outq;
     HANDLE workers[MAX_THREADS];
@@ -76,7 +76,7 @@ static void scan_dir(GenericScanner* s, int tidx, const wchar_t* dir){
     WIN32_FIND_DATAW f; HANDLE h = FindFirstFileExW(pattern, FindExInfoBasic, &f, FindExSearchNameMatch, NULL, 0);
     if(h==INVALID_HANDLE_VALUE) return;
     do{
-        if(WaitForSingleObject(s->cancel, 0)==WAIT_OBJECT_0) break;
+        if(is_cancelled(s->cancel)) break;
         emit(s->outq, dir, &f);
         if((f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(f.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)){
             wchar_t sub[MAX_LONG_PATH];
@@ -97,7 +97,7 @@ static DWORD WINAPI worker2(void* p){
     ThreadBundle* tb = (ThreadBundle*)p;
     GenericScanner* s = tb->s; int tidx = tb->idx;
     DirTask* t=NULL;
-    while(WaitForSingleObject(s->cancel, 0)!=WAIT_OBJECT_0){
+    while(!is_cancelled(s->cancel)){
         if(!pop_task(s, tidx, &t)){ Sleep(1); continue; }
         scan_dir(s, tidx, t->path);
         free(t);
@@ -106,9 +106,9 @@ static DWORD WINAPI worker2(void* p){
     return 0;
 }
 
-GenericScanner* GenericScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent){
+GenericScanner* GenericScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, CancelToken* cancelToken){
     GenericScanner* s = (GenericScanner*)calloc(1,sizeof(GenericScanner));
-    s->cancel = cancelEvent; s->outq = outQueue; s->threads = threads;
+    s->cancel = cancelToken; s->outq = outQueue; s->threads = threads;
     for(int i=0;i<threads;i++){
         MPMC_Init(&s->local_q[i], 1<<12);
     }

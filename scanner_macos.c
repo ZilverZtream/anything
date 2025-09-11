@@ -30,7 +30,7 @@ struct FileScanner {
     pthread_t enum_thread;
     CFRunLoopRef run_loop;
     volatile BOOL stop;
-    HANDLE cancel;
+    CancelToken* cancel;
     MPMCQueue* outq;
     char root[PATH_MAX];
     BOOL is_network;
@@ -38,15 +38,6 @@ struct FileScanner {
 };
 
 static FileScanner* g_current;
-
-static BOOL is_cancelled(HANDLE h){
-#ifdef _WIN32
-    return WaitForSingleObject(h,0)==WAIT_OBJECT_0;
-#else
-    if(!h) return FALSE;
-    return *(volatile BOOL*)(uintptr_t)h;
-#endif
-}
 
 wchar_t* GenerateThumbnail(const wchar_t* path){
     CFStringRef cfPath = CFStringCreateWithCharacters(NULL, path, wcslen(path));
@@ -300,7 +291,7 @@ static void* loop_thread(void* arg){
     return NULL;
 }
 
-FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, HANDLE cancelEvent){
+FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, CancelToken* cancelToken){
     (void)threads;
     char tmp[PATH_MAX];
     wcstombs(tmp, rootPath, PATH_MAX);
@@ -310,7 +301,7 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
             FileScanner* s = (FileScanner*)calloc(1, sizeof(FileScanner));
             if(!s) return NULL;
             s->is_network = TRUE;
-            s->net = NetworkScanner_Start(rootPath, threads, outQueue, cancelEvent);
+            s->net = NetworkScanner_Start(rootPath, threads, outQueue, cancelToken);
             if(!s->net){ free(s); return NULL; }
             return s;
         }
@@ -318,7 +309,7 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
     FileScanner* s = (FileScanner*)calloc(1,sizeof(FileScanner));
     if(!s) return NULL;
     s->outq = outQueue;
-    s->cancel = cancelEvent;
+    s->cancel = cancelToken;
     wcstombs(s->root, rootPath, PATH_MAX);
     CFStringRef path = CFStringCreateWithCString(NULL, s->root, kCFStringEncodingUTF8);
     CFArrayRef paths = CFArrayCreate(NULL, (const void**)&path, 1, &kCFTypeArrayCallBacks);

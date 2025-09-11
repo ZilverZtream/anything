@@ -16,8 +16,6 @@
 #include <limits.h>
 #define _snwprintf swprintf
 #define _wcsicmp wcscasecmp
-#define WAIT_OBJECT_0 0
-static int WaitForSingleObject(HANDLE h, unsigned int ms){(void)h;(void)ms;return 1;}
 #define Sleep(ms) usleep((ms)*1000)
 static int wcscpy_s(wchar_t* dst,size_t dstcch,const wchar_t* src){ if(!dst||!src||dstcch==0) return 1; wcsncpy(dst,src,dstcch); dst[dstcch-1]=0; return 0; }
 static uint64_t to_filetime(time_t t){ return ((uint64_t)t*10000000ULL)+116444736000000000ULL; }
@@ -217,7 +215,7 @@ static void scan(void){
     WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pattern,&fd);
     if(h==INVALID_HANDLE_VALUE) return;
     do{
-        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+        if(is_cancelled(g_host.cancel_token)) break;
         if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         const wchar_t* ext = wcsrchr(fd.cFileName, L'.');
         if(!ext) continue; ext++;
@@ -241,7 +239,7 @@ static void scan(void){
         wi->op = WI_ADD;
         int tries = 0;
         while(!MPMC_Push(g_host.queue, wi)){
-            if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
+            if(is_cancelled(g_host.cancel_token) || tries++>1000){
                 free(wi->content);
                 aligned_free(wi);
                 FindClose(h);
@@ -261,7 +259,7 @@ static void scan(void){
     if(!d) return;
     struct dirent* ent;
     while((ent = readdir(d))){
-        if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0) break;
+        if(is_cancelled(g_host.cancel_token)) break;
         char* ext = strrchr(ent->d_name, '.');
         if(!ext) continue; ext++;
         wchar_t wext[32]; mbstowcs(wext, ext, 32);
@@ -292,7 +290,7 @@ static void scan(void){
         wi->op = WI_ADD;
         int tries = 0;
         while(!MPMC_Push(g_host.queue, wi)){
-            if(WaitForSingleObject(g_host.cancel_event,0)==WAIT_OBJECT_0 || tries++>1000){
+            if(is_cancelled(g_host.cancel_token) || tries++>1000){
                 free(wi->content);
                 aligned_free(wi);
                 closedir(d);
