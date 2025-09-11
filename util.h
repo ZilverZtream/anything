@@ -23,6 +23,7 @@ void aligned_free(void* p);
 
 void lowercase_ascii(char* s, size_t n);
 void lowercase_wchar(wchar_t* s);
+void make_long_path(const wchar_t* in, wchar_t* out, size_t outcch);
 BOOL path_join(wchar_t* dst, size_t dstcch, const wchar_t* a, const wchar_t* b);
 BOOL path_dirname(const wchar_t* path, wchar_t* out, size_t outcch);
 BOOL get_drive_root(const wchar_t* any_path, wchar_t* root, size_t cch);

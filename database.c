@@ -279,9 +279,10 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
     char u8[MAX_PATH*3]; WideCharToMultiByte(CP_UTF8,0,path,-1,u8,sizeof(u8),NULL,NULL);
     rc = mdb_env_open(d->env, u8, MDB_WRITEMAP|MDB_MAPASYNC, 0664);
     if(rc){ set_mdb_error(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
-    wchar_t bloomPath[MAX_PATH];
-    swprintf(bloomPath, MAX_PATH, L"%s\\bloom.dat", path);
-    d->bloom_file = CreateFileW(bloomPath, GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    wchar_t bloomPath[MAX_LONG_PATH];
+    swprintf(bloomPath, MAX_LONG_PATH, L"%s\\bloom.dat", path);
+    wchar_t lp[MAX_LONG_PATH]; make_long_path(bloomPath, lp, MAX_LONG_PATH);
+    d->bloom_file = CreateFileW(lp, GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if(d->bloom_file==INVALID_HANDLE_VALUE){ set_sys_error(d, GetLastError()); mdb_env_close(d->env); free(d); return FALSE; }
     LARGE_INTEGER sz; sz.QuadPart = 0; GetFileSizeEx(d->bloom_file, &sz); d->bloom_offset = sz.QuadPart; SetFilePointerEx(d->bloom_file, sz, NULL, FILE_BEGIN);
     MDB_txn* txn;

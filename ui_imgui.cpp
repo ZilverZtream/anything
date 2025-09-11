@@ -65,8 +65,9 @@ static const uint8_t* bloom_readonly_base = nullptr;
 static size_t g_bloom_size = 0;
 static bool open_bloom(const wchar_t* dbPath){
 #ifdef _WIN32
-    wchar_t bp[MAX_PATH]; swprintf(bp, MAX_PATH, L"%s\\bloom.dat", dbPath);
-    HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    wchar_t bp[MAX_LONG_PATH]; swprintf(bp, MAX_LONG_PATH, L"%s\\bloom.dat", dbPath);
+    wchar_t lp[MAX_LONG_PATH]; make_long_path(bp, lp, MAX_LONG_PATH);
+    HANDLE f = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER sz; GetFileSizeEx(f,&sz); g_bloom_size = sz.QuadPart;
     bloom_mapping = CreateFileMappingW(f,NULL,PAGE_READONLY,0,0,NULL);

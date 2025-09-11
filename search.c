@@ -175,7 +175,7 @@ static int bloom_fd = -1;
 static const uint8_t* bloom_readonly_base = NULL;
 static size_t g_bloom_size = 0;
 // Global database path for caching term results
-static wchar_t g_db_path[MAX_PATH]={0};
+static wchar_t g_db_path[MAX_LONG_PATH]={0};
 static uint64_t g_db_generation = 0;
 
 // Magic marker and version for cache files so we can detect incompatible
@@ -184,8 +184,9 @@ static uint64_t g_db_generation = 0;
 #define CACHE_VERSION 2
 #ifdef _WIN32
 static BOOL open_bloom(const wchar_t* dbPath){
-    wchar_t bp[MAX_PATH]; swprintf(bp, MAX_PATH, L"%s\\bloom.dat", dbPath);
-    HANDLE f = CreateFileW(bp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    wchar_t bp[MAX_LONG_PATH]; swprintf(bp, MAX_LONG_PATH, L"%s\\bloom.dat", dbPath);
+    wchar_t lp[MAX_LONG_PATH]; make_long_path(bp, lp, MAX_LONG_PATH);
+    HANDLE f = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return FALSE;
     LARGE_INTEGER sz; GetFileSizeEx(f,&sz); g_bloom_size = sz.QuadPart;
     bloom_mapping = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
@@ -286,7 +287,7 @@ static int search_names(Query* q, Result* results){
     MDB_dbi dbi_fname, dbi_trigram, dbi_strings, dbi_smeta, dbi_ext, dbi_size, dbi_mtime;
     if(mdb_env_create(&env)!=0) return 0;
     mdb_env_set_maxdbs(env,64);
-    char u8db[MAX_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
+    char u8db[MAX_LONG_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
     if(mdb_env_open(env,u8db,MDB_RDONLY,0664)!=0){ mdb_env_close(env); return 0; }
     if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ mdb_env_close(env); return 0; }
     if(mdb_dbi_open(txn,"filename_index",0,&dbi_fname)!=0 ||
@@ -346,7 +347,7 @@ static int search_metadata(Query* q, Result* results){
     MDB_dbi dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_strrev;
     if(mdb_env_create(&env)!=0) { prog_mark_done(g_prog_state,1); return 0; }
     mdb_env_set_maxdbs(env,64);
-    char u8db[MAX_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
+    char u8db[MAX_LONG_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
     if(mdb_env_open(env,u8db,MDB_RDONLY,0664)!=0){ mdb_env_close(env); prog_mark_done(g_prog_state,1); return 0; }
     if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ mdb_env_close(env); prog_mark_done(g_prog_state,1); return 0; }
     if(mdb_dbi_open(txn,"author_index",0,&dbi_author)!=0 ||
@@ -388,7 +389,7 @@ static int search_content(Query* q, Result* results){
     MDB_dbi dbi_trigram, dbi_content;
     if(mdb_env_create(&env)!=0){ prog_mark_done(g_prog_state,2); return 0; }
     mdb_env_set_maxdbs(env,64);
-    char u8db[MAX_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
+    char u8db[MAX_LONG_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
     if(mdb_env_open(env,u8db,MDB_RDONLY,0664)!=0){ mdb_env_close(env); prog_mark_done(g_prog_state,2); return 0; }
     if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ mdb_env_close(env); prog_mark_done(g_prog_state,2); return 0; }
     if(mdb_dbi_open(txn,"trigram_index",0,&dbi_trigram)!=0 ||
@@ -656,7 +657,7 @@ static void output_error(bool json, const char* msg){
 static int set_indexer_state(const wchar_t* dbPath, bool start, bool json){
     MDB_env* env;
     if(mdb_env_create(&env)!=0){ output_error(json, "env_create failed"); return 1; }
-    char u8db[MAX_PATH*3]; to_utf8(dbPath, u8db, sizeof(u8db));
+    char u8db[MAX_LONG_PATH*3]; to_utf8(dbPath, u8db, sizeof(u8db));
     if(mdb_env_open(env, u8db, 0, 0664)!=0){ mdb_env_close(env); output_error(json, "env_open failed"); return 1; }
     MDB_txn* txn;
     if(mdb_txn_begin(env, NULL, 0, &txn)!=0){ mdb_env_close(env); output_error(json, "txn_begin failed"); return 1; }
@@ -702,7 +703,7 @@ static void parse_query(int argc, wchar_t** argv, wchar_t* dbPath, SearchQuery* 
     q->date_min_day=0; q->date_max_day=~0ULL;
     tokenlist_init(tokens);
     for(int i=1;i<argc;i++){
-        if(wcscmp(argv[i], L"--db")==0 && i+1<argc){ wcscpy_s(dbPath, MAX_PATH, argv[++i]); continue; }
+        if(wcscmp(argv[i], L"--db")==0 && i+1<argc){ wcscpy_s(dbPath, MAX_LONG_PATH, argv[++i]); continue; }
         if(wcscmp(argv[i], L"--start-indexer")==0 || wcscmp(argv[i], L"--pause-indexer")==0) continue;
         char u8[1024]; to_utf8(argv[i], u8, sizeof(u8));
         if(_strnicmp(u8,"size:",5)==0){
@@ -800,7 +801,7 @@ typedef struct {
 typedef struct CacheEntry {
     uint64_t access_time;
     uint64_t size;
-    wchar_t path[MAX_PATH];
+    wchar_t path[MAX_LONG_PATH];
     struct CacheEntry* next;
 } CacheEntry;
 
@@ -817,7 +818,8 @@ static void evict_lru_cache_entries(CacheEntry* head, size_t max_size, uint64_t 
     size_t total = 0, count = 0;
     for(CacheEntry* e=head; e; e=e->next){
         if(e->access_time < cutoff){
-            DeleteFileW(e->path);
+            wchar_t lp[MAX_LONG_PATH]; make_long_path(e->path, lp, MAX_LONG_PATH);
+            DeleteFileW(lp);
         } else {
             total += e->size;
             count++;
@@ -829,7 +831,8 @@ static void evict_lru_cache_entries(CacheEntry* head, size_t max_size, uint64_t 
     size_t i=0; for(CacheEntry* e=head; e; e=e->next){ if(e->access_time >= cutoff) arr[i++]=e; }
     qsort(arr, count, sizeof(CacheEntry*), cmp_cache_entry);
     for(i=0; i<count && total>max_size; i++){
-        DeleteFileW(arr[i]->path);
+        wchar_t lp[MAX_LONG_PATH]; make_long_path(arr[i]->path, lp, MAX_LONG_PATH);
+        DeleteFileW(lp);
         if(arr[i]->size <= total) total -= arr[i]->size; else total = 0;
     }
     free(arr);
@@ -844,19 +847,19 @@ static wchar_t* path_dirname_w(wchar_t* path){
 
 #ifdef _WIN32
 static void prune_cache_dir(const wchar_t* anyPath){
-    wchar_t dir[MAX_PATH]; wcscpy_s(dir, MAX_PATH, anyPath);
+    wchar_t dir[MAX_LONG_PATH]; wcscpy_s(dir, MAX_LONG_PATH, anyPath);
     wchar_t* p = path_dirname_w(dir); if(!p) return; *p = 0;
     CacheEntry* head = NULL;
     const wchar_t* patterns[2] = {L"cache_*.tmp", L"cache_term_*.tmp"};
     for(int i=0;i<2;i++){
-        wchar_t pat[MAX_PATH]; swprintf(pat, MAX_PATH, L"%s\\%s", dir, patterns[i]);
+        wchar_t pat[MAX_LONG_PATH]; swprintf(pat, MAX_LONG_PATH, L"%s\\%s", dir, patterns[i]);
         WIN32_FIND_DATAW fd; HANDLE h=FindFirstFileW(pat, &fd);
         if(h!=INVALID_HANDLE_VALUE){
             do{
                 if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)){
                     CacheEntry* e = (CacheEntry*)malloc(sizeof(CacheEntry));
                     if(!e) continue;
-                    swprintf(e->path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+                    swprintf(e->path, MAX_LONG_PATH, L"%s\\%s", dir, fd.cFileName);
                     ULARGE_INTEGER ui;
                     ui.LowPart = fd.ftLastAccessTime.dwLowDateTime;
                     ui.HighPart = fd.ftLastAccessTime.dwHighDateTime;
@@ -885,10 +888,11 @@ static void prune_cache_dir(const char* anyPath){ (void)anyPath; }
 static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     uint64_t sig = hash64(qstr, strlen(qstr));
 #ifdef _WIN32
-    wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, dbPath);
+    wchar_t cachePath[MAX_LONG_PATH]; wcscpy_s(cachePath, MAX_LONG_PATH, dbPath);
     wchar_t* p = path_dirname_w(cachePath); if(!p) return FALSE;
-    swprintf(p+1, (size_t)(MAX_PATH-(p+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
-    HANDLE f = CreateFileW(cachePath, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    swprintf(p+1, (size_t)(MAX_LONG_PATH-(p+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
+    wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
+    HANDLE f = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return FALSE;
     DWORD sz = GetFileSize(f, NULL);
     if(sz < sizeof(CacheHeader)){ CloseHandle(f); return FALSE; }
@@ -944,10 +948,11 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
 static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids){
     uint64_t sig = hash64(qstr, strlen(qstr));
 #ifdef _WIN32
-    wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, dbPath);
+    wchar_t cachePath[MAX_LONG_PATH]; wcscpy_s(cachePath, MAX_LONG_PATH, dbPath);
     wchar_t* p = path_dirname_w(cachePath); if(!p) return;
-    swprintf(p+1, (size_t)(MAX_PATH-(p+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
-    HANDLE f = CreateFileW(cachePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    swprintf(p+1, (size_t)(MAX_LONG_PATH-(p+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
+    wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
+    HANDLE f = CreateFileW(lp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return;
     HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, (DWORD)(sizeof(CacheHeader)+ids->n*sizeof(uint64_t)), NULL);
     if(!m){ CloseHandle(f); return; }
@@ -1014,10 +1019,11 @@ static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
     key[sizeof(key)-1] = 0;
     uint64_t sig = hash64(key, strlen(key));
 #ifdef _WIN32
-    wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, g_db_path);
+    wchar_t cachePath[MAX_LONG_PATH]; wcscpy_s(cachePath, MAX_LONG_PATH, g_db_path);
     wchar_t* p = path_dirname_w(cachePath); if(!p) return FALSE;
-    swprintf(p+1, (size_t)(MAX_PATH-(p+1-cachePath)), L"cache_term_%016llx.tmp", (unsigned long long)sig);
-    HANDLE f = CreateFileW(cachePath, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    swprintf(p+1, (size_t)(MAX_LONG_PATH-(p+1-cachePath)), L"cache_term_%016llx.tmp", (unsigned long long)sig);
+    wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
+    HANDLE f = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return FALSE;
     DWORD sz = GetFileSize(f, NULL);
     if(sz < sizeof(CacheHeader)){ CloseHandle(f); return FALSE; }
@@ -1079,10 +1085,11 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     key[sizeof(key)-1] = 0;
     uint64_t sig = hash64(key, strlen(key));
 #ifdef _WIN32
-    wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, g_db_path);
+    wchar_t cachePath[MAX_LONG_PATH]; wcscpy_s(cachePath, MAX_LONG_PATH, g_db_path);
     wchar_t* p = path_dirname_w(cachePath); if(!p) return;
-    swprintf(p+1, (size_t)(MAX_PATH-(p+1-cachePath)), L"cache_term_%016llx.tmp", (unsigned long long)sig);
-    HANDLE f = CreateFileW(cachePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    swprintf(p+1, (size_t)(MAX_LONG_PATH-(p+1-cachePath)), L"cache_term_%016llx.tmp", (unsigned long long)sig);
+    wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
+    HANDLE f = CreateFileW(lp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if(f==INVALID_HANDLE_VALUE) return;
     HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, (DWORD)(sizeof(CacheHeader)+ids->n*sizeof(uint64_t)), NULL);
     if(!m){ CloseHandle(f); return; }
@@ -1172,7 +1179,7 @@ typedef struct FilterArgs {
     RankedResult* out;
     size_t outn;
     size_t outcap;
-    char db_path[MAX_PATH*3];
+    char db_path[MAX_LONG_PATH*3];
     size_t total_docs;
     size_t docs_with_term;
 } FilterArgs;
@@ -1833,7 +1840,7 @@ int wmain(int argc, wchar_t** argv){
     }
     enterprise_audit_log("user", qcanon);
     enterprise_ad_authenticate("user", "");
-    wchar_t dbPath[MAX_PATH];
+    wchar_t dbPath[MAX_LONG_PATH];
     SearchQuery q; TokenList tokens;
     int workers = g_config.default_search_workers; bool json_output=false;
     bool admin_start=false, admin_pause=false;
@@ -1860,7 +1867,7 @@ int wmain(int argc, wchar_t** argv){
         int rc = set_indexer_state(dbPath, admin_start, json_output);
         free_search_query(&q); tokenlist_free(&tokens); return rc;
     }
-    wcscpy_s(g_db_path, MAX_PATH, dbPath);
+    wcscpy_s(g_db_path, MAX_LONG_PATH, dbPath);
     Db* hdr_db = NULL;
     const DbHeader* hdr = db_open_readonly(dbPath, &hdr_db);
     if(!hdr){ output_error(json_output, "db open failed"); free_search_query(&q); tokenlist_free(&tokens); return 1; }
@@ -1876,7 +1883,7 @@ int wmain(int argc, wchar_t** argv){
     MDB_env* env=NULL; MDB_txn* txn=NULL;
     if(mdb_env_create(&env)!=0){ output_error(json_output,"env_create failed"); free_search_query(&q); tokenlist_free(&tokens); close_bloom(); return 1; }
     mdb_env_set_maxdbs(env, 64);
-    char u8db[MAX_PATH*3]; to_utf8(dbPath,u8db,sizeof(u8db));
+    char u8db[MAX_LONG_PATH*3]; to_utf8(dbPath,u8db,sizeof(u8db));
     if(mdb_env_open(env, u8db, MDB_RDONLY, 0664)!=0){ output_error(json_output,"env_open failed"); mdb_env_close(env); free_search_query(&q); tokenlist_free(&tokens); close_bloom(); return 1; }
     if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ output_error(json_output,"txn_begin failed"); mdb_env_close(env); close_bloom(); free_search_query(&q); tokenlist_free(&tokens); return 1; }
     MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_mtime, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_camera, dbi_lens, dbi_artist, dbi_album, dbi_title, dbi_strrev, dbi_attr;
@@ -1986,7 +1993,7 @@ int wmain(int argc, wchar_t** argv){
         const char *pstr="?", *nstr="?";
         if(mdb_get(txnprint, dbi_stringsP, &pk, &pv)==0) pstr=(const char*)pv.mv_data;
         if(mdb_get(txnprint, dbi_stringsP, &nk, &nv)==0) nstr=(const char*)nv.mv_data;
-        char full_path[MAX_PATH*3];
+        char full_path[MAX_LONG_PATH*3];
         snprintf(full_path, sizeof(full_path), "%s\\%s", pstr, nstr);
         if(!enterprise_check_permission("user", full_path)) continue;
         if(json_output){
