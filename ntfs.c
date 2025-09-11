@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <process.h>
 #include "anything.h"
 #include "util.h"
 
@@ -230,7 +231,8 @@ NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue
     volume_from_root(volumeRoot, s->volPrefix, 8);
     s->hVol = CreateFileW(s->volPrefix, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if(s->hVol==INVALID_HANDLE_VALUE){ free(s); return NULL; }
-    s->thread = CreateThread(NULL,0,usn_thread,s,0,NULL);
+    uintptr_t h = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))usn_thread,s,0,NULL);
+    s->thread = (HANDLE)h;
     return (NTFSScanner*)s;
 }
 void NTFSScanner_Wait(NTFSScanner* s_){
@@ -353,6 +355,7 @@ HANDLE StartUSNTailer(const wchar_t* volumeRoot, MPMCQueue* outQueue, CancelToke
     TailCtx* t = (TailCtx*)calloc(1,sizeof(TailCtx));
     t->hVol=hVol; t->cancel=cancelToken; t->outq=outQueue;
     wcscpy_s(t->root, 8, volumeRoot);
-    t->thread = CreateThread(NULL,0,tail_thread,t,0,NULL);
+    uintptr_t th = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))tail_thread,t,0,NULL);
+    t->thread = (HANDLE)th;
     return t->thread;
 }
