@@ -31,6 +31,14 @@
 #include <pcre2.h>
 #endif
 
+#ifdef _WIN32
+static inline uint64_t ticks(void){ LARGE_INTEGER t; QueryPerformanceCounter(&t); return (uint64_t)t.QuadPart; }
+static double to_ms(uint64_t dt){ static double freq = 0; if(freq==0){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq=(double)f.QuadPart; } return 1000.0 * (double)dt / freq; }
+#else
+static inline uint64_t ticks(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000000ull + ts.tv_nsec; }
+static double to_ms(uint64_t dt){ return (double)dt / 1000000.0; }
+#endif
+
 #ifndef _WIN32
 // Provide Win32-style critical section wrappers on POSIX systems
 typedef pthread_mutex_t CRITICAL_SECTION;
@@ -268,39 +276,35 @@ static unsigned get_hw_threads(void){
 
 static double g_stage1_ms_avg = 0.0;
 
-static void parallel_search(Query* q, Result* results){
+#define SMALL_POSTINGS_MAX 4096
+#define TINY_QUERY_MS 2.0
+
+// Adaptive search that runs stages serially for cheap queries and
+// leverages a small thread pool for heavier ones.
+static void progressive_search(Query* q, Result* results){
     unsigned hw = get_hw_threads();
     unsigned pool_size = hw < 3 ? hw : 3;
 
-#ifdef _WIN32
-    LARGE_INTEGER freq,start,end;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&start);
+    uint64_t t0 = ticks();
     int id_count = search_names(q, results);
-    QueryPerformanceCounter(&end);
-    double ms = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
-#else
-    struct timespec ts_start, ts_end;
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
-    int id_count = search_names(q, results);
-    clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    double ms = (double)(ts_end.tv_sec - ts_start.tv_sec)*1000.0 + (double)(ts_end.tv_nsec - ts_start.tv_nsec)/1e6;
-#endif
+    double ms = to_ms(ticks() - t0);
 
     const double ALPHA = 0.2;
     if(g_stage1_ms_avg==0.0) g_stage1_ms_avg = ms;
     else g_stage1_ms_avg = g_stage1_ms_avg*(1.0-ALPHA) + ms*ALPHA;
 
-    const int ID_THRESHOLD = 100;
-    if(pool_size <= 1 || id_count <= ID_THRESHOLD || g_stage1_ms_avg < 1.0){
-        search_content(q, results);
+    BOOL cheap = (id_count <= SMALL_POSTINGS_MAX) && !q->regex_mode && ms < TINY_QUERY_MS;
+    if(pool_size <= 1 || cheap || g_stage1_ms_avg < 1.0){
+        // Run subsequent stages serially to avoid thread overhead
         search_metadata(q, results);
+        search_content(q, results);
         return;
     }
 
+    // Run metadata and content stages in parallel
     SearchTask tasks[2] = {
-        {search_content, q, results},
         {search_metadata, q, results},
+        {search_content,  q, results},
     };
     TaskQueue queue = { tasks, 2, 0 };
     unsigned workers = pool_size;
@@ -368,72 +372,7 @@ static void results_to_ids(const Result* res, size_t n, uint32_t** out_ids, size
 #define INTERSECT_EAGER_MAX 100000u
 
 // Progressive version that reports early hits through ProgState
-static void progressive_search(Query* q, ProgState* ps){
-    uint32_t* stage_ids=NULL; size_t stage_n=0; // accumulates survivors
-
-    // ---- Stage 0 : names ---------------------------------------------------
-    int n0 = search_names(q, NULL);
-    Result* r0 = n0>0 ? (Result*)malloc(sizeof(Result)* (size_t)n0) : NULL;
-    if(r0 && n0>0) search_names(q, r0);
-    results_to_ids(r0, n0, &stage_ids, &stage_n);
-    if(r0) free(r0);
-    if(stage_n) prog_submit(ps, stage_ids, stage_n, 0, 60);
-    prog_mark_done(ps,0);
-
-    // ---- Stage 1 : metadata -----------------------------------------------
-    int n1 = search_metadata(q, NULL);
-    Result* r1 = n1>0 ? (Result*)malloc(sizeof(Result)*(size_t)n1) : NULL;
-    uint32_t* meta_ids=NULL; size_t meta_n=0;
-    if(r1 && n1>0){ search_metadata(q, r1); results_to_ids(r1, n1, &meta_ids, &meta_n); }
-    if(r1) free(r1);
-    if(meta_n){
-        if(stage_n > INTERSECT_EAGER_MAX){
-            prog_submit(ps, meta_ids, meta_n, 1, 75);
-            uint32_t* inter = intersect_sorted(stage_ids, stage_n, meta_ids, meta_n, &meta_n);
-            if(stage_ids) free(stage_ids);
-            if(meta_ids) free(meta_ids);
-            stage_ids = inter; stage_n = meta_n;
-            if(stage_n) prog_submit(ps, stage_ids, stage_n, 1, 80);
-        } else {
-            uint32_t* inter = intersect_sorted(stage_ids, stage_n, meta_ids, meta_n, &meta_n);
-            if(stage_ids) free(stage_ids);
-            if(meta_ids) free(meta_ids);
-            stage_ids = inter; stage_n = meta_n;
-            if(stage_n) prog_submit(ps, stage_ids, stage_n, 1, 75);
-        }
-    } else {
-        if(stage_ids){ free(stage_ids); stage_ids=NULL; stage_n=0; }
-    }
-    prog_mark_done(ps,1);
-
-    // ---- Stage 2 : content -------------------------------------------------
-    int n2 = search_content(q, NULL);
-    Result* r2 = n2>0 ? (Result*)malloc(sizeof(Result)*(size_t)n2) : NULL;
-    uint32_t* cont_ids=NULL; size_t cont_n=0;
-    if(r2 && n2>0){ search_content(q, r2); results_to_ids(r2, n2, &cont_ids, &cont_n); }
-    if(r2) free(r2);
-    if(cont_n){
-        if(stage_n > INTERSECT_EAGER_MAX){
-            prog_submit(ps, cont_ids, cont_n, 2, 95);
-            uint32_t* inter = intersect_sorted(stage_ids, stage_n, cont_ids, cont_n, &cont_n);
-            if(stage_ids) free(stage_ids);
-            if(cont_ids) free(cont_ids);
-            stage_ids = inter; stage_n = cont_n;
-            if(stage_n) prog_submit(ps, stage_ids, stage_n, 2, 100);
-        } else {
-            uint32_t* inter = intersect_sorted(stage_ids, stage_n, cont_ids, cont_n, &cont_n);
-            if(stage_ids) free(stage_ids);
-            if(cont_ids) free(cont_ids);
-            stage_ids = inter; stage_n = cont_n;
-            if(stage_n) prog_submit(ps, stage_ids, stage_n, 2, 95);
-        }
-    } else {
-        if(stage_ids){ free(stage_ids); stage_ids=NULL; stage_n=0; }
-    }
-    prog_mark_done(ps,2);
-
-    if(stage_ids) free(stage_ids);
-}
+// (progressive_search removed; superseded by adaptive progressive_search above)
 
 typedef struct Node{ int type; TermType ttype; char* text; struct Node* left; struct Node* right; } Node;
 static void free_node(Node* n){ if(!n)return; free_node(n->left); free_node(n->right); if(n->type==TOK_TERM && n->text) free(n->text); free(n); }
