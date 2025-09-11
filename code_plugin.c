@@ -25,7 +25,7 @@ static PluginHost g_host;
 
 static void append_token(char** buf, size_t* len, size_t* cap, const char* type, const char* name){
     if(!name || !*name) return;
-    size_t need = strlen(type) + strlen(name) + 2; // type:name\n
+    size_t need = strlen(type) + strlen(name) + 3; // ":" + "\n" + "\0"
     if(*len + need >= *cap){
         size_t new_cap = (*cap + need) * 2;
         char* new_buf = (char*)realloc(*buf, new_cap);

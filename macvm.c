@@ -160,7 +160,7 @@ static BOOL path_join_local(wchar_t* dst, size_t dstcch, const wchar_t* a, const
         dst[n] = 0;
     }
     if(wcslen(b)+n>=dstcch) return FALSE;
-    wcscat(dst, b);
+    wcscat_s(dst, dstcch, b);
     return TRUE;
 }
 
