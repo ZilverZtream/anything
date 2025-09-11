@@ -760,12 +760,14 @@ static DWORD WINAPI DbWriterThread(void* p){
                     if(wi->content){
                         r.content_str_id = db_intern_wstring(ctx->db, wi->content);
                         free(wi->content);
+                        wi->content = NULL;
                     } else {
                         r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id, &r.title_str_id);
                     }
                     if(wi->preview){
                         r.preview_str_id = db_intern_wstring(ctx->db, wi->preview);
                         free(wi->preview);
+                        wi->preview = NULL;
                     } else if(needs_thumbnail(wi->name)){
                         wchar_t* thumb = GenerateThumbnail(fpath);
                         if(thumb){
