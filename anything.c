@@ -763,6 +763,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                         wi->content = NULL;
                     } else {
                         r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id, &r.title_str_id);
+                        wi->content = NULL;
                     }
                     if(wi->preview){
                         r.preview_str_id = db_intern_wstring(ctx->db, wi->preview);
@@ -774,6 +775,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                             r.preview_str_id = db_intern_wstring(ctx->db, thumb);
                             free(thumb);
                         }
+                        wi->preview = NULL;
                     }
                     extract_exif_metadata(ctx->db, fpath, &r);
                     extract_id3_metadata(ctx->db, fpath, &r);
