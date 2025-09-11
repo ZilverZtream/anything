@@ -13,6 +13,54 @@
 #include "anything.h"
 #include "util.h"
 
+typedef struct AdaptiveThreadPool {
+    int min_threads;
+    int max_threads;
+    volatile int current_threads;
+    HANDLE* threads;
+    volatile LONG work_queue_size;
+    LARGE_INTEGER last_adjustment;
+    LPTHREAD_START_ROUTINE worker;
+    void* worker_arg;
+} AdaptiveThreadPool;
+
+static void adjust_thread_count(AdaptiveThreadPool* pool){
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if(pool->work_queue_size > pool->current_threads * 10 &&
+       pool->current_threads < pool->max_threads){
+        HANDLE h = (HANDLE)_beginthreadex(NULL,0,pool->worker,pool->worker_arg,0,NULL);
+        if(h){
+            pool->threads[pool->current_threads++] = h;
+        }
+    }
+    pool->last_adjustment = now;
+}
+
+static void pool_init(AdaptiveThreadPool* pool, int min_t, int max_t,
+                      LPTHREAD_START_ROUTINE worker, void* arg){
+    pool->min_threads = min_t;
+    pool->max_threads = max_t;
+    pool->current_threads = 0;
+    pool->threads = (HANDLE*)calloc(max_t, sizeof(HANDLE));
+    pool->worker = worker;
+    pool->worker_arg = arg;
+    pool->work_queue_size = 0;
+    QueryPerformanceCounter(&pool->last_adjustment);
+    for(int i=0;i<min_t;i++){
+        HANDLE h = (HANDLE)_beginthreadex(NULL,0,worker,arg,0,NULL);
+        if(h){ pool->threads[pool->current_threads++] = h; }
+    }
+}
+
+static void pool_destroy(AdaptiveThreadPool* pool){
+    if(!pool) return;
+    for(int i=0;i<pool->current_threads;i++) CloseHandle(pool->threads[i]);
+    free(pool->threads);
+    pool->threads = NULL;
+    pool->current_threads = 0;
+}
+
 // Minimal FRN map (open addressing)
 
 typedef struct NameArena {
@@ -127,6 +175,9 @@ typedef struct USNScanner {
     wchar_t volRoot[8]; // e.g., L"C:\\"
     wchar_t volPrefix[8]; // e.g., L"\\\\.\\C:" or root path for path building "C:\"
     FrnMap map;
+    AdaptiveThreadPool pool;
+    volatile LONG next_idx;
+    int max_threads;
     HANDLE thread;
 } USNScanner;
 
@@ -162,6 +213,41 @@ static BOOL frn_build_path(FrnMap* fm, uint64_t frn, wchar_t* full, size_t cch){
     return wcscpy_s(full, cch, temp)==0;
 }
 
+static DWORD WINAPI map_emit_worker(void* p){
+    USNScanner* s = (USNScanner*)p;
+    for(;;){
+        LONG idx = InterlockedIncrement(&s->next_idx) - 1;
+        if(idx >= (LONG)s->map.cap) break;
+        if(!s->map.slots[idx].frn){
+            InterlockedDecrement(&s->pool.work_queue_size);
+            continue;
+        }
+        FrnEntry* e = &s->map.slots[idx];
+        wchar_t rel[MAX_LONG_PATH];
+        if(!frn_build_path(&s->map, e->parent, rel, MAX_LONG_PATH)){
+            InterlockedDecrement(&s->pool.work_queue_size);
+            continue;
+        }
+        wchar_t parent[MAX_LONG_PATH];
+        swprintf(parent, MAX_LONG_PATH, L"%c:%s", s->volRoot[0], rel);
+        DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+        wi->content = NULL; wi->preview = NULL;
+        wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
+        wcscpy_s(wi->name, MAX_PATH, e->name);
+        wi->file_size = 0;
+        wi->creation_time = wi->modified_time = wi->access_time = 0;
+        wi->attributes = e->attrs;
+        wi->clone_id = 0;
+        wi->stage = INDEX_NAMES_ONLY;
+        wi->op = WI_ADD;
+        while(!MPMC_Push(s->outq, wi)) { SwitchToThread(); }
+        InterlockedDecrement(&s->pool.work_queue_size);
+        adjust_thread_count(&s->pool);
+        if(is_cancelled(s->cancel)) break;
+    }
+    return 0;
+}
+
 static DWORD WINAPI usn_thread(void* p){
     USNScanner* s = (USNScanner*)p;
     // Enumerate MFT via FSCTL_ENUM_USN_DATA
@@ -193,44 +279,25 @@ static DWORD WINAPI usn_thread(void* p){
         }
         med.StartFileReferenceNumber = *(USN*)buf;
     }
-    // Second pass: emit work items by walking the map
-    for(size_t i=0;i<s->map.cap;i++){
-        if(!s->map.slots[i].frn) continue;
-        FrnEntry* e = &s->map.slots[i];
-        // Build full path from parent chain
-        wchar_t rel[MAX_LONG_PATH];
-        if(!frn_build_path(&s->map, e->parent, rel, MAX_LONG_PATH)){
-            // If parent missing, skip
-            continue;
-        }
-        // rel begins with \Dir\Sub; build absolute parent path: e.g., "C:\Dir\Sub"
-        wchar_t parent[MAX_LONG_PATH];
-        swprintf(parent, MAX_LONG_PATH, L"%c:%s", s->volRoot[0], rel);
-        DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
-        wi->content = NULL;
-        wi->preview = NULL;
-        wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
-        wcscpy_s(wi->name, MAX_PATH, e->name);
-        wi->file_size = 0;
-        wi->creation_time = wi->modified_time = wi->access_time = 0;
-        wi->attributes = e->attrs;
-        wi->clone_id = 0;
-        wi->stage = INDEX_NAMES_ONLY;
-        wi->op = WI_ADD;
-        while(!MPMC_Push(s->outq, wi)) { SwitchToThread(); }
-    }
+    // Second pass: emit work items using adaptive thread pool
+    s->next_idx = -1;
+    s->pool.work_queue_size = (LONG)s->map.cap;
+    pool_init(&s->pool, 1, s->max_threads, map_emit_worker, s);
+    WaitForMultipleObjects(s->pool.current_threads, s->pool.threads, TRUE, INFINITE);
+    pool_destroy(&s->pool);
     VirtualFree(buf,0,MEM_RELEASE);
     return 0;
 }
 
 NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue* outQueue, CancelToken* cancelToken){
-    (void)threads;
     USNScanner* s = (USNScanner*)calloc(1,sizeof(USNScanner));
+    if(!s) return NULL;
     s->outq = outQueue; s->cancel = cancelToken;
     wcscpy_s(s->volRoot, 8, volumeRoot);
     volume_from_root(volumeRoot, s->volPrefix, 8);
     s->hVol = CreateFileW(s->volPrefix, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if(s->hVol==INVALID_HANDLE_VALUE){ free(s); return NULL; }
+    s->max_threads = threads > 0 ? threads : 1;
     uintptr_t h = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))usn_thread,s,0,NULL);
     s->thread = (HANDLE)h;
     return (NTFSScanner*)s;
