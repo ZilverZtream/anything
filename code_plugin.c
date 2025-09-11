@@ -178,10 +178,19 @@ static wchar_t* parse_file(const wchar_t* path){
     if(!out){ free(data); return NULL; }
     out[0]=0;
 
-    char* ctx=NULL; char* line = strtok_s(data, "\n\r", &ctx);
+    char* ctx=NULL;
+#ifdef _WIN32
+    char* line = strtok_s(data, "\n\r", &ctx);
+#else
+    char* line = strtok_r(data, "\n\r", &ctx);
+#endif
     while(line){
         process_line(line,&out,&l,&cap);
+#ifdef _WIN32
         line = strtok_s(NULL, "\n\r", &ctx);
+#else
+        line = strtok_r(NULL, "\n\r", &ctx);
+#endif
     }
 
 #ifdef _WIN32
