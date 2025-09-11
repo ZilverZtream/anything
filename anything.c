@@ -148,7 +148,10 @@ BOOL live_updates_poll(LiveUpdate* out){
     if(!p) return FALSE;
     LiveUpdate* lu = (LiveUpdate*)p;
     *out = *lu;
-    aligned_free(lu);
+    _ReadWriteBarrier();
+    if(InterlockedDecrement(&lu->refcount) == 0){
+        aligned_free(lu);
+    }
     return TRUE;
 }
 
@@ -159,6 +162,8 @@ static void push_live_update(const DbWorkItem* wi){
     wcscpy_s(lu->parent_path, MAX_LONG_PATH, wi->parent_path);
     wcscpy_s(lu->name, MAX_PATH, wi->name);
     lu->op = wi->op;
+    lu->refcount = 1;
+    _ReadWriteBarrier();
     while(!MPMC_Push(&g_live_updates, lu)){
         if(!g_live_inited){
             aligned_free(lu);
