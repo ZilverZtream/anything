@@ -368,6 +368,45 @@ typedef struct {
     // followed by rec_ids[count]
 } CacheHeader;
 
+#define CACHE_FILE_LIMIT 128
+typedef struct {
+    uint64_t ts;
+    wchar_t path[MAX_PATH];
+} CacheFileInfo;
+
+static int cmp_cache_file(const void* a, const void* b){
+    const CacheFileInfo* x = (const CacheFileInfo*)a;
+    const CacheFileInfo* y = (const CacheFileInfo*)b;
+    return (x->ts>y->ts) - (x->ts<y->ts);
+}
+
+static void prune_cache_dir(const wchar_t* anyPath){
+    wchar_t dir[MAX_PATH]; wcscpy_s(dir, MAX_PATH, anyPath);
+    wchar_t* p = wcsrchr(dir, L'\\'); if(!p) return; *p = 0;
+    CacheFileInfo* files = NULL; size_t n=0, cap=0;
+    const wchar_t* patterns[2] = {L"cache_*.tmp", L"cache_term_*.tmp"};
+    for(int i=0;i<2;i++){
+        wchar_t pat[MAX_PATH]; swprintf(pat, MAX_PATH, L"%s\\%s", dir, patterns[i]);
+        WIN32_FIND_DATAW fd; HANDLE h=FindFirstFileW(pat, &fd);
+        if(h!=INVALID_HANDLE_VALUE){
+            do{
+                if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)){
+                    if(n==cap){ cap=cap?cap*2:64; files=(CacheFileInfo*)realloc(files, cap*sizeof(CacheFileInfo)); }
+                    swprintf(files[n].path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+                    ULARGE_INTEGER ui; ui.LowPart=fd.ftLastWriteTime.dwLowDateTime; ui.HighPart=fd.ftLastWriteTime.dwHighDateTime;
+                    files[n].ts = ui.QuadPart; n++;
+                }
+            }while(FindNextFileW(h,&fd));
+            FindClose(h);
+        }
+    }
+    if(n>CACHE_FILE_LIMIT){
+        qsort(files, n, sizeof(CacheFileInfo), cmp_cache_file);
+        for(size_t i=0;i<n-CACHE_FILE_LIMIT;i++) DeleteFileW(files[i].path);
+    }
+    free(files);
+}
+
 static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     uint64_t sig = hash64(qstr, strlen(qstr));
     wchar_t cachePath[MAX_PATH]; wcscpy_s(cachePath, MAX_PATH, dbPath);
@@ -415,6 +454,7 @@ static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids
     h->bloom_size = g_bloom_size;
     memcpy(base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
+    prune_cache_dir(cachePath);
 }
 
 // Per-term cache helpers
@@ -491,6 +531,7 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     h->bloom_size = g_bloom_size;
     memcpy(base+sizeof(CacheHeader), ids->ids, ids->n*sizeof(uint64_t));
     UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
+    prune_cache_dir(cachePath);
 }
 
 // Intersect postings
