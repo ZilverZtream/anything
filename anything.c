@@ -164,8 +164,9 @@ static void push_live_update(const DbWorkItem* wi){
     lu->op = wi->op;
     lu->refcount = 1;
     _ReadWriteBarrier();
+    int tries = 0;
     while(!MPMC_Push(&g_live_updates, lu)){
-        if(!g_live_inited){
+        if(!g_live_inited || tries++ > 1000){
             aligned_free(lu);
             return;
         }
