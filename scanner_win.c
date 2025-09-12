@@ -84,32 +84,44 @@ static BOOL save_hbitmap_png(HBITMAP hbmp, const wchar_t* path){
 }
 
 wchar_t* GenerateThumbnail(const wchar_t* path){
-    CoInitialize(NULL);
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    BOOL do_uninit = FALSE;
+    if(hr == RPC_E_CHANGED_MODE){
+        // COM already initialized with a different concurrency model; proceed
+        do_uninit = FALSE;
+    } else if(SUCCEEDED(hr)){
+        do_uninit = TRUE;
+    } else {
+        return NULL;
+    }
     IShellItemImageFactory* factory = NULL;
     if(FAILED(SHCreateItemFromParsingName(path, NULL, &IID_IShellItemImageFactory, (void**)&factory))){
-        CoUninitialize();
+        if(do_uninit) CoUninitialize();
         return NULL;
     }
     SIZE sz = {256,256};
     HBITMAP hbmp;
-    HRESULT hr = factory->lpVtbl->GetImage(factory, sz, SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT, &hbmp);
+    hr = factory->lpVtbl->GetImage(factory, sz, SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT, &hbmp);
     factory->lpVtbl->Release(factory);
-    if(FAILED(hr)){ CoUninitialize(); return NULL; }
+    if(FAILED(hr)){
+        if(do_uninit) CoUninitialize();
+        return NULL;
+    }
     wchar_t tmp[MAX_PATH];
     if(!GetTempFileNameW(L"", L"ath", 0, tmp)){
         DeleteObject(hbmp);
-        CoUninitialize();
+        if(do_uninit) CoUninitialize();
         return NULL;
     }
     DeleteFileW(tmp);
     wcscat_s(tmp, MAX_PATH, L".png");
     if(!save_hbitmap_png(hbmp, tmp)){
         DeleteObject(hbmp);
-        CoUninitialize();
+        if(do_uninit) CoUninitialize();
         return NULL;
     }
     DeleteObject(hbmp);
-    CoUninitialize();
+    if(do_uninit) CoUninitialize();
     return _wcsdup(tmp);
 }
 #endif
