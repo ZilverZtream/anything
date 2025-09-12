@@ -913,21 +913,21 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     uint64_t sig = hash64(qstr, strlen(qstr));
 #ifdef _WIN32
     wchar_t cachePath[MAX_LONG_PATH]; wcscpy_s(cachePath, MAX_LONG_PATH, dbPath);
-    wchar_t* p = path_dirname_w(cachePath); if(!p) return FALSE;
-    swprintf(p+1, (size_t)(MAX_LONG_PATH-(p+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
+    wchar_t* dp = path_dirname_w(cachePath);
+    if(!dp) return FALSE;
+    swprintf(dp+1, (size_t)(MAX_LONG_PATH-(dp+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
     wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
     HANDLE f = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
-    if(f==INVALID_HANDLE_VALUE) return FALSE;
-    OVERLAPPED ov = {0};
-    if(!LockFileEx(f, 0, 0, MAXDWORD, MAXDWORD, &ov)){ CloseHandle(f); return FALSE; }
+    HANDLE m = NULL; BYTE* base = NULL; BOOL ok = FALSE; BOOL locked = FALSE; OVERLAPPED ov={0};
+    if(f==INVALID_HANDLE_VALUE) goto cleanup;
+    if(!LockFileEx(f, 0, 0, MAXDWORD, MAXDWORD, &ov)) goto cleanup; locked = TRUE;
     DWORD sz = GetFileSize(f, NULL);
-    if(sz < sizeof(CacheHeader)){ UnlockFileEx(f, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(f); return FALSE; }
-    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
-    if(!m){ UnlockFileEx(f, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(f); return FALSE; }
-    BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0);
-    if(!base){ CloseHandle(m); UnlockFileEx(f, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(f); return FALSE; }
+    if(sz < sizeof(CacheHeader)) goto cleanup;
+    m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
+    if(!m) goto cleanup;
+    base = (BYTE*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0);
+    if(!base) goto cleanup;
     const CacheHeader* h = (const CacheHeader*)base;
-    BOOL ok = FALSE;
     size_t need, ids_bytes;
     if(h->magic == CACHE_MAGIC &&
        h->version == CACHE_VERSION &&
@@ -944,10 +944,13 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
             ok = TRUE;
         }
     }
-    UnmapViewOfFile(base);
-    CloseHandle(m);
-    UnlockFileEx(f, 0, MAXDWORD, MAXDWORD, &ov);
-    CloseHandle(f);
+cleanup:
+    if(base) UnmapViewOfFile(base);
+    if(m) CloseHandle(m);
+    if(f!=INVALID_HANDLE_VALUE){
+        if(locked) UnlockFileEx(f, 0, MAXDWORD, MAXDWORD, &ov);
+        CloseHandle(f);
+    }
     return ok;
 #else
     char path[PATH_MAX];
@@ -955,14 +958,14 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
     char* p = strrchr(path, '/'); if(!p) return FALSE;
     snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_%016llx.tmp", (unsigned long long)sig);
     int fd = open(path, O_RDONLY);
+    void* base = MAP_FAILED; BOOL ok = FALSE; struct stat st;
     if(fd < 0) return FALSE;
-    if(flock(fd, LOCK_SH) != 0){ close(fd); return FALSE; }
-    struct stat st; if(fstat(fd, &st) < 0){ close(fd); return FALSE; }
-    if(st.st_size < (off_t)sizeof(CacheHeader)){ close(fd); return FALSE; }
-    void* base = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if(base == MAP_FAILED){ close(fd); return FALSE; }
+    if(flock(fd, LOCK_SH) != 0) goto cleanup;
+    if(fstat(fd, &st) < 0) goto cleanup;
+    if(st.st_size < (off_t)sizeof(CacheHeader)) goto cleanup;
+    base = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    if(base == MAP_FAILED) goto cleanup;
     const CacheHeader* h = (const CacheHeader*)base;
-    BOOL ok = FALSE;
     size_t need, ids_bytes;
     if(h->magic == CACHE_MAGIC &&
        h->version == CACHE_VERSION &&
@@ -979,8 +982,9 @@ static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
             ok = TRUE;
         }
     }
-    munmap(base, st.st_size);
-    close(fd);
+cleanup:
+    if(base != MAP_FAILED) munmap(base, st.st_size);
+    if(fd >= 0){ flock(fd, LOCK_UN); close(fd); }
     return ok;
 #endif
 }
