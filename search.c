@@ -1268,10 +1268,16 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
 
 static DWORD WINAPI filter_worker_thread(void* p){
     FilterArgs* a=(FilterArgs*)p;
-    MDB_env* env; mdb_env_create(&env); mdb_env_set_maxdbs(env,64);
-    mdb_env_open(env, a->db_path, MDB_RDONLY, 0664);
-    MDB_txn* txn; mdb_txn_begin(env,NULL,MDB_RDONLY,&txn);
-    MDB_dbi dbi_strings, dbi_records; mdb_dbi_open(txn,"strings",0,&dbi_strings); mdb_dbi_open(txn,"records",0,&dbi_records);
+    MDB_env* env=NULL; MDB_txn* txn=NULL;
+    MDB_dbi dbi_strings, dbi_records;
+    if(mdb_env_create(&env)!=0) return 0;
+    mdb_env_set_maxdbs(env,64);
+    if(mdb_env_open(env, a->db_path, MDB_RDONLY, 0664)!=0){ mdb_env_close(env); return 0; }
+    if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ mdb_env_close(env); return 0; }
+    if(mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
+       mdb_dbi_open(txn,"records",0,&dbi_records)!=0){
+        mdb_txn_abort(txn); mdb_env_close(env); return 0;
+    }
     for(size_t i=a->start;i<a->end;i++){
         uint64_t rid = a->ids[i];
         MDB_val rk={.mv_data=&rid,.mv_size=sizeof(rid)}, rv;
