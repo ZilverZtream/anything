@@ -609,12 +609,28 @@ static HANDLE tempfile_create(wchar_t path[MAX_LONG_PATH], const wchar_t* tmpdir
                        FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE, NULL);
 }
 static BOOL chunk_write(HANDLE h, const void* buf, size_t bytes){
-    DWORD written = 0;
-    return WriteFile(h, buf, (DWORD)bytes, &written, NULL) && written==(DWORD)bytes;
+    const uint8_t* p = (const uint8_t*)buf;
+    while(bytes > 0){
+        DWORD to_write = bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : (DWORD)bytes;
+        DWORD written = 0;
+        if(!WriteFile(h, p, to_write, &written, NULL) || written != to_write)
+            return FALSE;
+        p += to_write;
+        bytes -= to_write;
+    }
+    return TRUE;
 }
 static BOOL chunk_read(HANDLE h, void* buf, size_t bytes){
-    DWORD rd = 0;
-    return ReadFile(h, buf, (DWORD)bytes, &rd, NULL) && rd==(DWORD)bytes;
+    uint8_t* p = (uint8_t*)buf;
+    while(bytes > 0){
+        DWORD to_read = bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : (DWORD)bytes;
+        DWORD rd = 0;
+        if(!ReadFile(h, p, to_read, &rd, NULL) || rd != to_read)
+            return FALSE;
+        p += to_read;
+        bytes -= to_read;
+    }
+    return TRUE;
 }
 static void chunk_close(HANDLE h, const wchar_t* path){
     if(h!=INVALID_HANDLE_VALUE) CloseHandle(h);
