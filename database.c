@@ -444,6 +444,7 @@ static BOOL str_by_id_with_retry(DbImpl* d, uint64_t id, MDB_val* out, int max_r
 uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
     if(!s || !s[0]) return 0;
     DbImpl* d = (DbImpl*)db_;
+    uint64_t result = 0;
     int needed = WideCharToMultiByte(CP_UTF8,0,s,-1,NULL,0,NULL,NULL);
     if(needed<=0) return 0;
     char stack_u8[512];
@@ -454,42 +455,43 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
     size_t u8len = (size_t)(needed-1);
     uint64_t h = hash64(u8, u8len);
     uint64_t cached = string_cache_lookup(u8, h);
-    if(cached){ if(heap) free(u8); return cached; }
+    if(cached){ result = cached; goto cleanup; }
     // Try to read using the current write txn if present; otherwise open a RO txn.
     MDB_txn* rtxn = d->wtxn ? d->wtxn : NULL;
     BOOL need_abort = FALSE;
     if(!rtxn){
-        if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn)!=0){ if(heap) free(u8); return 0; }
+        if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn)!=0) goto cleanup;
         need_abort = TRUE;
     }
     MDB_val k={.mv_data=u8,.mv_size=u8len}, v;
     int rc = mdb_get(rtxn, d->dbi_strrev, &k, &v);
     if(rc==0){
-        uint64_t id = *(uint64_t*)v.mv_data;
+        result = *(uint64_t*)v.mv_data;
+        string_cache_insert(u8, h, result);
         if(need_abort) mdb_txn_abort(rtxn);
-        string_cache_insert(u8, h, id);
-        if(heap) free(u8);
-        return id;
+        goto cleanup;
     }
     if(need_abort) mdb_txn_abort(rtxn);
-    if(!d->wtxn){ if(!db_begin_write(db_)){ if(heap) free(u8); return 0; } }
+    if(!d->wtxn && !db_begin_write(db_)) goto cleanup;
     uint64_t new_id = d->header_cache.string_count + 1;
     d->header_cache.string_count = new_id;
     MDB_val idkey={.mv_data=&new_id,.mv_size=sizeof(new_id)};
-    MDB_val idval={.mv_data=u8,.mv_size=(size_t)(needed-1)};
+    MDB_val idval={.mv_data=u8,.mv_size=u8len};
     rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
-    if(rc){ set_mdb_error(d,rc); if(heap) free(u8); return 0; }
+    if(rc){ set_mdb_error(d,rc); goto cleanup; }
     MDB_val revval={.mv_data=&new_id,.mv_size=sizeof(new_id)};
     rc = mdb_put(d->wtxn, d->dbi_strrev, &k, &revval, 0);
-    if(rc){ set_mdb_error(d,rc); if(heap) free(u8); return 0; }
+    if(rc){ set_mdb_error(d,rc); goto cleanup; }
     // update header
     MDB_val mk,mv; const char* H="header"; to_mdb_val(H, strlen(H), &mk);
     to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
     rc = mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
+    if(rc){ set_mdb_error(d,rc); goto cleanup; }
     string_cache_insert(u8, h, new_id);
+    result = new_id;
+cleanup:
     if(heap) free(u8);
-    if(rc){ set_mdb_error(d,rc); return 0; }
-    return new_id;
+    return result;
 }
 
 // ---- Trigram helpers ----
