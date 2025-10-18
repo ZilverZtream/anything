@@ -41,131 +41,23 @@ typedef struct {
 
 typedef struct {
     volatile uint64_t hash;
-    volatile uint64_t string_id;
-    volatile char* string;
+    volatile LONG64   stamp;
+    volatile uint32_t string_id;
+    volatile char*    string;
 } StringCache;
 
-#define STRING_CACHE_SIZE 262144u
-#define STRING_CACHE_MASK (STRING_CACHE_SIZE-1u)
-#define STRING_CACHE_PROBE_LIMIT STRING_CACHE_SIZE
-
-#define CACHE_PARTITIONS 16u
+#define STRING_CACHE_SIZE 65536u
+#define CACHE_PARTITIONS 64u
 #define PARTITION_SIZE (STRING_CACHE_SIZE / CACHE_PARTITIONS)
 #define PARTITION_MASK (PARTITION_SIZE-1u)
 
-#define L1_STRING_CACHE_SIZE 256u
-#define L1_STRING_CACHE_MASK (L1_STRING_CACHE_SIZE-1u)
-
 static StringCache g_string_cache[CACHE_PARTITIONS][PARTITION_SIZE];
-
-typedef struct {
-    volatile LONG64 stamp;
-    uint64_t wide_hash;
-    uint32_t wide_len;
-    uint32_t utf8_len;
-    uint64_t string_id;
-    volatile wchar_t* wide;
-    volatile char* utf8;
-} L1StringCache;
-
-static L1StringCache g_l1_string_cache[L1_STRING_CACHE_SIZE];
-static volatile LONG64 g_l1_clock = 0;
-
 static const char* const STRING_CACHE_BUSY = (const char*)(intptr_t)1;
-static const wchar_t* const L1_CACHE_BUSY_WIDE = (const wchar_t*)(intptr_t)1;
-static const char* const L1_CACHE_BUSY_UTF8 = (const char*)(intptr_t)1;
+
+static volatile LONG64 g_string_cache_clock = 0;
 
 static inline char* atomic_load_char(volatile char** p){
     return (char*)InterlockedCompareExchangePointer((PVOID*)p, NULL, NULL);
-}
-
-static inline wchar_t* atomic_load_wchar(volatile wchar_t** p){
-    return (wchar_t*)InterlockedCompareExchangePointer((PVOID*)p, NULL, NULL);
-}
-
-static uint64_t hash_wide_string(const wchar_t* s, size_t* out_len){
-    if(!s){
-        if(out_len) *out_len = 0;
-        return 0;
-    }
-    size_t len = wcslen(s);
-    if(out_len) *out_len = len;
-    return hash64(s, len * sizeof(wchar_t));
-}
-
-static uint64_t l1_cache_lookup(const wchar_t* s, uint64_t wide_hash, size_t wlen, const char** out_u8, size_t* out_u8_len){
-    if(out_u8) *out_u8 = NULL;
-    if(out_u8_len) *out_u8_len = 0;
-    if(!s || wlen == 0) return 0;
-    LONG64 stamp = InterlockedIncrement64(&g_l1_clock);
-    for(uint32_t i = 0; i < L1_STRING_CACHE_SIZE; ++i){
-        L1StringCache* entry = &g_l1_string_cache[i];
-        wchar_t* cached_wide = atomic_load_wchar(&entry->wide);
-        if(!cached_wide || cached_wide == L1_CACHE_BUSY_WIDE) continue;
-        if(entry->wide_hash != wide_hash || entry->wide_len != (uint32_t)wlen) continue;
-        if(wmemcmp(cached_wide, s, wlen) != 0) continue;
-        InterlockedExchange64(&entry->stamp, stamp);
-        char* cached_utf8 = atomic_load_char(&entry->utf8);
-        if(cached_utf8 && cached_utf8 != L1_CACHE_BUSY_UTF8){
-            if(out_u8) *out_u8 = cached_utf8;
-            if(out_u8_len) *out_u8_len = entry->utf8_len;
-        }
-        return entry->string_id;
-    }
-    return 0;
-}
-
-static void l1_cache_update(const wchar_t* wide, size_t wlen, uint64_t wide_hash, const char* utf8, size_t utf8_len, uint64_t string_id){
-    if(!wide || wlen == 0 || !utf8 || utf8_len == 0 || string_id == 0) return;
-    LONG64 stamp = InterlockedIncrement64(&g_l1_clock);
-    L1StringCache* target = NULL;
-    LONG64 oldest = LLONG_MAX;
-    for(uint32_t i = 0; i < L1_STRING_CACHE_SIZE; ++i){
-        L1StringCache* entry = &g_l1_string_cache[i];
-        wchar_t* cached_wide = atomic_load_wchar(&entry->wide);
-        if(!cached_wide){
-            target = entry;
-            break;
-        }
-        if(cached_wide == L1_CACHE_BUSY_WIDE) continue;
-        LONG64 entry_stamp = entry->stamp;
-        if(entry_stamp < oldest){
-            oldest = entry_stamp;
-            target = entry;
-        }
-    }
-    if(!target) return;
-    for(;;){
-        wchar_t* expected_wide = atomic_load_wchar(&target->wide);
-        if(expected_wide == L1_CACHE_BUSY_WIDE) continue;
-        if(InterlockedCompareExchangePointer((PVOID*)&target->wide, (PVOID)L1_CACHE_BUSY_WIDE, expected_wide) == expected_wide){
-            char* expected_utf8;
-            do {
-                expected_utf8 = atomic_load_char(&target->utf8);
-            } while(expected_utf8 == L1_CACHE_BUSY_UTF8);
-            InterlockedExchangePointer((PVOID*)&target->utf8, (PVOID)L1_CACHE_BUSY_UTF8);
-            if(expected_wide && expected_wide != L1_CACHE_BUSY_WIDE) free(expected_wide);
-            if(expected_utf8 && expected_utf8 != L1_CACHE_BUSY_UTF8) free(expected_utf8);
-            wchar_t* wide_copy = _wcsdup(wide);
-            char* utf8_copy = _strdup(utf8);
-            if(!wide_copy || !utf8_copy){
-                if(wide_copy) free(wide_copy);
-                if(utf8_copy) free(utf8_copy);
-                InterlockedExchangePointer((PVOID*)&target->utf8, NULL);
-                InterlockedExchangePointer((PVOID*)&target->wide, NULL);
-                return;
-            }
-            target->wide_hash = wide_hash;
-            target->wide_len = (uint32_t)wlen;
-            target->utf8_len = (uint32_t)utf8_len;
-            target->string_id = string_id;
-            target->stamp = stamp;
-            MemoryBarrier();
-            InterlockedExchangePointer((PVOID*)&target->utf8, utf8_copy);
-            InterlockedExchangePointer((PVOID*)&target->wide, wide_copy);
-            return;
-        }
-    }
 }
 
 static uint64_t string_cache_lookup(const char* s, uint64_t h){
@@ -185,9 +77,11 @@ static uint64_t string_cache_lookup(const char* s, uint64_t h){
             continue;
         }
         if(c->hash == h && strcmp(str, s) == 0){
-            uint64_t string_id = (uint64_t)InterlockedCompareExchange64((volatile LONG64*)&c->string_id, 0, 0);
-            if(string_id != 0){
-                return string_id;
+            uint32_t cached_id = (uint32_t)InterlockedCompareExchange((volatile LONG*)&c->string_id, 0, 0);
+            if(cached_id != 0){
+                LONG64 stamp = InterlockedIncrement64(&g_string_cache_clock);
+                InterlockedExchange64(&c->stamp, stamp);
+                return (uint64_t)cached_id;
             }
         }
         idx = (idx + step) & mask;
@@ -196,14 +90,16 @@ static uint64_t string_cache_lookup(const char* s, uint64_t h){
 }
 
 static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
-    if(!s) return;
+    if(!s || id == 0 || id > UINT32_MAX) return;
     size_t partition = (size_t)(h % CACHE_PARTITIONS);
     size_t mask = PARTITION_MASK;
     size_t idx = ((size_t)(h / CACHE_PARTITIONS)) & mask;
     size_t step = (((size_t)(h >> 32) & mask) | 1u);
     if(step == 0) step = 1u;
     size_t best_idx = idx;
-    uint64_t best_age = UINT64_MAX;
+    LONG64 best_stamp = LLONG_MAX;
+    uint32_t id32 = (uint32_t)id;
+    LONG64 stamp = InterlockedIncrement64(&g_string_cache_clock);
     StringCache* cache = g_string_cache[partition];
     for(size_t probe = 0; probe < PARTITION_SIZE; ++probe){
         StringCache* c = &cache[idx];
@@ -211,8 +107,15 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
         if(!str){
             if(InterlockedCompareExchangePointer((PVOID*)&c->string, (PVOID)STRING_CACHE_BUSY, NULL) == NULL){
                 c->hash = h;
-                c->string_id = id;
+                InterlockedExchange((volatile LONG*)&c->string_id, (LONG)id32);
+                InterlockedExchange64(&c->stamp, stamp);
                 char* dup = _strdup(s);
+                if(!dup){
+                    InterlockedExchange((volatile LONG*)&c->string_id, 0);
+                    InterlockedExchange64(&c->stamp, 0);
+                    InterlockedExchangePointer((PVOID*)&c->string, NULL);
+                    return;
+                }
                 MemoryBarrier();
                 InterlockedExchangePointer((PVOID*)&c->string, dup);
                 return;
@@ -224,12 +127,13 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
             continue;
         }
         if(c->hash == h && strcmp(str, s) == 0){
-            c->string_id = id;
+            InterlockedExchange((volatile LONG*)&c->string_id, (LONG)id32);
+            InterlockedExchange64(&c->stamp, stamp);
             return;
         }
-        uint64_t string_id = (uint64_t)InterlockedCompareExchange64((volatile LONG64*)&c->string_id, 0, 0);
-        if(string_id != 0 && string_id < best_age){
-            best_age = string_id;
+        LONG64 entry_stamp = InterlockedCompareExchange64(&c->stamp, 0, 0);
+        if(entry_stamp < best_stamp){
+            best_stamp = entry_stamp;
             best_idx = idx;
         }
         idx = (idx + step) & mask;
@@ -241,8 +145,15 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
         if(InterlockedCompareExchangePointer((PVOID*)&victim->string, (PVOID)STRING_CACHE_BUSY, expected) == expected){
             if(expected) free(expected);
             victim->hash = h;
-            victim->string_id = id;
+            InterlockedExchange((volatile LONG*)&victim->string_id, (LONG)id32);
+            InterlockedExchange64(&victim->stamp, stamp);
             char* dup = _strdup(s);
+            if(!dup){
+                InterlockedExchange((volatile LONG*)&victim->string_id, 0);
+                InterlockedExchange64(&victim->stamp, 0);
+                InterlockedExchangePointer((PVOID*)&victim->string, NULL);
+                return;
+            }
             MemoryBarrier();
             InterlockedExchangePointer((PVOID*)&victim->string, dup);
             return;
@@ -945,8 +856,6 @@ static BOOL str_by_id_with_retry(DbImpl* d, uint64_t id, MDB_val* out, int max_r
 typedef struct InternTask {
     size_t index;
     const wchar_t* wide;
-    size_t wide_len;
-    uint64_t wide_hash;
     char* utf8;
     size_t utf8_len;
     uint64_t utf8_hash;
@@ -980,18 +889,9 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, s
     for(size_t i = 0; i < count; ++i){
         const wchar_t* ws = strings[i];
         if(!ws || !ws[0]){ out_ids[i] = 0; continue; }
-        size_t wlen = 0; uint64_t whash = hash_wide_string(ws, &wlen);
-        const char* cached_utf8 = NULL; size_t cached_utf8_len = 0;
-        uint64_t cached_id = l1_cache_lookup(ws, whash, wlen, &cached_utf8, &cached_utf8_len);
-        if(cached_id){
-            out_ids[i] = cached_id;
-            continue;
-        }
         InternTask task = {0};
         task.index = i;
         task.wide = ws;
-        task.wide_len = wlen;
-        task.wide_hash = whash;
         task.utf8 = NULL;
         task.utf8_len = 0;
         task.utf8_hash = 0;
@@ -1123,13 +1023,6 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, s
             d->header_cache.string_count = original_count;
             set_mdb_error(d, rc);
             goto cleanup;
-        }
-    }
-
-    for(size_t i = 0; i < unique_count; ++i){
-        InternTask* t = unique[i];
-        if(t->id){
-            l1_cache_update(t->wide, t->wide_len, t->wide_hash, t->utf8, t->utf8_len, t->id);
         }
     }
 
