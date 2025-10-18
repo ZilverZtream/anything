@@ -229,12 +229,15 @@ static BOOL frnmap_ensure_slot_committed(FrnMap* m, size_t index){
             if(actual > committed){
                 if(actual >= target){
                     for(;;){
-                        size_t expected = committed;
-                        if(frnmap_atomic_compare_exchange_size(&m->slots_committed, expected, actual)){
+                        size_t expected = frnmap_atomic_read_size(&m->slots_committed);
+                        if(expected >= actual){
                             return TRUE;
                         }
-                        expected = frnmap_atomic_read_size(&m->slots_committed);
-                        if(expected >= actual){
+                        if(expected != committed){
+                            committed = expected;
+                            break;
+                        }
+                        if(frnmap_atomic_compare_exchange_size(&m->slots_committed, expected, actual)){
                             return TRUE;
                         }
                     }
