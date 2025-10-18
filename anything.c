@@ -243,6 +243,8 @@ static BOOL is_archive_file(const wchar_t* name){
 }
 
 #define MAX_INDEXED_CONTENT (1024*1024) // 1MB
+#define MAX_TOTAL_EPUB_SIZE (4*1024*1024) // 4MB safety cap for aggregated EPUB text
+#define MAX_EPUB_HTML_FILES 2048
 
 static wchar_t* extract_with_filter(const wchar_t* path){
 #ifdef _WIN32
@@ -484,14 +486,19 @@ static wchar_t* extract_epub_content(Db* db, const wchar_t* path, uint64_t* auth
     }
     size_t cap=4096,len=0; char* textbuf=(char*)malloc(cap);
     if(textbuf) textbuf[0]=0;
+    size_t html_count = 0;
     zip_int64_t count=zip_get_num_entries(z,0);
     for(zip_int64_t i=0;i<count;i++){
         const char* name=zip_get_name(z,i,0);
         if(!name) continue;
         size_t namelen=strlen(name);
         if(namelen>5 && (_stricmp(name+namelen-5,".html")==0 || _stricmp(name+namelen-6,".xhtml")==0)){
+            if(len >= MAX_TOTAL_EPUB_SIZE) break;
+            if(html_count >= MAX_EPUB_HTML_FILES) break;
             if(zip_stat_index(z,i,0,&st)!=0) continue;
             if(len + st.size >= MAX_INDEXED_CONTENT) break;
+            size_t remaining_space = MAX_TOTAL_EPUB_SIZE > len ? (MAX_TOTAL_EPUB_SIZE - len) : 0;
+            if(st.size > remaining_space) st.size = remaining_space;
             char* buf=(char*)malloc(st.size+1);
             if(!buf) continue;
             zip_file_t* f=zip_fopen_index(z,i,0);
@@ -499,10 +506,29 @@ static wchar_t* extract_epub_content(Db* db, const wchar_t* path, uint64_t* auth
             char* stripped=strip_html_tags(buf); free(buf);
             if(!stripped) continue;
             size_t slen=strlen(stripped);
-            if(len + slen +1 > cap){
-                cap=(cap+slen+1)*2; char* tmp=(char*)realloc(textbuf,cap); if(!tmp){ free(stripped); break; } textbuf=tmp;
+            if(len + slen +1 > MAX_TOTAL_EPUB_SIZE){
+                if(len >= MAX_TOTAL_EPUB_SIZE){ free(stripped); break; }
+                slen = MAX_TOTAL_EPUB_SIZE - len - 1;
+            }
+            size_t needed = len + slen + 1;
+            if(needed > cap){
+                size_t newcap = cap;
+                while(newcap < needed){
+                    if(newcap >= MAX_TOTAL_EPUB_SIZE) { newcap = MAX_TOTAL_EPUB_SIZE; break; }
+                    size_t candidate = newcap * 2;
+                    if(candidate <= newcap || candidate > MAX_TOTAL_EPUB_SIZE){
+                        newcap = MAX_TOTAL_EPUB_SIZE;
+                    } else {
+                        newcap = candidate;
+                    }
+                }
+                if(newcap < needed) newcap = needed;
+                char* tmp=(char*)realloc(textbuf,newcap);
+                if(!tmp){ free(stripped); break; }
+                textbuf=tmp; cap=newcap;
             }
             memcpy(textbuf+len,stripped,slen); len+=slen; textbuf[len]=0; free(stripped);
+            html_count++;
         }
     }
     zip_close(z);
