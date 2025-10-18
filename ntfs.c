@@ -400,6 +400,9 @@ static FrnEntry* frnmap_put(FrnMap* m, uint64_t frn, uint64_t parent, const wcha
     return &m->slots[i];
 }
 static FrnEntry* frnmap_get(FrnMap* m, uint64_t frn){
+    if(!m || !m->slots || m->cap == 0){
+        return NULL;
+    }
     size_t i = (size_t)(frn_hash(frn) & (m->cap-1));
     while(m->slots[i].frn){
         if(m->slots[i].frn==frn) return &m->slots[i];
@@ -407,6 +410,28 @@ static FrnEntry* frnmap_get(FrnMap* m, uint64_t frn){
     }
     return NULL;
 }
+
+typedef enum {
+    FRN_MODE_BUILDING,
+    FRN_MODE_STREAMING,
+} FrnMode;
+
+#define USN_STREAM_BATCH 256
+#define USN_PARENT_CACHE 256
+
+typedef struct PendingEmit {
+    uint64_t frn;
+    uint64_t parent_frn;
+    wchar_t  name[MAX_PATH];
+    uint32_t attrs;
+} PendingEmit;
+
+typedef struct ParentPathCacheEntry {
+    uint64_t frn;
+    wchar_t  path[MAX_LONG_PATH];
+    uint64_t last_use;
+    BOOL     valid;
+} ParentPathCacheEntry;
 
 typedef struct USNScanner {
     HANDLE hVol;
@@ -420,6 +445,13 @@ typedef struct USNScanner {
     int max_threads;
     HANDLE thread;
     BOOL streaming_mode;
+    BOOL map_emit_async;
+    BOOL map_freed;
+    PendingEmit pending_batch[USN_STREAM_BATCH];
+    size_t pending_count;
+    ParentPathCacheEntry parent_cache[USN_PARENT_CACHE];
+    size_t parent_cache_count;
+    uint64_t parent_cache_clock;
 } USNScanner;
 
 static BOOL volume_from_root(const wchar_t* root, wchar_t* volprefix, size_t cch){
@@ -503,16 +535,10 @@ static BOOL frn_resolve_parent_path(USNScanner* s, uint64_t parent_frn, wchar_t*
     return ok;
 }
 
-static BOOL frn_emit_direct(USNScanner* s, const USN_RECORD_V2* r){
+static BOOL frn_emit_resolved(USNScanner* s, const wchar_t* parent, const wchar_t* name, uint32_t attrs){
     if(is_cancelled(s->cancel)){
         return FALSE;
     }
-    wchar_t parent[MAX_LONG_PATH];
-    if(!frn_resolve_parent_path(s, r->ParentFileReferenceNumber, parent, MAX_LONG_PATH)){
-        return FALSE;
-    }
-    wchar_t name[MAX_PATH];
-    wcsncpy_s(name, MAX_PATH, (const wchar_t*)((BYTE*)r + r->FileNameOffset), r->FileNameLength/2);
     DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
     if(!wi){
         return FALSE;
@@ -523,7 +549,7 @@ static BOOL frn_emit_direct(USNScanner* s, const USN_RECORD_V2* r){
     wcscpy_s(wi->name, MAX_PATH, name);
     wi->file_size = 0;
     wi->creation_time = wi->modified_time = wi->access_time = 0;
-    wi->attributes = r->FileAttributes;
+    wi->attributes = attrs;
     wi->clone_id = 0;
     wi->stage = INDEX_NAMES_ONLY;
     wi->op = WI_ADD;
@@ -535,6 +561,124 @@ static BOOL frn_emit_direct(USNScanner* s, const USN_RECORD_V2* r){
         SwitchToThread();
     }
     return TRUE;
+}
+
+static BOOL usn_parent_cache_lookup(USNScanner* s, uint64_t parent_frn, wchar_t* parent, size_t cch){
+    if(!s) return FALSE;
+    for(size_t i = 0; i < USN_PARENT_CACHE; ++i){
+        ParentPathCacheEntry* entry = &s->parent_cache[i];
+        if(entry->valid && entry->frn == parent_frn){
+            if(wcscpy_s(parent, cch, entry->path) == 0){
+                entry->last_use = ++s->parent_cache_clock;
+                return TRUE;
+            }
+            return FALSE;
+        }
+    }
+    return FALSE;
+}
+
+static void usn_parent_cache_store(USNScanner* s, uint64_t parent_frn, const wchar_t* parent){
+    if(!s || !parent){
+        return;
+    }
+    ParentPathCacheEntry* target = NULL;
+    ParentPathCacheEntry* oldest = NULL;
+    for(size_t i = 0; i < USN_PARENT_CACHE; ++i){
+        ParentPathCacheEntry* entry = &s->parent_cache[i];
+        if(entry->valid && entry->frn == parent_frn){
+            target = entry;
+            break;
+        }
+        if(!entry->valid){
+            if(!target){
+                target = entry;
+            }
+        } else if(!oldest || entry->last_use < oldest->last_use){
+            oldest = entry;
+        }
+    }
+    if(!target){
+        target = oldest ? oldest : &s->parent_cache[0];
+    }
+    if(!target->valid && s->parent_cache_count < USN_PARENT_CACHE){
+        s->parent_cache_count++;
+    }
+    target->frn = parent_frn;
+    wcscpy_s(target->path, MAX_LONG_PATH, parent);
+    target->valid = TRUE;
+    target->last_use = ++s->parent_cache_clock;
+}
+
+static void emit_direct_batched(USNScanner* s, PendingEmit* batch, size_t count){
+    if(!s || !batch || count == 0){
+        return;
+    }
+    for(size_t i = 0; i < count; ++i){
+        if(is_cancelled(s->cancel)){
+            return;
+        }
+        PendingEmit* item = &batch[i];
+        wchar_t parent[MAX_LONG_PATH];
+        BOOL resolved = FALSE;
+        if(item->parent_frn && usn_parent_cache_lookup(s, item->parent_frn, parent, MAX_LONG_PATH)){
+            resolved = TRUE;
+        } else {
+            if(!frn_resolve_parent_path(s, item->parent_frn, parent, MAX_LONG_PATH)){
+                continue;
+            }
+            if(item->parent_frn){
+                usn_parent_cache_store(s, item->parent_frn, parent);
+            }
+            resolved = TRUE;
+        }
+        if(!resolved){
+            continue;
+        }
+        frn_emit_resolved(s, parent, item->name, item->attrs);
+    }
+}
+
+static void usn_flush_pending_emits(USNScanner* s){
+    if(!s) return;
+    if(s->pending_count){
+        emit_direct_batched(s, s->pending_batch, s->pending_count);
+        s->pending_count = 0;
+    }
+}
+
+static void usn_queue_streaming_emit(USNScanner* s, const USN_RECORD_V2* r){
+    if(!s || !r) return;
+    if(s->pending_count >= USN_STREAM_BATCH){
+        emit_direct_batched(s, s->pending_batch, s->pending_count);
+        s->pending_count = 0;
+    }
+    PendingEmit* slot = &s->pending_batch[s->pending_count++];
+    slot->frn = r->FileReferenceNumber;
+    slot->parent_frn = r->ParentFileReferenceNumber;
+    size_t chars = r->FileNameLength / sizeof(wchar_t);
+    wcsncpy_s(slot->name, MAX_PATH, (const wchar_t*)((BYTE*)r + r->FileNameOffset), chars);
+    slot->attrs = r->FileAttributes;
+}
+
+static void usn_check_async_emit_done(USNScanner* s){
+    if(!s || !s->map_emit_async || s->map_freed){
+        return;
+    }
+    if(s->pool.current_threads <= 0){
+        pool_destroy(&s->pool);
+        frnmap_free(&s->map);
+        s->map_emit_async = FALSE;
+        s->map_freed = TRUE;
+        return;
+    }
+    DWORD wait = WaitForMultipleObjects(s->pool.current_threads, s->pool.threads, TRUE, 0);
+    if(wait == WAIT_OBJECT_0){
+        pool_destroy(&s->pool);
+        frnmap_free(&s->map);
+        s->map_emit_async = FALSE;
+        s->map_freed = TRUE;
+    }
 }
 
 static DWORD WINAPI map_emit_worker(void* p){
@@ -572,9 +716,24 @@ static DWORD WINAPI map_emit_worker(void* p){
     return 0;
 }
 
+static void usn_emit_buffered_results(USNScanner* s){
+    if(!s || s->map_emit_async){
+        return;
+    }
+    if(!s->map.cap || !s->map.slots){
+        return;
+    }
+    s->next_idx = -1;
+    s->pool.work_queue_size = (LONG)s->map.cap;
+    pool_init(&s->pool, 1, s->max_threads, map_emit_worker, s);
+    s->map_emit_async = TRUE;
+    s->map_freed = FALSE;
+}
+
 static DWORD WINAPI usn_thread(void* p){
     USNScanner* s = (USNScanner*)p;
-    // Enumerate MFT via FSCTL_ENUM_USN_DATA
+    FrnMode mode = FRN_MODE_BUILDING;
+    size_t last_progress_emit = 0;
     BYTE* buf = (BYTE*)VirtualAlloc(NULL, 16*1024*1024, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
     if(!buf) return 1;
     MFT_ENUM_DATA_V1 med = {0};
@@ -582,7 +741,6 @@ static DWORD WINAPI usn_thread(void* p){
     med.LowUsn = 0;
     med.HighUsn = MAXLONGLONG;
     DWORD bytes;
-    // first, fill the FRN map
     frnmap_init(&s->map, 1<<20);
     for(;;){
         if(is_cancelled(s->cancel)) break;
@@ -593,32 +751,74 @@ static DWORD WINAPI usn_thread(void* p){
         while(pRec + sizeof(USN_RECORD_V2) <= (DWORD_PTR)buf + bytes){
             USN_RECORD_V2* r = (USN_RECORD_V2*)pRec;
             if(r->RecordLength < sizeof(USN_RECORD_V2)) break;
-            wchar_t name[MAX_PATH];
-            wcsncpy_s(name, MAX_PATH, (const wchar_t*)((BYTE*)r + r->FileNameOffset), r->FileNameLength/2);
-            if(s->streaming_mode || s->map.streaming){
-                s->streaming_mode = TRUE;
-                frn_emit_direct(s, r);
-            } else {
+            if((DWORD)r->FileNameOffset + (DWORD)r->FileNameLength > r->RecordLength){
+                pRec += r->RecordLength;
+                continue;
+            }
+            if(mode == FRN_MODE_BUILDING){
+                wchar_t name[MAX_PATH];
+                size_t name_chars = r->FileNameLength / sizeof(wchar_t);
+                wcsncpy_s(name, MAX_PATH, (const wchar_t*)((BYTE*)r + r->FileNameOffset), name_chars);
                 FrnEntry* fe = frnmap_put(&s->map, r->FileReferenceNumber, r->ParentFileReferenceNumber, name, r->FileAttributes);
                 if(fe == FRNMAP_STREAMING_SENTINEL){
+                    mode = FRN_MODE_STREAMING;
+                    s->map.streaming = TRUE;
                     s->streaming_mode = TRUE;
-                    frn_emit_direct(s, r);
+                    usn_emit_buffered_results(s);
+                    live_updates_push_progress((uint64_t)s->map.count, TRUE);
+                    usn_queue_streaming_emit(s, r);
                 } else if(!fe){
                     VirtualFree(buf,0,MEM_RELEASE);
                     return 1;
+                } else {
+                    if(s->map.count - last_progress_emit >= 1000){
+                        live_updates_push_progress((uint64_t)s->map.count, FALSE);
+                        last_progress_emit = s->map.count;
+                    }
+                    if(s->map.count > 10000){
+                        mode = FRN_MODE_STREAMING;
+                        s->map.streaming = TRUE;
+                        s->streaming_mode = TRUE;
+                        usn_emit_buffered_results(s);
+                        live_updates_push_progress((uint64_t)s->map.count, TRUE);
+                    }
                 }
+            } else {
+                usn_queue_streaming_emit(s, r);
             }
             pRec += r->RecordLength;
         }
+        if(mode == FRN_MODE_STREAMING){
+            usn_flush_pending_emits(s);
+        }
         med.StartFileReferenceNumber = *(USN*)buf;
+        usn_check_async_emit_done(s);
     }
-    // Second pass: emit work items using adaptive thread pool
-    if(s->map.cap && s->map.slots){
+    if(mode == FRN_MODE_BUILDING){
+        live_updates_push_progress((uint64_t)s->map.count, TRUE);
+    }
+    usn_flush_pending_emits(s);
+    if(s->map_emit_async && !s->map_freed){
+        if(s->pool.current_threads > 0){
+            WaitForMultipleObjects(s->pool.current_threads, s->pool.threads, TRUE, INFINITE);
+        }
+        pool_destroy(&s->pool);
+        frnmap_free(&s->map);
+        s->map_emit_async = FALSE;
+        s->map_freed = TRUE;
+    } else if(!s->map.streaming && s->map.cap && s->map.slots){
         s->next_idx = -1;
         s->pool.work_queue_size = (LONG)s->map.cap;
         pool_init(&s->pool, 1, s->max_threads, map_emit_worker, s);
-        WaitForMultipleObjects(s->pool.current_threads, s->pool.threads, TRUE, INFINITE);
+        if(s->pool.current_threads > 0){
+            WaitForMultipleObjects(s->pool.current_threads, s->pool.threads, TRUE, INFINITE);
+        }
         pool_destroy(&s->pool);
+        frnmap_free(&s->map);
+        s->map_freed = TRUE;
+    } else if(!s->map_freed && s->map.cap && s->map.slots){
+        frnmap_free(&s->map);
+        s->map_freed = TRUE;
     }
     VirtualFree(buf,0,MEM_RELEASE);
     return 0;

@@ -166,6 +166,31 @@ static void push_live_update(const DbWorkItem* wi){
     wcscpy_s(lu->name, MAX_PATH, wi->name);
     lu->op = wi->op;
     lu->refcount = 1;
+    lu->is_progress = FALSE;
+    lu->progress_done = FALSE;
+    lu->progress_count = 0;
+    _ReadWriteBarrier();
+    int tries = 0;
+    while(!MPMC_Push(&g_live_updates, lu)){
+        if(!g_live_inited || tries++ > 1000){
+            aligned_free(lu);
+            return;
+        }
+        Sleep(0);
+    }
+}
+
+void live_updates_push_progress(uint64_t processed_count, BOOL done){
+    if(!g_live_inited) return;
+    LiveUpdate* lu = (LiveUpdate*)aligned_malloc(sizeof(LiveUpdate), CACHE_LINE_SIZE);
+    if(!lu) return;
+    lu->parent_path[0] = L'\0';
+    lu->name[0] = L'\0';
+    lu->op = WI_ADD;
+    lu->refcount = 1;
+    lu->is_progress = TRUE;
+    lu->progress_done = done;
+    lu->progress_count = processed_count;
     _ReadWriteBarrier();
     int tries = 0;
     while(!MPMC_Push(&g_live_updates, lu)){
