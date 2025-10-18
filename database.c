@@ -49,10 +49,14 @@ typedef struct {
 #define STRING_CACHE_MASK (STRING_CACHE_SIZE-1u)
 #define STRING_CACHE_PROBE_LIMIT STRING_CACHE_SIZE
 
+#define CACHE_PARTITIONS 16u
+#define PARTITION_SIZE (STRING_CACHE_SIZE / CACHE_PARTITIONS)
+#define PARTITION_MASK (PARTITION_SIZE-1u)
+
 #define L1_STRING_CACHE_SIZE 256u
 #define L1_STRING_CACHE_MASK (L1_STRING_CACHE_SIZE-1u)
 
-static StringCache g_string_cache[STRING_CACHE_SIZE];
+static StringCache g_string_cache[CACHE_PARTITIONS][PARTITION_SIZE];
 
 typedef struct {
     volatile LONG64 stamp;
@@ -166,12 +170,14 @@ static void l1_cache_update(const wchar_t* wide, size_t wlen, uint64_t wide_hash
 
 static uint64_t string_cache_lookup(const char* s, uint64_t h){
     if(!s) return 0;
-    uint32_t mask = STRING_CACHE_MASK;
-    uint32_t idx = (uint32_t)h & mask;
-    uint32_t step = (uint32_t)(((h >> 32) & mask) | 1u);
+    size_t partition = (size_t)(h % CACHE_PARTITIONS);
+    size_t mask = PARTITION_MASK;
+    size_t idx = ((size_t)(h / CACHE_PARTITIONS)) & mask;
+    size_t step = (((size_t)(h >> 32) & mask) | 1u);
     if(step == 0) step = 1u;
-    for(uint32_t probe = 0; probe < STRING_CACHE_PROBE_LIMIT; ++probe){
-        StringCache* c = &g_string_cache[idx];
+    StringCache* cache = g_string_cache[partition];
+    for(size_t probe = 0; probe < PARTITION_SIZE; ++probe){
+        StringCache* c = &cache[idx];
         char* str = atomic_load_char((volatile char**)&c->string);
         if(!str) return 0;
         if(str == STRING_CACHE_BUSY){
@@ -179,7 +185,10 @@ static uint64_t string_cache_lookup(const char* s, uint64_t h){
             continue;
         }
         if(c->hash == h && strcmp(str, s) == 0){
-            return c->string_id;
+            uint64_t string_id = (uint64_t)InterlockedCompareExchange64((volatile LONG64*)&c->string_id, 0, 0);
+            if(string_id != 0){
+                return string_id;
+            }
         }
         idx = (idx + step) & mask;
     }
@@ -188,14 +197,16 @@ static uint64_t string_cache_lookup(const char* s, uint64_t h){
 
 static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
     if(!s) return;
-    uint32_t mask = STRING_CACHE_MASK;
-    uint32_t idx = (uint32_t)h & mask;
-    uint32_t step = (uint32_t)(((h >> 32) & mask) | 1u);
+    size_t partition = (size_t)(h % CACHE_PARTITIONS);
+    size_t mask = PARTITION_MASK;
+    size_t idx = ((size_t)(h / CACHE_PARTITIONS)) & mask;
+    size_t step = (((size_t)(h >> 32) & mask) | 1u);
     if(step == 0) step = 1u;
-    uint32_t best_idx = idx;
+    size_t best_idx = idx;
     uint64_t best_age = UINT64_MAX;
-    for(uint32_t probe = 0; probe < STRING_CACHE_PROBE_LIMIT; ++probe){
-        StringCache* c = &g_string_cache[idx];
+    StringCache* cache = g_string_cache[partition];
+    for(size_t probe = 0; probe < PARTITION_SIZE; ++probe){
+        StringCache* c = &cache[idx];
         char* str = atomic_load_char((volatile char**)&c->string);
         if(!str){
             if(InterlockedCompareExchangePointer((PVOID*)&c->string, (PVOID)STRING_CACHE_BUSY, NULL) == NULL){
@@ -216,13 +227,14 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
             c->string_id = id;
             return;
         }
-        if(c->string_id < best_age){
-            best_age = c->string_id;
+        uint64_t string_id = (uint64_t)InterlockedCompareExchange64((volatile LONG64*)&c->string_id, 0, 0);
+        if(string_id != 0 && string_id < best_age){
+            best_age = string_id;
             best_idx = idx;
         }
         idx = (idx + step) & mask;
     }
-    StringCache* victim = &g_string_cache[best_idx];
+    StringCache* victim = &cache[best_idx];
     for(;;){
         char* expected = atomic_load_char((volatile char**)&victim->string);
         if(expected == STRING_CACHE_BUSY) continue;
