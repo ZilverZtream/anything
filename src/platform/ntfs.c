@@ -195,9 +195,57 @@ static BOOL frnmap_ensure_slot_committed(FrnMap* m, size_t index){
             if(observed >= target){
                 return TRUE;
             }
-            if(frnmap_atomic_compare_exchange_size(&m->slots_committed, committed, target)){
-                return TRUE;
+            if(observed > committed){
+                continue;
             }
+            size_t actual = committed;
+            uint8_t* cursor = (uint8_t*)addr;
+            uint8_t* const end = (uint8_t*)m->slots + target;
+            while(cursor < end){
+                MEMORY_BASIC_INFORMATION info;
+                SIZE_T queried = VirtualQuery(cursor, &info, sizeof(info));
+                if(queried != sizeof(info)){
+                    break;
+                }
+                if(info.State != MEM_COMMIT){
+                    break;
+                }
+                uint8_t* region_end = (uint8_t*)info.BaseAddress + info.RegionSize;
+                if(region_end > (uint8_t*)m->slots + m->slots_bytes){
+                    region_end = (uint8_t*)m->slots + m->slots_bytes;
+                }
+                if(region_end <= cursor){
+                    break;
+                }
+                cursor = region_end;
+                size_t new_actual = (size_t)(cursor - (uint8_t*)m->slots);
+                if(new_actual > actual){
+                    actual = new_actual;
+                }
+                if(cursor >= end){
+                    break;
+                }
+            }
+            if(actual > committed){
+                if(actual >= target){
+                    for(;;){
+                        size_t expected = committed;
+                        if(frnmap_atomic_compare_exchange_size(&m->slots_committed, expected, actual)){
+                            return TRUE;
+                        }
+                        expected = frnmap_atomic_read_size(&m->slots_committed);
+                        if(expected >= actual){
+                            return TRUE;
+                        }
+                    }
+                }
+                frnmap_atomic_compare_exchange_size(&m->slots_committed, committed, actual);
+                continue;
+            }
+#ifdef _WIN32
+            SwitchToThread();
+#endif
+            continue;
         }else if(frnmap_atomic_compare_exchange_size(&m->slots_committed, committed, committed + to_commit)){
             return TRUE;
         }
