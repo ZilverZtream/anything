@@ -102,7 +102,7 @@ static uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom){
 
     size_t limit = len > DB_BLOOM_MAX_BYTES ? DB_BLOOM_MAX_BYTES : len;
     char stack_tmp[512];
-    BOOL heap = limit + 1 > sizeof(stack_tmp);
+    BOOL heap = (limit + 1 > sizeof(stack_tmp));
     char* tmp = heap ? (char*)malloc(limit + 1) : stack_tmp;
     if(!tmp) return 0;
     memcpy(tmp, name_u8, limit);
