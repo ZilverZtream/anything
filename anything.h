@@ -68,6 +68,7 @@ typedef struct DbRecord {
     uint64_t  rec_id;
     uint64_t  parent_str_id;
     uint64_t  name_str_id;
+    uint64_t  normalized_name_str_id;
     uint64_t  file_size;
     uint64_t  creation_time;
     uint64_t  modified_time;

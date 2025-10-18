@@ -922,9 +922,18 @@ void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const std::st
 static bool string_contains_lower_term(const MDB_val* text, const std::string& lower_term){
     if(!text) return false;
     std::string tmp(static_cast<const char*>(text->mv_data), text->mv_size);
-    std::transform(tmp.begin(), tmp.end(), tmp.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-    for(char& c : tmp){
-        if(c == '_' || c == '-') c = ' ';
+    bool needs_transform = false;
+    for(char c : tmp){
+        if((c >= 'A' && c <= 'Z') || c == '_' || c == '-' || c == '.'){
+            needs_transform = true;
+            break;
+        }
+    }
+    if(needs_transform){
+        std::transform(tmp.begin(), tmp.end(), tmp.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+        for(char& c : tmp){
+            if(c == '_' || c == '-' || c == '.') c = ' ';
+        }
     }
     return tmp.find(lower_term) != std::string::npos;
 }
@@ -938,11 +947,21 @@ static std::string string_from_value_trimmed(const MDB_val& value){
 
 void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_dbi dbi_strings, MDB_dbi dbi_smeta, const std::string& term, IdVec* out) {
     IdVec name_ids; idvec_init(&name_ids);
-    collect_trigram_candidates(txn, dbi_trigram, term, &name_ids);
+    size_t raw_len = term.length();
+    if(raw_len >= DB_BLOOM_MAX_BYTES){
+        idvec_free(&name_ids);
+        return;
+    }
+
+    std::vector<char> normalized_buf(raw_len + 1);
+    normalize_filename_utf8(term.c_str(), normalized_buf.data(), normalized_buf.size());
+    std::string normalized(normalized_buf.data());
+
+    collect_trigram_candidates(txn, dbi_trigram, normalized.c_str(), &name_ids);
     sort_unique(&name_ids);
 
-    const size_t term_len = term.length();
-    std::string lower_term = to_lower(term);
+    const size_t term_len = normalized.length();
+    const std::string& lower_term = normalized;
     const bool use_bloom = term_len >= 5;
     uint32_t hbuf[4096]; size_t hn = 0;
     if(use_bloom){
@@ -1040,16 +1059,25 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
         MDB_val sk, sv;
         int rc = mdb_cursor_get(cs, &sk, &sv, MDB_FIRST);
         std::string npat = lower_term;
-        for(char& c : npat){ if(c == '_' || c == '-') c = ' '; }
         int maxd = static_cast<int>((npat.length() + 4) / 5);
         while(rc == 0){
             uint64_t sid = *(uint64_t*)sk.mv_data;
             MDB_val text_val; StringMeta meta_tmp;
             string_value_parse(&sv, &text_val, &meta_tmp);
-            std::string name(static_cast<const char*>(text_val.mv_data), text_val.mv_size);
-            std::string norm = name;
-            std::transform(norm.begin(), norm.end(), norm.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
-            for(char& c : norm){ if(c == '_' || c == '-' || c == '.') c = ' '; }
+            std::string norm(static_cast<const char*>(text_val.mv_data), text_val.mv_size);
+            bool needs_transform = false;
+            for(char c : norm){
+                if((c >= 'A' && c <= 'Z') || c == '_' || c == '-' || c == '.'){
+                    needs_transform = true;
+                    break;
+                }
+            }
+            if(needs_transform){
+                std::vector<char> tmp(norm.begin(), norm.end());
+                tmp.push_back('\0');
+                normalize_filename_utf8(tmp.data(), tmp.data(), tmp.size());
+                norm.assign(tmp.data());
+            }
             if(fuzzy_match(norm.c_str(), npat.c_str(), maxd)){
                 MDB_val k = {.mv_data = &sid, .mv_size = sizeof(sid)};
                 MDB_val v;

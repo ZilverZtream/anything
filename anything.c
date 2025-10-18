@@ -993,6 +993,7 @@ static BOOL writer_signal_wait(WriterSignal* sig, DWORD timeout_ms, BOOL* timed_
 typedef struct BatchInternRequest {
     wchar_t*   str;
     uint64_t*  target;
+    uint64_t*  normalized_target;
 } BatchInternRequest;
 
 static wchar_t* dup_wstring_local(const wchar_t* s){
@@ -1004,7 +1005,7 @@ static wchar_t* dup_wstring_local(const wchar_t* s){
 #endif
 }
 
-static BOOL writer_add_intern_request(BatchInternRequest** reqs, size_t* count, size_t* capacity, wchar_t* str, uint64_t* target){
+static BOOL writer_add_intern_request(BatchInternRequest** reqs, size_t* count, size_t* capacity, wchar_t* str, uint64_t* target, uint64_t* normalized_target){
     if(!str || !target){
         if(str) free(str);
         return TRUE;
@@ -1021,6 +1022,7 @@ static BOOL writer_add_intern_request(BatchInternRequest** reqs, size_t* count, 
     }
     (*reqs)[*count].str = str;
     (*reqs)[*count].target = target;
+    (*reqs)[*count].normalized_target = normalized_target;
     (*count)++;
     return TRUE;
 }
@@ -1054,20 +1056,39 @@ static BOOL writer_ensure_record_capacity(DbRecord** buf, size_t* capacity, size
 static BOOL writer_resolve_intern_requests(WriterCtx* ctx, BatchInternRequest* reqs, size_t count){
     if(!ctx || !reqs || count==0) return TRUE;
     const wchar_t** strings = (const wchar_t**)malloc(sizeof(wchar_t*) * count);
+    uint8_t* needs_norm = (uint8_t*)malloc(sizeof(uint8_t) * count);
     uint64_t* ids = (uint64_t*)malloc(sizeof(uint64_t) * count);
-    if(!strings || !ids){
+    uint64_t* norm_ids = NULL;
+    BOOL any_norm = FALSE;
+    if(!strings || !ids || !needs_norm){
         free(strings);
         free(ids);
+        free(needs_norm);
         writer_release_intern_requests(reqs, count);
         return FALSE;
     }
     for(size_t i=0;i<count;i++){
         strings[i] = reqs[i].str;
+        needs_norm[i] = (reqs[i].normalized_target != NULL) ? 1u : 0u;
+        if(needs_norm[i]) any_norm = TRUE;
     }
-    db_intern_wstrings_batched(ctx->db, strings, count, ids);
+    if(any_norm){
+        norm_ids = (uint64_t*)malloc(sizeof(uint64_t) * count);
+        if(!norm_ids){
+            free(strings);
+            free(ids);
+            free(needs_norm);
+            writer_release_intern_requests(reqs, count);
+            return FALSE;
+        }
+    }
+    db_intern_wstrings_batched(ctx->db, strings, needs_norm, count, ids, norm_ids);
     for(size_t i=0;i<count;i++){
         if(reqs[i].target){
             *(reqs[i].target) = ids[i];
+        }
+        if(reqs[i].normalized_target && norm_ids){
+            *(reqs[i].normalized_target) = norm_ids[i];
         }
         if(reqs[i].str){
             free(reqs[i].str);
@@ -1076,6 +1097,8 @@ static BOOL writer_resolve_intern_requests(WriterCtx* ctx, BatchInternRequest* r
     }
     free(strings);
     free(ids);
+    free(needs_norm);
+    if(norm_ids) free(norm_ids);
     return TRUE;
 }
 
@@ -1331,8 +1354,8 @@ static DWORD WINAPI DbWriterThread(void* p){
                 success = FALSE;
                 goto cleanup;
             }
-            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, parent_copy, &r.parent_str_id) ||
-               !writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, name_copy, &r.name_str_id)){
+            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, parent_copy, &r.parent_str_id, NULL) ||
+               !writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, name_copy, &r.name_str_id, &r.normalized_name_str_id)){
                 aligned_free(wi);
                 success = FALSE;
                 goto cleanup;
@@ -1365,8 +1388,8 @@ static DWORD WINAPI DbWriterThread(void* p){
                 success = FALSE;
                 goto cleanup;
             }
-            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, parent_copy, &r.parent_str_id) ||
-               !writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, name_copy, &r.name_str_id)){
+            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, parent_copy, &r.parent_str_id, NULL) ||
+               !writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, name_copy, &r.name_str_id, &r.normalized_name_str_id)){
                 aligned_free(wi);
                 success = FALSE;
                 goto cleanup;
@@ -1408,7 +1431,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                     if(wi->content){
                         wchar_t* owned = wi->content;
                         wi->content = NULL;
-                        if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, owned, &rfull.content_str_id)){
+                        if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, owned, &rfull.content_str_id, NULL)){
                             aligned_free(wi);
                             success = FALSE;
                             goto cleanup;
@@ -1420,7 +1443,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                     if(wi->preview){
                         wchar_t* owned = wi->preview;
                         wi->preview = NULL;
-                        if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, owned, &rfull.preview_str_id)){
+                        if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, owned, &rfull.preview_str_id, NULL)){
                             aligned_free(wi);
                             success = FALSE;
                             goto cleanup;
@@ -1428,7 +1451,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                     } else if(needs_thumbnail(wi->name)){
                         wchar_t* thumb = GenerateThumbnail(fpath);
                         if(thumb){
-                            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, thumb, &rfull.preview_str_id)){
+                            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, thumb, &rfull.preview_str_id, NULL)){
                                 success = FALSE;
                                 aligned_free(wi);
                                 goto cleanup;

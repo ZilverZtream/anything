@@ -465,9 +465,19 @@ static BOOL string_contains_lower_term(const MDB_val* text, const char* lower_te
     if(!tmp) return FALSE;
     memcpy(tmp, text->mv_data, len);
     tmp[len] = 0;
-    lowercase_ascii(tmp, len);
+    BOOL needs_transform = FALSE;
     for(size_t i=0;i<len;i++){
-        if(tmp[i]=='_' || tmp[i]=='-') tmp[i]=' ';
+        unsigned char c = (unsigned char)tmp[i];
+        if((c >= 'A' && c <= 'Z') || c == '_' || c == '-' || c == '.'){
+            needs_transform = TRUE;
+            break;
+        }
+    }
+    if(needs_transform){
+        lowercase_ascii(tmp, len);
+        for(size_t i=0;i<len;i++){
+            if(tmp[i]=='_' || tmp[i]=='-' || tmp[i]=='.') tmp[i]=' ';
+        }
     }
     BOOL match = strstr(tmp, lower_term) != NULL;
     free(tmp);
@@ -2595,19 +2605,21 @@ static void records_for_content(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_c
 
 static const size_t MAX_NAME_RESULTS = 100000;
 
+
 static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_dbi dbi_strings, MDB_dbi dbi_smeta, const char* term, IdVec* out){
     IdVec name_ids; idvec_init(&name_ids);
-    collect_trigram_candidates(txn, dbi_trigram, term, &name_ids);
+    size_t raw_len = strnlen(term, DB_BLOOM_MAX_BYTES);
+    if(raw_len == DB_BLOOM_MAX_BYTES){ idvec_free(&name_ids); return; }
+    char* normalized = (char*)malloc(raw_len + 1);
+    if(!normalized){ idvec_free(&name_ids); return; }
+    normalize_filename_utf8(term, normalized, raw_len + 1);
+    size_t normalized_len = strlen(normalized);
+    collect_trigram_candidates(txn, dbi_trigram, normalized, &name_ids);
     sort_unique(&name_ids);
     if(name_ids.n>0){
         size_t keep=0;
-        size_t tlen=strnlen(term, DB_BLOOM_MAX_BYTES);
-        if(tlen == DB_BLOOM_MAX_BYTES) { idvec_free(&name_ids); return; }
-        char* tl=(char*)malloc(tlen+1);
-        if(!tl){ idvec_free(&name_ids); return; }
-        memcpy(tl, term, tlen);
-        tl[tlen]='\0';
-        lowercase_ascii(tl,tlen);
+        size_t tlen = normalized_len;
+        const char* tl = normalized;
         uint32_t hbuf[4096]; size_t hn=0;
         size_t limit = tlen > DB_BLOOM_MAX_BYTES ? DB_BLOOM_MAX_BYTES : tlen;
         size_t full = limit < DB_BLOOM_STRIDE_AFTER ? limit : DB_BLOOM_STRIDE_AFTER;
@@ -2662,7 +2674,7 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
             }
             if(ok){ name_ids.ids[keep++]=name_ids.ids[i]; }
         }
-        name_ids.n=keep; free(tl);
+        name_ids.n=keep;
     }
     MDB_cursor* cix=NULL; mdb_cursor_open(txn, dbi_fname, &cix);
     BOOL limit_reached = FALSE;
@@ -2678,41 +2690,40 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
             }
         }
     } else {
-        MDB_cursor* cs=NULL; mdb_cursor_open(txn, dbi_strings,&cs);
-        MDB_val sk,sv; int rc=mdb_cursor_get(cs,&sk,&sv,MDB_FIRST);
-        size_t npat_len = strnlen(term, DB_BLOOM_MAX_BYTES);
-        if(npat_len == DB_BLOOM_MAX_BYTES){ mdb_cursor_close(cs); idvec_free(&name_ids); return; }
-        char* npat=(char*)malloc(npat_len+1);
-        if(!npat){ mdb_cursor_close(cs); idvec_free(&name_ids); return; }
-        memcpy(npat, term, npat_len);
-        npat[npat_len]='\0';
-        lowercase_ascii(npat,npat_len);
-        for(size_t j=0;npat[j];++j){ if(npat[j]=='_'||npat[j]=='-') npat[j]=' '; }
-        int maxd=(int)((npat_len+4)/5);
+        int maxd=(int)((normalized_len+4)/5);
+        MDB_val key,val;
+        int rc=mdb_cursor_get(cix,&key,&val,MDB_FIRST);
         while(rc==0 && !limit_reached){
-            uint64_t sid=*(uint64_t*)sk.mv_data;
+            uint64_t sid=*(uint64_t*)key.mv_data;
+            MDB_val sk={.mv_data=&sid,.mv_size=sizeof(sid)}, sv;
+            if(mdb_get(txn, dbi_strings, &sk, &sv)!=0){
+                rc = mdb_cursor_get(cix,&key,&val,MDB_NEXT_NODUP);
+                continue;
+            }
             MDB_val text_val; StringMeta meta_tmp;
             string_value_parse(&sv, &text_val, &meta_tmp);
-            size_t nlen=text_val.mv_size;
-            char* tmp=(char*)_malloca(nlen+1); memcpy(tmp,text_val.mv_data,nlen); tmp[nlen]=0;
-            normalize_filename_utf8(tmp,tmp,nlen+1);
-            if(fuzzy_match(tmp,npat,maxd)){
-                MDB_val k={.mv_data=&sid,.mv_size=sizeof(sid)}, v;
-                if(mdb_cursor_get(cix,&k,&v,MDB_SET_KEY)==0){
-                    do{
-                        if(out->n >= MAX_NAME_RESULTS){ limit_reached = TRUE; break; }
-                        idvec_push(out, *(uint64_t*)v.mv_data);
-                    }
-                    while(!limit_reached && mdb_cursor_get(cix,&k,&v,MDB_NEXT_DUP)==0);
-                }
-            }
+            char* tmp=(char*)_malloca(text_val.mv_size + 1);
+            if(!tmp){ rc = mdb_cursor_get(cix,&key,&val,MDB_NEXT_NODUP); continue; }
+            memcpy(tmp,text_val.mv_data,text_val.mv_size); tmp[text_val.mv_size]=0;
+            BOOL matched = fuzzy_match(tmp, normalized, maxd);
             _freea(tmp);
-            if(!limit_reached){ rc=mdb_cursor_get(cs,&sk,&sv,MDB_NEXT); }
+            if(matched){
+                do{
+                    if(out->n >= MAX_NAME_RESULTS){ limit_reached = TRUE; break; }
+                    idvec_push(out, *(uint64_t*)val.mv_data);
+                }
+                while(!limit_reached && mdb_cursor_get(cix,&key,&val,MDB_NEXT_DUP)==0);
+                if(!limit_reached){
+                    rc = mdb_cursor_get(cix,&key,&val,MDB_NEXT_NODUP);
+                }
+            } else {
+                rc = mdb_cursor_get(cix,&key,&val,MDB_NEXT_NODUP);
+            }
         }
-        mdb_cursor_close(cs); free(npat);
     }
     mdb_cursor_close(cix);
     idvec_free(&name_ids);
+    free(normalized);
 }
 
 static void eval_node(Node* n, MDB_txn* txn, MDB_dbi dbi_strings, MDB_dbi dbi_fname, MDB_dbi dbi_trigram, MDB_dbi dbi_smeta, MDB_dbi dbi_content, MDB_dbi dbi_author, MDB_dbi dbi_camera, MDB_dbi dbi_lens, MDB_dbi dbi_artist, MDB_dbi dbi_album, MDB_dbi dbi_title, MDB_dbi dbi_ext, MDB_dbi dbi_strrev, MDB_dbi dbi_date, IdVec* out){

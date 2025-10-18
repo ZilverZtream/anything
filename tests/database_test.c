@@ -160,9 +160,21 @@ static void test_bloom_meta_sizes(){
         assert(name_id != 0);
         assert(db_commit_write(db));
 
+        char norm_buf[512];
+        normalize_filename_utf8(text, norm_buf, sizeof(norm_buf));
+        wchar_t wnorm[512];
+        size_t norm_converted = mbstowcs(wnorm, norm_buf, sizeof(wnorm)/sizeof(wnorm[0]));
+        assert(norm_converted != (size_t)-1);
+        if(norm_converted >= sizeof(wnorm)/sizeof(wnorm[0])) norm_converted = (sizeof(wnorm)/sizeof(wnorm[0])) - 1;
+        wnorm[norm_converted] = L'\0';
+        uint64_t norm_id = db_intern_wstring(db, wnorm);
+        assert(norm_id != 0);
+        assert(db_commit_write(db));
+
         DbRecord rec = {0};
         rec.parent_str_id = parent;
         rec.name_str_id = name_id;
+        rec.normalized_name_str_id = norm_id;
         rec.type = DB_REC_FILE;
         rec.file_size = 1;
         rec.creation_time = rec.modified_time = rec.access_time = 1;
@@ -196,9 +208,20 @@ static void test_db_put_records_and_get_by_path(){
     uint64_t name_id = db_intern_wstring(db, L"file.txt");
     assert(db_commit_write(db));
 
+    char norm_buf[32];
+    normalize_filename_utf8("file.txt", norm_buf, sizeof(norm_buf));
+    wchar_t wnorm[32];
+    size_t norm_len = mbstowcs(wnorm, norm_buf, sizeof(wnorm)/sizeof(wnorm[0]));
+    assert(norm_len != (size_t)-1);
+    if(norm_len >= sizeof(wnorm)/sizeof(wnorm[0])) norm_len = (sizeof(wnorm)/sizeof(wnorm[0])) - 1;
+    wnorm[norm_len] = L'\0';
+    uint64_t norm_id = db_intern_wstring(db, wnorm);
+    assert(db_commit_write(db));
+
     DbRecord rec = {0};
     rec.parent_str_id = parent_id;
     rec.name_str_id = name_id;
+    rec.normalized_name_str_id = norm_id;
     rec.type = DB_REC_FILE;
     rec.file_size = 1;
     rec.creation_time = rec.modified_time = rec.access_time = 1;
