@@ -40,6 +40,8 @@
 #include <mutex>
 #include <memory>
 #include <sstream>
+#include <array>
+#include <cstring>
  extern "C" {
  #include "lmdb.h"
  #include "database.h"
@@ -57,12 +59,42 @@
 #endif
 
 #ifdef HAS_IMGUI
-struct StringMeta { uint32_t trigram_count; uint64_t bloom_offset; };
+struct StringMeta {
+    uint32_t trigram_count;
+    uint8_t  hash_count;
+    uint8_t  reserved[3];
+    uint64_t bloom_offset;
+    uint32_t bloom_length;
+};
 #ifdef _WIN32
 static HANDLE bloom_mapping = NULL;
 #endif
 static const uint8_t* bloom_readonly_base = nullptr;
 static size_t g_bloom_size = 0;
+static thread_local std::array<uint8_t, 8192> gBloomDecodeBuffer;
+
+static bool DecompressBloom(const uint8_t* src, size_t srcLen, uint8_t* dst, size_t dstLen) {
+    if (!src || !dst) return false;
+    size_t i = 0;
+    size_t o = 0;
+    while (i < srcLen && o < dstLen) {
+        int8_t header = static_cast<int8_t>(src[i++]);
+        if (header >= 0) {
+            size_t count = static_cast<size_t>(header) + 1;
+            if (i + count > srcLen || o + count > dstLen) return false;
+            memcpy(dst + o, src + i, count);
+            i += count;
+            o += count;
+        } else if (header != -128) {
+            size_t count = static_cast<size_t>(1 - header);
+            if (i >= srcLen || o + count > dstLen) return false;
+            uint8_t value = src[i++];
+            memset(dst + o, value, count);
+            o += count;
+        }
+    }
+    return o == dstLen;
+}
 static bool open_bloom(const wchar_t* dbPath){
 #ifdef _WIN32
     wchar_t bp[MAX_LONG_PATH]; swprintf(bp, MAX_LONG_PATH, L"%s\\bloom.dat", dbPath);
@@ -601,12 +633,25 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
             MDB_val v;
             if (mdb_get(txn, dbi_smeta, &k, &v) != 0 || v.mv_size < sizeof(StringMeta)) continue;
             const StringMeta* sm = (const StringMeta*)v.mv_data;
-            if (sm->bloom_offset + 8192 > g_bloom_size) continue;
-            const uint8_t* bloom = bloom_readonly_base + sm->bloom_offset;
+            if (sm->bloom_offset >= g_bloom_size || g_bloom_size - sm->bloom_offset < sm->bloom_length) continue;
+            const uint8_t* encoded = bloom_readonly_base + sm->bloom_offset;
+            uint8_t* bloomData = gBloomDecodeBuffer.data();
+            if (sm->bloom_length == 8192) {
+                memcpy(bloomData, encoded, 8192);
+            } else if (!DecompressBloom(encoded, sm->bloom_length, bloomData, 8192)) {
+                continue;
+            }
+            const uint8_t* bloom = bloomData;
+            uint32_t hashToCheck = sm->hash_count;
+            if (hashToCheck == 0 || hashToCheck > 4) hashToCheck = 4;
             bool ok = true;
-            for (size_t j = 0; j < hn; j++) {
-                uint32_t bit = hbuf[j];
-                if ((bloom[bit >> 3] & (1u << (bit & 7))) == 0) { ok = false; break; }
+            size_t idx = 0;
+            while (idx < hn && ok) {
+                for (uint32_t h = 0; h < hashToCheck && idx + h < hn; ++h) {
+                    uint32_t bit = hbuf[idx + h];
+                    if ((bloom[bit >> 3] & (1u << (bit & 7))) == 0) { ok = false; break; }
+                }
+                idx += 4;
             }
             if (ok) { name_ids.ids[keep++] = name_ids.ids[i]; }
         }
