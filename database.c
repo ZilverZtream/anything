@@ -22,9 +22,18 @@
 #define _strdup strdup
 #endif
 
+#if defined(_MSC_VER)
+#define THREAD_LOCAL __declspec(thread)
+#else
+#define THREAD_LOCAL __thread
+#endif
+
 typedef struct {
     uint32_t trigram_count;
+    uint8_t  hash_count;
+    uint8_t  reserved[3];
     uint64_t bloom_offset; // offset in bloom file
+    uint32_t bloom_length;
 } StringMeta;
 
 typedef struct {
@@ -60,6 +69,346 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
     c->hash=h; c->string_id=id; c->string=_strdup(s);
 }
 
+#define TLS_FILENAME_CAP 2048u
+
+typedef struct {
+    char      lower_buf[TLS_FILENAME_CAP];
+    uint32_t  trigram_buf[TLS_FILENAME_CAP];
+} BloomThreadBuffers;
+
+typedef struct {
+    const char* original;
+    size_t      original_len;
+    char*       lower;
+    size_t      lower_len;
+    BOOL        lower_heap;
+    uint32_t*   trigrams;
+    size_t      trigram_count;
+    BOOL        trigrams_heap;
+    uint32_t    hash_count;
+} NameBloomContext;
+
+static THREAD_LOCAL BloomThreadBuffers g_bloom_tls_buffers;
+
+static void name_bloom_context_init(NameBloomContext* ctx){
+    if(!ctx) return;
+    ctx->original = NULL;
+    ctx->original_len = 0;
+    ctx->lower = NULL;
+    ctx->lower_len = 0;
+    ctx->lower_heap = FALSE;
+    ctx->trigrams = NULL;
+    ctx->trigram_count = 0;
+    ctx->trigrams_heap = FALSE;
+    ctx->hash_count = 0;
+}
+
+static size_t fill_trigram_values(const char* text, size_t len, uint32_t* out){
+    if(len < 3 || !text || !out) return 0;
+    size_t tri_count = len - 2;
+#if defined(__SSE4_1__)
+    size_t i = 0;
+    if(tri_count >= 4){
+        size_t simd_limit = tri_count & ~3ull;
+        for(; i < simd_limit; i += 4){
+            __m128i bytes = _mm_loadu_si128((const __m128i*)(text + i));
+            __m128i b0 = _mm_cvtepu8_epi32(bytes);
+            __m128i b1 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes,1));
+            __m128i b2 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes,2));
+            __m128i t  = _mm_or_si128(_mm_slli_epi32(b0,16),
+                                _mm_or_si128(_mm_slli_epi32(b1,8), b2));
+            _mm_storeu_si128((__m128i*)(out + i), t);
+        }
+    }
+    for(; i < tri_count; ++i){
+        out[i] = ((uint32_t)(uint8_t)text[i] << 16) |
+                 ((uint32_t)(uint8_t)text[i+1] << 8) |
+                 (uint32_t)(uint8_t)text[i+2];
+    }
+#else
+    for(size_t i=0;i<tri_count;i++){
+        out[i] = ((uint32_t)(uint8_t)text[i] << 16) |
+                 ((uint32_t)(uint8_t)text[i+1] << 8) |
+                 (uint32_t)(uint8_t)text[i+2];
+    }
+#endif
+    return tri_count;
+}
+
+static BOOL name_bloom_context_prepare(const char* name_u8, NameBloomContext* ctx){
+    if(!name_u8 || !ctx) return FALSE;
+    name_bloom_context_init(ctx);
+    size_t len = strlen(name_u8);
+    ctx->original = name_u8;
+    ctx->original_len = len;
+    if(len == 0){
+        ctx->lower = g_bloom_tls_buffers.lower_buf;
+        ctx->trigrams = g_bloom_tls_buffers.trigram_buf;
+        ctx->lower_len = 0;
+        ctx->trigram_count = 0;
+        return TRUE;
+    }
+
+    BOOL use_tls_lower = (len + 1) <= TLS_FILENAME_CAP;
+    char* lower = use_tls_lower ? g_bloom_tls_buffers.lower_buf : (char*)malloc(len + 1);
+    if(!lower) return FALSE;
+    memcpy(lower, name_u8, len + 1);
+    lowercase_ascii(lower, len);
+    ctx->lower = lower;
+    ctx->lower_len = len;
+    ctx->lower_heap = !use_tls_lower;
+
+    size_t tri_count = len >= 3 ? (len - 2) : 0;
+    BOOL use_tls_tris = tri_count <= TLS_FILENAME_CAP;
+    uint32_t* tris = tri_count ? (use_tls_tris ? g_bloom_tls_buffers.trigram_buf : (uint32_t*)malloc(tri_count * sizeof(uint32_t))) : g_bloom_tls_buffers.trigram_buf;
+    if(tri_count && !tris){
+        if(!use_tls_lower) free(lower);
+        name_bloom_context_init(ctx);
+        return FALSE;
+    }
+    if(tri_count){
+        fill_trigram_values(lower, len, tris);
+    }
+    ctx->trigrams = tris;
+    ctx->trigram_count = tri_count;
+    ctx->trigrams_heap = tri_count && !use_tls_tris;
+    return TRUE;
+}
+
+static void name_bloom_context_release(NameBloomContext* ctx){
+    if(!ctx) return;
+    if(ctx->lower_heap && ctx->lower){
+        free(ctx->lower);
+    }
+    if(ctx->trigrams_heap && ctx->trigrams){
+        free(ctx->trigrams);
+    }
+    name_bloom_context_init(ctx);
+}
+
+static const uint32_t kBloomHashSeeds[4] = {
+    0xA5A5A5A5u, 0x3C3C3C3Cu, 0x5A5A5A5Au, 0x1F1F1F1Fu
+};
+
+#define BLOOM_HASH_CACHE_SIZE 64u
+#define BLOOM_HASH_BATCH      16u
+
+typedef struct {
+    uint32_t trigram;
+    uint32_t hashes[4];
+    uint64_t tick;
+    BOOL     filled;
+} BloomHashCacheEntry;
+
+static BloomHashCacheEntry g_bloom_hash_cache[BLOOM_HASH_CACHE_SIZE];
+static uint64_t g_bloom_hash_tick = 1;
+
+static BloomHashCacheEntry* bloom_hash_cache_lookup(uint32_t trigram){
+    BloomHashCacheEntry* oldest = NULL;
+    uint64_t oldest_tick = UINT64_MAX;
+    for(size_t i=0;i<BLOOM_HASH_CACHE_SIZE;i++){
+        BloomHashCacheEntry* e = &g_bloom_hash_cache[i];
+        if(e->filled && e->trigram == trigram){
+            e->tick = g_bloom_hash_tick++;
+            return e;
+        }
+        if(!e->filled){
+            oldest = e;
+            oldest_tick = 0;
+        } else if(e->tick < oldest_tick){
+            oldest_tick = e->tick;
+            oldest = e;
+        }
+    }
+    return oldest;
+}
+
+static BloomHashCacheEntry* bloom_hash_cache_reserve(uint32_t trigram){
+    BloomHashCacheEntry* slot = bloom_hash_cache_lookup(trigram);
+    if(slot && slot->filled && slot->trigram == trigram){
+        return slot;
+    }
+    if(!slot){
+        slot = &g_bloom_hash_cache[0];
+    }
+    slot->filled = FALSE;
+    slot->trigram = trigram;
+    slot->tick = g_bloom_hash_tick++;
+    return slot;
+}
+
+static inline uint32_t hash_trigram_scalar(uint32_t trigram, uint32_t seed){
+    uint32_t h = trigram ^ seed;
+    h *= 16777619u;
+    return h;
+}
+
+static void compute_hashes_batch(const uint32_t* tris, size_t count, uint32_t hash_count, uint32_t* out){
+    if(count == 0 || hash_count == 0) return;
+#if defined(__AVX2__)
+    size_t i = 0;
+    __m256i prime = _mm256_set1_epi32(16777619);
+    for(; i + 8 <= count; i += 8){
+        __m256i tri = _mm256_loadu_si256((const __m256i*)(tris + i));
+        for(uint32_t s=0; s<hash_count; ++s){
+            __m256i seed = _mm256_set1_epi32((int)kBloomHashSeeds[s]);
+            __m256i hashed = _mm256_mullo_epi32(_mm256_xor_si256(tri, seed), prime);
+            _mm256_storeu_si256((__m256i*)(out + s*count + i), hashed);
+        }
+    }
+    for(; i < count; ++i){
+        uint32_t t = tris[i];
+        for(uint32_t s=0; s<hash_count; ++s){
+            out[s*count + i] = hash_trigram_scalar(t, kBloomHashSeeds[s]);
+        }
+    }
+#else
+    for(size_t i=0;i<count;i++){
+        uint32_t t = tris[i];
+        for(uint32_t s=0; s<hash_count; ++s){
+            out[s*count + i] = hash_trigram_scalar(t, kBloomHashSeeds[s]);
+        }
+    }
+#endif
+}
+
+static void flush_pending_hashes(uint8_t* bloom, uint32_t actual_hashes,
+                                 uint32_t pending_count,
+                                 const uint32_t* pending_tris,
+                                 BloomHashCacheEntry** pending_entries){
+    if(pending_count == 0) return;
+    uint32_t results[4 * BLOOM_HASH_BATCH];
+    compute_hashes_batch(pending_tris, pending_count, 4, results);
+    for(uint32_t i=0;i<pending_count;i++){
+        BloomHashCacheEntry* entry = pending_entries[i];
+        if(!entry) continue;
+        entry->trigram = pending_tris[i];
+        entry->tick = g_bloom_hash_tick++;
+        entry->filled = TRUE;
+        for(uint32_t s=0;s<4;s++){
+            entry->hashes[s] = results[s * pending_count + i];
+        }
+        for(uint32_t s=0;s<actual_hashes && s<4;s++){
+            bloom_set(bloom, entry->hashes[s]);
+        }
+    }
+}
+
+static void queue_trigram_for_bloom(uint32_t trigram,
+                                    uint8_t* bloom,
+                                    uint32_t hash_count,
+                                    uint32_t* pending_tris,
+                                    BloomHashCacheEntry** pending_entries,
+                                    uint32_t* pending_n){
+    BloomHashCacheEntry* entry = bloom_hash_cache_lookup(trigram);
+    if(entry && entry->filled && entry->trigram == trigram){
+        entry->tick = g_bloom_hash_tick++;
+        for(uint32_t s=0; s<hash_count && s<4; ++s){
+            bloom_set(bloom, entry->hashes[s]);
+        }
+    } else {
+        entry = bloom_hash_cache_reserve(trigram);
+        pending_tris[*pending_n] = trigram;
+        pending_entries[*pending_n] = entry;
+        (*pending_n)++;
+        if(*pending_n == BLOOM_HASH_BATCH){
+            flush_pending_hashes(bloom, hash_count, *pending_n, pending_tris, pending_entries);
+            *pending_n = 0;
+        }
+    }
+}
+
+static size_t bloom_packbits_compress(const uint8_t* src, size_t len, uint8_t* dst, size_t dst_cap){
+    if(!src || !dst || dst_cap == 0) return 0;
+    size_t i = 0;
+    size_t o = 0;
+    while(i < len){
+        size_t run = 1;
+        while(run < 128 && i + run < len && src[i] == src[i + run]){
+            run++;
+        }
+        if(run >= 3){
+            if(o + 2 > dst_cap) return 0;
+            dst[o++] = (uint8_t)(1 - (int)run);
+            dst[o++] = src[i];
+            i += run;
+        } else {
+            size_t lit_start = i;
+            size_t lit_len = 0;
+            while(i < len){
+                run = 1;
+                while(run < 128 && i + run < len && src[i] == src[i + run]){
+                    run++;
+                }
+                if(run >= 3){
+                    break;
+                }
+                size_t copy = run;
+                if(lit_len + copy > 128){
+                    copy = 128 - lit_len;
+                }
+                i += copy;
+                lit_len += copy;
+                if(lit_len == 128){
+                    break;
+                }
+            }
+            if(lit_len == 0){
+                lit_len = run;
+                i += run;
+            }
+            if(o + 1 + lit_len > dst_cap) return 0;
+            dst[o++] = (uint8_t)(lit_len - 1);
+            memcpy(dst + o, src + lit_start, lit_len);
+            o += lit_len;
+        }
+    }
+    return o;
+}
+
+static uint32_t build_bloom_from_context(NameBloomContext* ctx, uint8_t* bloom){
+    if(!ctx || !bloom) return 0;
+    ZeroMemory(bloom, 8192);
+    ctx->hash_count = 1;
+    if(!ctx->lower || ctx->lower_len < 3 || !ctx->trigrams){
+        return 0;
+    }
+
+    size_t limit = ctx->lower_len > DB_BLOOM_MAX_BYTES ? DB_BLOOM_MAX_BYTES : ctx->lower_len;
+    size_t full = limit < DB_BLOOM_STRIDE_AFTER ? limit : DB_BLOOM_STRIDE_AFTER;
+    size_t tri_full = full >= 3 ? (full - 2) : 0;
+    size_t tri_sampled = 0;
+    if(limit > full){
+        size_t rem = limit - full;
+        if(rem > 3) tri_sampled = ((rem - 3) / DB_BLOOM_STRIDE) + 1;
+    }
+    size_t tri_est = tri_full + tri_sampled;
+    uint32_t hash_count = optimal_hash_count(tri_est ? tri_est : 1, 65536);
+    if(hash_count > 4) hash_count = 4;
+    ctx->hash_count = hash_count;
+
+    uint32_t tcount = 0;
+    uint32_t pending_tris[BLOOM_HASH_BATCH];
+    BloomHashCacheEntry* pending_entries[BLOOM_HASH_BATCH];
+    uint32_t pending_n = 0;
+
+    for(size_t i=0;i<tri_full;i++){
+        queue_trigram_for_bloom(ctx->trigrams[i], bloom, hash_count, pending_tris, pending_entries, &pending_n);
+        tcount++;
+    }
+    for(size_t i=full; i + 3 <= limit; i += DB_BLOOM_STRIDE){
+        size_t idx = i;
+        if(idx < ctx->trigram_count){
+            queue_trigram_for_bloom(ctx->trigrams[idx], bloom, hash_count, pending_tris, pending_entries, &pending_n);
+            tcount++;
+        }
+    }
+    if(pending_n){
+        flush_pending_hashes(bloom, hash_count, pending_n, pending_tris, pending_entries);
+    }
+    return tcount;
+}
+
 static inline void bloom_set(uint8_t* bloom, uint32_t h){
     uint32_t bit = h & 0xFFFFu; // 65536 bits
     bloom[bit>>3] |= (uint8_t)(1u << (bit & 7));
@@ -91,49 +440,11 @@ static void build_bloom_hashes_simd(const char* tri, uint32_t* out4){
     _mm_storeu_si128((__m128i*)out4, res);
 }
 static uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom){
-    // Bloom construction can be expensive on very large strings.  To keep the
-    // cost bounded we only process the first DB_BLOOM_MAX_BYTES bytes and, after
-    // DB_BLOOM_STRIDE_AFTER, we sample every DB_BLOOM_STRIDE-th trigram.
     if(!name_u8 || !bloom) return 0;
-    ZeroMemory(bloom, 8192);
-    uint32_t tcount = 0;
-    size_t len = strlen(name_u8);
-    if(len < 3) return 0;
-
-    size_t limit = len > DB_BLOOM_MAX_BYTES ? DB_BLOOM_MAX_BYTES : len;
-    char stack_tmp[512];
-    BOOL heap = (limit + 1 > sizeof(stack_tmp));
-    char* tmp = heap ? (char*)malloc(limit + 1) : stack_tmp;
-    if(!tmp) return 0;
-    memcpy(tmp, name_u8, limit);
-    tmp[limit] = '\0';
-    lowercase_ascii(tmp, limit);
-
-    size_t full = limit < DB_BLOOM_STRIDE_AFTER ? limit : DB_BLOOM_STRIDE_AFTER;
-
-    size_t tri_full = full >= 3 ? (full - 2) : 0;
-    size_t tri_sampled = 0;
-    if(limit > full){
-        size_t rem = limit - full;
-        if(rem > 3) tri_sampled = ((rem - 3) / DB_BLOOM_STRIDE) + 1;
-    }
-    size_t tri_est = tri_full + tri_sampled;
-    uint32_t hash_count = optimal_hash_count(tri_est ? tri_est : 1, 65536);
-    if(hash_count > 4) hash_count = 4;
-
-    for(size_t i=0; i + 3 <= full; ++i){
-        uint32_t hs[4];
-        build_bloom_hashes_simd(&tmp[i], hs);
-        for(uint32_t j=0; j<hash_count; ++j){ bloom_set(bloom, hs[j]); }
-        tcount++;
-    }
-    for(size_t i=full; i + 3 <= limit; i += DB_BLOOM_STRIDE){
-        uint32_t hs[4];
-        build_bloom_hashes_simd(&tmp[i], hs);
-        for(uint32_t j=0; j<hash_count; ++j){ bloom_set(bloom, hs[j]); }
-        tcount++;
-    }
-    if(heap) free(tmp);
+    NameBloomContext ctx;
+    if(!name_bloom_context_prepare(name_u8, &ctx)) return 0;
+    uint32_t tcount = build_bloom_from_context(&ctx, bloom);
+    name_bloom_context_release(&ctx);
     return tcount;
 }
 
@@ -561,34 +872,32 @@ static int compare_u32(const void* a, const void* b){
     return 0;
 }
 
-static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
-    size_t len = strlen(name_u8);
-    if(len < 3) return;
-    char stack_tmp[512];
-    BOOL heap = len + 1 > sizeof(stack_tmp);
-    char* tmp = heap ? (char*)malloc(len + 1) : stack_tmp;
-    if(!tmp) return;
-    memcpy(tmp, name_u8, len + 1);
-    lowercase_ascii(tmp, len);
-
-    uint32_t* tris; size_t tri_n;
-    extract_trigrams(tmp, &tris, &tri_n);
-    if(!tris || tri_n == 0){
-        if(heap) free(tmp);
+static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id, NameBloomContext* prepared){
+    if(!d || !name_u8) return;
+    NameBloomContext local;
+    NameBloomContext* ctx = prepared;
+    BOOL need_release = FALSE;
+    if(!ctx){
+        if(!name_bloom_context_prepare(name_u8, &local)) return;
+        ctx = &local;
+        need_release = TRUE;
+    }
+    if(ctx->trigram_count == 0){
+        if(need_release) name_bloom_context_release(ctx);
         return;
     }
 
-    qsort(tris, tri_n, sizeof(uint32_t), compare_u32);
+    qsort(ctx->trigrams, ctx->trigram_count, sizeof(uint32_t), compare_u32);
 
-    for(size_t i=0;i<tri_n;i++){
-        uint32_t key = tris[i];
-        if(i > 0 && key == tris[i-1]) continue;
+    for(size_t i=0;i<ctx->trigram_count;i++){
+        uint32_t key = ctx->trigrams[i];
+        if(i > 0 && key == ctx->trigrams[i-1]) continue;
 
         MDB_val k={.mv_data=&key,.mv_size=3}, v={.mv_data=&name_id,.mv_size=sizeof(name_id)};
         int rc = mdb_put(d->wtxn, d->dbi_trigram_index, &k, &v, MDB_NODUPDATA);
         if(rc && rc!=MDB_KEYEXIST){ set_mdb_error(d, rc); }
     }
-    if(heap) free(tmp);
+    if(need_release) name_bloom_context_release(ctx);
 }
 
 static void remove_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
@@ -762,17 +1071,33 @@ retry_batch:
         // Fetch UTF-8 name by id
         MDB_val namev;
         if(success && str_by_id_with_retry(d, r->name_str_id, &namev, 5)){
+            NameBloomContext name_ctx;
+            if(!name_bloom_context_prepare((const char*)namev.mv_data, &name_ctx)){
+                success = FALSE;
+                set_error(d, DB_ERROR_OS, 0, "failed to prepare bloom context");
+                break;
+            }
             // ensure bloom meta exists
             MDB_val mk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, mv;
             if(mdb_get(d->wtxn, d->dbi_string_meta, &mk, &mv)!=0){
                 uint8_t bloom[8192];
-                uint32_t tc = build_bloom_for_name((const char*)namev.mv_data, bloom);
+                uint32_t tc = build_bloom_from_context(&name_ctx, bloom);
+                uint8_t encoded[8192 + 1024];
+                size_t enc_len = bloom_packbits_compress(bloom, sizeof(bloom), encoded, sizeof(encoded));
+                const uint8_t* out_data = bloom;
+                DWORD out_bytes = (DWORD)sizeof(bloom);
+                uint32_t stored_len = (uint32_t)sizeof(bloom);
+                if(enc_len > 0 && enc_len < sizeof(bloom)){
+                    out_data = encoded;
+                    out_bytes = (DWORD)enc_len;
+                    stored_len = (uint32_t)enc_len;
+                }
                 uint64_t off = bloom_offset_tmp;
-                if(off > UINT64_MAX - 8192){ set_error(d, DB_ERROR_OS, 0, "bloom file too large"); success = FALSE; break; }
+                if(off > UINT64_MAX - stored_len){ set_error(d, DB_ERROR_OS, 0, "bloom file too large"); success = FALSE; name_bloom_context_release(&name_ctx); break; }
                 DWORD wr=0;
-                if(!WriteFile(d->bloom_file, bloom, 8192, &wr, NULL) || wr != 8192){ set_sys_error(d, GetLastError()); success = FALSE; break; }
+                if(!WriteFile(d->bloom_file, out_data, out_bytes, &wr, NULL) || wr != out_bytes){ set_sys_error(d, GetLastError()); success = FALSE; name_bloom_context_release(&name_ctx); break; }
                 bloom_offset_tmp += wr;
-                StringMeta sm={.trigram_count=tc,.bloom_offset=off};
+                StringMeta sm={.trigram_count=tc,.hash_count=name_ctx.hash_count,.bloom_offset=off,.bloom_length=stored_len};
                 MDB_val smv={.mv_data=&sm,.mv_size=sizeof(sm)};
                 mdb_put(d->wtxn, d->dbi_string_meta, &mk, &smv, 0);
             }
@@ -782,7 +1107,8 @@ retry_batch:
                 rc = mdb_put(d->wtxn, d->dbi_extension_index, &ek, &ev, MDB_NODUPDATA);
                 if(rc && rc!=MDB_KEYEXIST){ success = FALSE; set_mdb_error(d,rc); break; }
             }
-            emit_trigrams(d, (const char*)namev.mv_data, r->name_str_id);
+            emit_trigrams(d, (const char*)namev.mv_data, r->name_str_id, &name_ctx);
+            name_bloom_context_release(&name_ctx);
         }
         if(r->content_str_id){
             MDB_val ck, cv; to_mdb_val(&r->content_str_id, sizeof(r->content_str_id), &ck); to_mdb_val(&id, sizeof(id), &cv);
@@ -790,20 +1116,37 @@ retry_batch:
             if(rc && rc!=MDB_KEYEXIST){ success = FALSE; set_mdb_error(d,rc); break; }
             MDB_val cvstr;
             if(success && str_by_id_with_retry(d, r->content_str_id, &cvstr, 5)){
+                NameBloomContext content_ctx;
+                if(!name_bloom_context_prepare((const char*)cvstr.mv_data, &content_ctx)){
+                    success = FALSE;
+                    set_error(d, DB_ERROR_OS, 0, "failed to prepare bloom context");
+                    break;
+                }
                 MDB_val mk={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, mv;
                 if(mdb_get(d->wtxn, d->dbi_string_meta, &mk, &mv)!=0){
                     uint8_t bloom[8192];
-                    uint32_t tc = build_bloom_for_name((const char*)cvstr.mv_data, bloom);
+                    uint32_t tc = build_bloom_from_context(&content_ctx, bloom);
+                    uint8_t encoded[8192 + 1024];
+                    size_t enc_len = bloom_packbits_compress(bloom, sizeof(bloom), encoded, sizeof(encoded));
+                    const uint8_t* out_data = bloom;
+                    DWORD out_bytes = (DWORD)sizeof(bloom);
+                    uint32_t stored_len = (uint32_t)sizeof(bloom);
+                    if(enc_len > 0 && enc_len < sizeof(bloom)){
+                        out_data = encoded;
+                        out_bytes = (DWORD)enc_len;
+                        stored_len = (uint32_t)enc_len;
+                    }
                     uint64_t off = bloom_offset_tmp;
-                    if(off > UINT64_MAX - 8192){ set_error(d, DB_ERROR_OS, 0, "bloom file too large"); success = FALSE; break; }
+                    if(off > UINT64_MAX - stored_len){ set_error(d, DB_ERROR_OS, 0, "bloom file too large"); success = FALSE; name_bloom_context_release(&content_ctx); break; }
                     DWORD wr=0;
-                    if(!WriteFile(d->bloom_file, bloom, 8192, &wr, NULL) || wr != 8192){ set_sys_error(d, GetLastError()); success = FALSE; break; }
+                    if(!WriteFile(d->bloom_file, out_data, out_bytes, &wr, NULL) || wr != out_bytes){ set_sys_error(d, GetLastError()); success = FALSE; name_bloom_context_release(&content_ctx); break; }
                     bloom_offset_tmp += wr;
-                    StringMeta sm={.trigram_count=tc,.bloom_offset=off};
+                    StringMeta sm={.trigram_count=tc,.hash_count=content_ctx.hash_count,.bloom_offset=off,.bloom_length=stored_len};
                     MDB_val smv={.mv_data=&sm,.mv_size=sizeof(sm)};
                     mdb_put(d->wtxn, d->dbi_string_meta, &mk, &smv, 0);
                 }
-                emit_trigrams(d, (const char*)cvstr.mv_data, r->content_str_id);
+                emit_trigrams(d, (const char*)cvstr.mv_data, r->content_str_id, &content_ctx);
+                name_bloom_context_release(&content_ctx);
             }
         }
         if(r->author_str_id){

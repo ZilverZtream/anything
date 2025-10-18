@@ -168,7 +168,21 @@ void prog_mark_done(ProgState* ps, uint8_t stage){
     }
 }
 
-typedef struct { uint32_t trigram_count; uint64_t bloom_offset; } StringMeta;
+#ifndef THREAD_LOCAL
+#if defined(_MSC_VER)
+#define THREAD_LOCAL __declspec(thread)
+#else
+#define THREAD_LOCAL __thread
+#endif
+#endif
+
+typedef struct {
+    uint32_t trigram_count;
+    uint8_t  hash_count;
+    uint8_t  reserved[3];
+    uint64_t bloom_offset;
+    uint32_t bloom_length;
+} StringMeta;
 #ifdef _WIN32
 static HANDLE bloom_mapping = NULL;
 #else
@@ -176,6 +190,7 @@ static int bloom_fd = -1;
 #endif
 static const uint8_t* bloom_readonly_base = NULL;
 static size_t g_bloom_size = 0;
+static THREAD_LOCAL uint8_t g_bloom_decode_buf[8192];
 // Global database path for caching term results
 static wchar_t g_db_path[MAX_LONG_PATH]={0};
 static uint64_t g_db_generation = 0;
@@ -203,6 +218,28 @@ static void close_bloom(void){
     bloom_readonly_base=NULL;
     if(bloom_mapping) CloseHandle(bloom_mapping);
     bloom_mapping=NULL;
+}
+
+static BOOL bloom_packbits_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_len){
+    if(!src || !dst) return FALSE;
+    size_t i=0, o=0;
+    while(i < src_len && o < dst_len){
+        int8_t header = (int8_t)src[i++];
+        if(header >= 0){
+            size_t count = (size_t)header + 1;
+            if(i + count > src_len || o + count > dst_len) return FALSE;
+            memcpy(dst + o, src + i, count);
+            i += count;
+            o += count;
+        } else if(header != -128){
+            size_t count = (size_t)(1 - header);
+            if(i >= src_len || o + count > dst_len) return FALSE;
+            uint8_t value = src[i++];
+            memset(dst + o, value, count);
+            o += count;
+        }
+    }
+    return o == dst_len;
 }
 #else
 static BOOL open_bloom(const wchar_t* dbPath){
@@ -1890,12 +1927,25 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
             MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
             if(mdb_get(txn, dbi_smeta,&k,&v)!=0 || v.mv_size<sizeof(StringMeta)) continue;
             const StringMeta* sm = (const StringMeta*)v.mv_data;
-            if(sm->bloom_offset >= g_bloom_size || g_bloom_size - sm->bloom_offset < 8192) continue;
-            const uint8_t* bloom = bloom_readonly_base + sm->bloom_offset;
+            if(sm->bloom_offset >= g_bloom_size || g_bloom_size - sm->bloom_offset < sm->bloom_length) continue;
+            const uint8_t* encoded = bloom_readonly_base + sm->bloom_offset;
+            uint8_t* bloom_buf = g_bloom_decode_buf;
+            if(sm->bloom_length == 8192){
+                memcpy(bloom_buf, encoded, 8192);
+            } else if(!bloom_packbits_decompress(encoded, sm->bloom_length, bloom_buf, 8192)){
+                continue;
+            }
+            const uint8_t* bloom = bloom_buf;
+            uint32_t hash_to_check = sm->hash_count;
+            if(hash_to_check == 0 || hash_to_check > 4) hash_to_check = 4;
             BOOL ok=TRUE;
-            for(size_t j=0;j<hn;j++){
-                uint32_t bit=hbuf[j];
-                if((bloom[bit>>3] & (1u<<(bit&7)))==0){ ok=FALSE; break; }
+            size_t idx=0;
+            while(idx < hn && ok){
+                for(uint32_t h=0; h<hash_to_check && idx + h < hn; ++h){
+                    uint32_t bit = hbuf[idx + h];
+                    if((bloom[bit>>3] & (1u<<(bit&7)))==0){ ok=FALSE; break; }
+                }
+                idx += 4;
             }
             if(ok){ name_ids.ids[keep++]=name_ids.ids[i]; }
         }
