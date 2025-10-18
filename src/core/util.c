@@ -440,12 +440,20 @@ cleanup:
 
 // Runtime AVX2 check via CPUID
 BOOL is_avx2_supported(void){
-    int info[4]={0};
+    int info[4] = {0};
     __cpuid(info, 0);
-    int max_id = info[0];
-    if(max_id < 7) return FALSE;
-    int info7[4]; __cpuidex(info7, 7, 0);
-    return (info7[1] & (1<<5)) != 0; // AVX2 bit
+    if(info[0] < 7) return FALSE;
+
+    __cpuid(info, 1);
+    if(!(info[2] & (1 << 27))) return FALSE; // OSXSAVE not enabled
+    if(!(info[2] & (1 << 28))) return FALSE; // AVX not present
+
+    unsigned long long xcr0 = _xgetbv(0);
+    if((xcr0 & 0x6) != 0x6) return FALSE; // XMM and YMM state must be enabled
+
+    int info7[4];
+    __cpuidex(info7, 7, 0);
+    return (info7[1] & (1 << 5)) != 0; // AVX2 bit
 }
 
 // AVX2-accelerated substring search (ASCII, case-insensitive if caller lowercases both)
