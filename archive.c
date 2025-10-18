@@ -12,7 +12,36 @@
 // absolute paths. On success, the canonical relative path is written to out.
 static BOOL normalize_archive_path(const char* name, char* out, size_t outcch){
     if(!name || !out || outcch==0) return FALSE;
-    if(name[0]=='/' || strchr(name,'\\') || strchr(name,':')) return FALSE;
+
+    // Reject obvious absolute paths before we touch the data.
+    if(name[0]=='/' || name[0]=='\\') return FALSE;
+    if(isalpha((unsigned char)name[0]) && name[1]==':') return FALSE;
+
+    // Reject raw backslashes or drive specifiers anywhere in the name since
+    // the archive should use POSIX style separators.
+    if(strchr(name,'\\') || strchr(name,':')) return FALSE;
+
+    // Validate the raw name one component at a time so archives with literal
+    // ".." segments are rejected even before decoding.
+    size_t depth = 0;
+    const char* raw = name;
+    while(*raw){
+        while(*raw=='/') raw++;
+        const char* seg_start = raw;
+        while(*raw && *raw!='/') raw++;
+        size_t seg_len = (size_t)(raw - seg_start);
+        if(seg_len==0) break;
+        if(seg_len==1 && seg_start[0]=='.'){
+            // stay at same depth
+        }else if(seg_len==2 && seg_start[0]=='.' && seg_start[1]=='.'){
+            if(depth==0) return FALSE;
+            depth--;
+        }else{
+            depth++;
+        }
+        if(*raw=='/') raw++;
+    }
+
     char decoded[MAX_LONG_PATH*3];
     size_t di=0;
     for(size_t i=0; name[i] && di<sizeof(decoded)-1; ++i){
@@ -27,7 +56,12 @@ static BOOL normalize_archive_path(const char* name, char* out, size_t outcch){
         }
     }
     decoded[di]=0;
-    // Split into components and resolve '.' and '..'
+
+    if(decoded[0]=='/' || decoded[0]=='\\') return FALSE;
+    if(isalpha((unsigned char)decoded[0]) && decoded[1]==':') return FALSE;
+    if(strchr(decoded,'\\') || strchr(decoded,':')) return FALSE;
+
+    // Split into components and resolve '.' and '..' on the decoded form.
     char* segs[MAX_LONG_PATH];
     size_t seg_count=0;
     char* p = decoded;
@@ -44,6 +78,7 @@ static BOOL normalize_archive_path(const char* name, char* out, size_t outcch){
         if(!next) break;
         p = next+1;
     }
+
     size_t pos=0;
     for(size_t i=0; i<seg_count; ++i){
         size_t len = strlen(segs[i]);
@@ -53,6 +88,9 @@ static BOOL normalize_archive_path(const char* name, char* out, size_t outcch){
         pos += len;
     }
     out[pos] = 0;
+
+    // Empty paths or ones that resolve outside the root are rejected.
+    if(seg_count==0) return FALSE;
     return TRUE;
 }
 
