@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <alloca.h>
 #include <string.h>
+#include <time.h>
 
 typedef int BOOL;
 typedef unsigned char BYTE;
@@ -132,6 +133,16 @@ static inline void __cpuid(int info[4], int infoType){
 }
 static inline void __cpuidex(int info[4], int infoType, int ecx){
     info[0]=info[1]=info[2]=info[3]=0;
+}
+
+static inline ULONGLONG GetTickCount64(void){
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+    return (ULONGLONG)ts.tv_sec * 1000ull + (ULONGLONG)(ts.tv_nsec / 1000000ull);
 }
 
 #endif
