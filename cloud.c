@@ -9,11 +9,14 @@
 #include "cJSON.h"
 #ifdef _WIN32
 #include <windows.h>
+#include <wincrypt.h>
 #include <malloc.h>
 #else
 #include <wchar.h>
 #include <sched.h>
 #include <malloc.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 #ifndef FILE_ATTRIBUTE_DIRECTORY
@@ -28,6 +31,136 @@ static void wcscpy_s(wchar_t* dst, size_t dstsz, const wchar_t* src){
     if(dstsz==0) return; wcsncpy(dst, src, dstsz); dst[dstsz-1]=0; }
 static void strcpy_s(char* dst, size_t dstsz, const char* src){
     if(dstsz==0) return; strncpy(dst, src, dstsz); dst[dstsz-1]=0; }
+#endif
+
+static void secure_memzero(void* ptr, size_t len){
+    if(!ptr || len==0) return;
+#ifdef _WIN32
+    SecureZeroMemory(ptr, len);
+#else
+    volatile unsigned char* p = (volatile unsigned char*)ptr;
+    while(len--) *p++ = 0;
+#endif
+}
+
+typedef struct SensitiveBuffer {
+    void* data;
+    size_t size;
+    size_t alloc_size;
+} SensitiveBuffer;
+
+static BOOL sensitive_alloc(SensitiveBuffer* buf, size_t size){
+    if(!buf || size==0) return FALSE;
+    buf->data = NULL;
+    buf->size = size;
+    buf->alloc_size = 0;
+#ifdef _WIN32
+    SYSTEM_INFO sys_info;
+    GetSystemInfo(&sys_info);
+    size_t page = sys_info.dwPageSize ? (size_t)sys_info.dwPageSize : 4096;
+    size_t alloc_size = ((size + page - 1) / page) * page;
+    void* mem = VirtualAlloc(NULL, alloc_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if(!mem) return FALSE;
+    if(!VirtualLock(mem, alloc_size)){
+        VirtualFree(mem, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    buf->data = mem;
+    buf->alloc_size = alloc_size;
+    return TRUE;
+#else
+    long page = sysconf(_SC_PAGESIZE);
+    if(page <= 0) page = 4096;
+    size_t pg = (size_t)page;
+    size_t alloc_size = ((size + pg - 1) / pg) * pg;
+    void* mem = NULL;
+    if(posix_memalign(&mem, pg, alloc_size)!=0) return FALSE;
+    if(mlock(mem, alloc_size)!=0){
+        free(mem);
+        return FALSE;
+    }
+    buf->data = mem;
+    buf->alloc_size = alloc_size;
+    return TRUE;
+#endif
+}
+
+static void sensitive_free(SensitiveBuffer* buf){
+    if(!buf || !buf->data) return;
+    secure_memzero(buf->data, buf->alloc_size);
+#ifdef _WIN32
+    VirtualUnlock(buf->data, buf->alloc_size);
+    VirtualFree(buf->data, 0, MEM_RELEASE);
+#else
+    munlock(buf->data, buf->alloc_size);
+    free(buf->data);
+#endif
+    buf->data = NULL;
+    buf->size = 0;
+    buf->alloc_size = 0;
+}
+
+#ifdef _WIN32
+typedef struct CloudToken {
+    DATA_BLOB encrypted;
+} CloudToken;
+#else
+typedef struct CloudToken {
+    SensitiveBuffer buffer;
+} CloudToken;
+#endif
+
+static void cloud_token_init(CloudToken* token){
+    if(!token) return;
+#ifdef _WIN32
+    token->encrypted.cbData = 0;
+    token->encrypted.pbData = NULL;
+#else
+    token->buffer.data = NULL;
+    token->buffer.size = 0;
+    token->buffer.alloc_size = 0;
+#endif
+}
+
+static void cloud_token_clear(CloudToken* token){
+    if(!token) return;
+#ifdef _WIN32
+    if(token->encrypted.pbData){
+        secure_memzero(token->encrypted.pbData, token->encrypted.cbData);
+        LocalFree(token->encrypted.pbData);
+        token->encrypted.pbData = NULL;
+        token->encrypted.cbData = 0;
+    }
+#else
+    sensitive_free(&token->buffer);
+#endif
+}
+
+#ifdef _WIN32
+static BOOL cloud_token_decrypt(const CloudToken* token, SensitiveBuffer* out_plain){
+    if(!token || !out_plain || !token->encrypted.pbData || token->encrypted.cbData==0) return FALSE;
+    DATA_BLOB plain = {0};
+    if(!CryptUnprotectData((DATA_BLOB*)&token->encrypted, NULL, NULL, NULL, NULL, 0, &plain))
+        return FALSE;
+    BOOL ok = FALSE;
+    if(sensitive_alloc(out_plain, plain.cbData)){
+        memcpy(out_plain->data, plain.pbData, plain.cbData);
+        ok = TRUE;
+    }
+    if(plain.pbData){
+        secure_memzero(plain.pbData, plain.cbData);
+        LocalFree(plain.pbData);
+    }
+    if(!ok) sensitive_free(out_plain);
+    return ok;
+}
+#else
+static BOOL cloud_token_decrypt(const CloudToken* token, SensitiveBuffer* out_plain){
+    if(!token || !out_plain || !token->buffer.data) return FALSE;
+    if(!sensitive_alloc(out_plain, token->buffer.size)) return FALSE;
+    memcpy(out_plain->data, token->buffer.data, token->buffer.size);
+    return TRUE;
+}
 #endif
 
 static BOOL path_join(wchar_t* dst, size_t dstcch, const wchar_t* a, const wchar_t* b){
@@ -158,8 +291,9 @@ static void enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_u
 }
 
 // Obtain OAuth2 token using refresh_token flow. Credentials are taken from environment variables.
-static BOOL obtain_token(CloudProvider p, char** out_token){
-    if(out_token) *out_token=NULL;
+static BOOL obtain_token(CloudProvider p, CloudToken* out_token){
+    if(!out_token) return FALSE;
+    cloud_token_init(out_token);
     const char *env_client=NULL, *env_secret=NULL, *env_refresh=NULL;
     const char *host=NULL, *path=NULL;
     switch(p){
@@ -193,15 +327,37 @@ static BOOL obtain_token(CloudProvider p, char** out_token){
     cJSON* tok = cJSON_GetObjectItemCaseSensitive(root, "access_token");
     if(!cJSON_IsString(tok) || !tok->valuestring) goto cleanup;
 #ifdef _WIN32
-    *out_token = _strdup(tok->valuestring);
+    size_t token_len = strlen(tok->valuestring) + 1;
+    SensitiveBuffer plain = {0};
+    if(!sensitive_alloc(&plain, token_len)) goto cleanup;
+    memcpy(plain.data, tok->valuestring, token_len);
+    DATA_BLOB in = {0};
+    in.cbData = (DWORD)token_len;
+    in.pbData = (BYTE*)plain.data;
+    DATA_BLOB out = {0};
+    if(!CryptProtectData(&in, L"CloudAccessToken", NULL, NULL, NULL, 0, &out)){
+        sensitive_free(&plain);
+        goto cleanup;
+    }
+    secure_memzero(plain.data, plain.alloc_size);
+    sensitive_free(&plain);
+    out_token->encrypted = out;
+    ok = TRUE;
 #else
-    *out_token = strdup(tok->valuestring);
+    size_t token_len = strlen(tok->valuestring) + 1;
+    if(!sensitive_alloc(&out_token->buffer, token_len)) goto cleanup;
+    memcpy(out_token->buffer.data, tok->valuestring, token_len);
+    ok = TRUE;
 #endif
-    ok = (*out_token!=NULL);
 
 cleanup:
     if(root) cJSON_Delete(root);
-    if(resp) free(resp);
+    if(resp){
+        secure_memzero(resp, strlen(resp));
+        free(resp);
+    }
+    secure_memzero(body, sizeof(body));
+    secure_memzero(headers, sizeof(headers));
     return ok;
 }
 
@@ -455,7 +611,23 @@ static void dropbox_walk(const char* token, const wchar_t* parent, MPMCQueue* q)
 
 BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
     if(!db || !out_queue) return FALSE;
-    char* token=NULL; if(!obtain_token(provider,&token)) return FALSE;
+    CloudToken token_store; cloud_token_init(&token_store);
+    if(!obtain_token(provider,&token_store)){
+        cloud_token_clear(&token_store);
+        return FALSE;
+    }
+    SensitiveBuffer plain_token={0};
+    if(!cloud_token_decrypt(&token_store,&plain_token)){
+        cloud_token_clear(&token_store);
+        return FALSE;
+    }
+    if(plain_token.size == 0 || !plain_token.data){
+        sensitive_free(&plain_token);
+        cloud_token_clear(&token_store);
+        return FALSE;
+    }
+    ((char*)plain_token.data)[plain_token.size-1] = '\0';
+    char* token = (char*)plain_token.data;
     wchar_t root[MAX_LONG_PATH]; root[0]=0;
     switch(provider){
     case CLOUD_ONEDRIVE:
@@ -471,9 +643,12 @@ BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
         wcscpy_s(root,MAX_LONG_PATH,L"Dropbox:");
         dropbox_walk(token,root,out_queue); break;
     default:
-        free(token); return FALSE;
+        sensitive_free(&plain_token);
+        cloud_token_clear(&token_store);
+        return FALSE;
     }
-    free(token);
+    sensitive_free(&plain_token);
+    cloud_token_clear(&token_store);
 
     IndexState st={0};
     db_get_index_state(db, &st);
