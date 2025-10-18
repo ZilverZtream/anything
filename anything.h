@@ -118,10 +118,14 @@ typedef struct LiveUpdate {
     wchar_t  name[MAX_PATH];
     uint8_t  op;
     volatile LONG refcount;
+    BOOL     is_progress;
+    BOOL     progress_done;
+    uint64_t progress_count;
 } LiveUpdate;
 
 void live_updates_init(void);
 BOOL live_updates_poll(LiveUpdate* out);
+void live_updates_push_progress(uint64_t processed_count, BOOL done);
 
 // ---- MPMC lock-free queue (Vyukov) ----
 typedef struct MPMCCell {

@@ -988,6 +988,8 @@ int run_ui(void){
     int theme_idx = 0; // 0 = Dark, 1 = Light
     bool need_update = true;
     bool need_sort = true;
+    bool indexing_active = false;
+    uint64_t indexing_progress = 0;
     Db* db = nullptr;
     const DbHeader* header;
 #ifdef _WIN32
@@ -1038,7 +1040,13 @@ int run_ui(void){
 
     while(!glfwWindowShouldClose(window)){
         LiveUpdate lu;
-        while(live_updates_poll(&lu)) { need_update = true; }
+        while(live_updates_poll(&lu)) {
+            if(lu.is_progress){
+                indexing_progress = lu.progress_count;
+                indexing_active = !lu.progress_done;
+            }
+            need_update = true;
+        }
         glfwPollEvents();
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -1052,6 +1060,10 @@ int run_ui(void){
                 ImGui::SameLine();
                 if (ImGui::Button("Advanced")) show_advanced = !show_advanced;
                 if (query_edited) need_update = true;
+
+                if(indexing_active){
+                    ImGui::Text("Indexing %llu files...", static_cast<unsigned long long>(indexing_progress));
+                }
 
                 ImGui::BeginChild("ResultsAndPreview", ImVec2(0, 0), false);
                 if (ImGui::BeginTable("split", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_NoSavedSettings)) {
