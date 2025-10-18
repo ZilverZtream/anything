@@ -27,6 +27,172 @@
 #include <limits.h>
 #endif
 
+#ifndef MDB_DBI_INVALID
+#define MDB_DBI_INVALID ((MDB_dbi)~(unsigned)0)
+#endif
+
+static inline size_t bloom_log2_to_bytes(uint8_t log2){
+    if(log2 >= 8 && log2 <= 20){
+        return (size_t)1u << log2;
+    }
+    return 0;
+}
+
+static BOOL string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta_out){
+    if(!value) return FALSE;
+    BOOL present = FALSE;
+    size_t total = value->mv_size;
+    if(total >= sizeof(StringMeta)){
+        const uint8_t* base = (const uint8_t*)value->mv_data;
+        const StringMeta* tail = (const StringMeta*)(base + total - sizeof(StringMeta));
+        if(tail->magic0 == STRING_META_MAGIC0 && tail->magic1 == STRING_META_MAGIC1){
+            present = TRUE;
+            if(meta_out) *meta_out = *tail;
+            total -= sizeof(StringMeta);
+        }
+    }
+    if(meta_out && !present){
+        memset(meta_out, 0, sizeof(*meta_out));
+    }
+    if(text){
+        text->mv_data = value->mv_data;
+        text->mv_size = total;
+    }
+    return present;
+}
+
+static size_t string_meta_bloom_bytes(const StringMeta* sm){
+    if(!sm) return 0;
+    if(sm->magic0 == STRING_META_MAGIC0 && sm->magic1 == STRING_META_MAGIC1){
+        if(sm->bloom_log2){
+            size_t bytes = bloom_log2_to_bytes(sm->bloom_log2);
+            if(bytes) return bytes;
+        }
+    }
+    if(sm->bloom_length == 0) return 0;
+    if(sm->bloom_length == 2048 || sm->bloom_length == 4096 || sm->bloom_length == 8192){
+        return sm->bloom_length;
+    }
+    return 8192;
+}
+
+static uint32_t string_meta_bloom_mask(const StringMeta* sm){
+    size_t bytes = string_meta_bloom_bytes(sm);
+    if(bytes == 0) return 0;
+    size_t bits = bytes * 8;
+    if(bits > UINT32_MAX) bits = UINT32_MAX;
+    return (uint32_t)(bits - 1);
+}
+
+static void bloom_cache_init(void){
+    if(!g_bloom_cache_initialized){
+        InitializeCriticalSection(&g_bloom_cache_mu);
+        g_bloom_cache_initialized = TRUE;
+    }
+}
+
+static void bloom_cache_reset(void){
+    if(!g_bloom_cache_initialized) return;
+    EnterCriticalSection(&g_bloom_cache_mu);
+    for(size_t i=0;i<BLOOM_CACHE_CAP;i++){
+        if(g_bloom_cache[i].data){
+            free(g_bloom_cache[i].data);
+            g_bloom_cache[i].data = NULL;
+        }
+        g_bloom_cache[i].in_use = FALSE;
+        g_bloom_cache[i].stamp = 0;
+        g_bloom_cache[i].bloom_bytes = 0;
+    }
+    g_bloom_cache_count = 0;
+    g_bloom_cache_clock = 0;
+    LeaveCriticalSection(&g_bloom_cache_mu);
+}
+
+static void bloom_cache_shutdown(void){
+    if(!g_bloom_cache_initialized) return;
+    bloom_cache_reset();
+    DeleteCriticalSection(&g_bloom_cache_mu);
+    g_bloom_cache_initialized = FALSE;
+}
+
+static uint8_t* bloom_cache_get(uint64_t string_id, const StringMeta* meta, size_t* out_len){
+    if(!meta || meta->hash_count == 0 || meta->bloom_length == 0) return NULL;
+    size_t bloom_bytes = string_meta_bloom_bytes(meta);
+    if(bloom_bytes == 0) return NULL;
+    bloom_cache_init();
+    EnterCriticalSection(&g_bloom_cache_mu);
+    BloomCacheEntry* slot = NULL;
+    for(size_t i=0;i<g_bloom_cache_count;i++){
+        BloomCacheEntry* e = &g_bloom_cache[i];
+        if(e->in_use && e->string_id == string_id){
+            if(e->bloom_offset == meta->bloom_offset && e->bloom_length == meta->bloom_length && e->bloom_log2 == meta->bloom_log2){
+                e->stamp = ++g_bloom_cache_clock;
+                if(out_len) *out_len = e->bloom_bytes;
+                uint8_t* data = e->data;
+                LeaveCriticalSection(&g_bloom_cache_mu);
+                return data;
+            }
+            slot = e;
+            break;
+        }
+        if(!e->in_use && !slot){
+            slot = e;
+        }
+    }
+    if(!slot){
+        if(g_bloom_cache_count < BLOOM_CACHE_CAP){
+            slot = &g_bloom_cache[g_bloom_cache_count++];
+        } else {
+            size_t victim = 0;
+            uint64_t best_stamp = UINT64_MAX;
+            for(size_t i=0;i<BLOOM_CACHE_CAP;i++){
+                if(!g_bloom_cache[i].in_use){
+                    victim = i;
+                    break;
+                }
+                if(g_bloom_cache[i].stamp < best_stamp){
+                    best_stamp = g_bloom_cache[i].stamp;
+                    victim = i;
+                }
+            }
+            slot = &g_bloom_cache[victim];
+        }
+    }
+    if(slot->data && slot->bloom_bytes != bloom_bytes){
+        uint8_t* resized = (uint8_t*)realloc(slot->data, bloom_bytes);
+        if(!resized){
+            LeaveCriticalSection(&g_bloom_cache_mu);
+            return NULL;
+        }
+        slot->data = resized;
+    } else if(!slot->data){
+        slot->data = (uint8_t*)malloc(bloom_bytes);
+        if(!slot->data){
+            LeaveCriticalSection(&g_bloom_cache_mu);
+            return NULL;
+        }
+    }
+    const uint8_t* encoded = bloom_readonly_base + meta->bloom_offset;
+    if(meta->bloom_length == bloom_bytes){
+        memcpy(slot->data, encoded, bloom_bytes);
+    } else if(!bloom_packbits_decompress(encoded, meta->bloom_length, slot->data, bloom_bytes)){
+        LeaveCriticalSection(&g_bloom_cache_mu);
+        return NULL;
+    }
+    slot->string_id = string_id;
+    slot->bloom_offset = meta->bloom_offset;
+    slot->bloom_length = meta->bloom_length;
+    slot->bloom_log2 = meta->bloom_log2;
+    slot->hash_count = meta->hash_count;
+    slot->bloom_bytes = bloom_bytes;
+    slot->stamp = ++g_bloom_cache_clock;
+    slot->in_use = TRUE;
+    if(out_len) *out_len = bloom_bytes;
+    uint8_t* result = slot->data;
+    LeaveCriticalSection(&g_bloom_cache_mu);
+    return result;
+}
+
 #include "database.h"
 #include "anything.h"
 #include "util.h"
@@ -180,10 +346,15 @@ void prog_mark_done(ProgState* ps, uint8_t stage){
 typedef struct {
     uint32_t trigram_count;
     uint8_t  hash_count;
-    uint8_t  reserved[3];
+    uint8_t  bloom_log2;
+    uint8_t  magic0;
+    uint8_t  magic1;
     uint64_t bloom_offset;
     uint32_t bloom_length;
 } StringMeta;
+
+#define STRING_META_MAGIC0 'B'
+#define STRING_META_MAGIC1 'F'
 #ifdef _WIN32
 static HANDLE bloom_mapping = NULL;
 #else
@@ -191,7 +362,25 @@ static int bloom_fd = -1;
 #endif
 static const uint8_t* bloom_readonly_base = NULL;
 static size_t g_bloom_size = 0;
-static THREAD_LOCAL uint8_t g_bloom_decode_buf[8192];
+#define BLOOM_CACHE_CAP 1000
+
+typedef struct {
+    uint64_t string_id;
+    uint64_t bloom_offset;
+    uint32_t bloom_length;
+    uint8_t  bloom_log2;
+    uint8_t  hash_count;
+    size_t   bloom_bytes;
+    uint8_t* data;
+    uint64_t stamp;
+    BOOL     in_use;
+} BloomCacheEntry;
+
+static BloomCacheEntry g_bloom_cache[BLOOM_CACHE_CAP];
+static size_t g_bloom_cache_count = 0;
+static uint64_t g_bloom_cache_clock = 0;
+static BOOL g_bloom_cache_initialized = FALSE;
+static CRITICAL_SECTION g_bloom_cache_mu;
 // Global database path for caching term results
 static wchar_t g_db_path[MAX_LONG_PATH]={0};
 static uint64_t g_db_generation = 0;
@@ -211,6 +400,7 @@ static BOOL open_bloom(const wchar_t* dbPath){
     if(!bloom_mapping) return FALSE;
     bloom_readonly_base = (const uint8_t*)MapViewOfFile(bloom_mapping, FILE_MAP_READ, 0,0,0);
     if(!bloom_readonly_base){ CloseHandle(bloom_mapping); bloom_mapping=NULL; return FALSE; }
+    bloom_cache_reset();
     return TRUE;
 }
 static void close_bloom(void){
@@ -218,6 +408,7 @@ static void close_bloom(void){
     bloom_readonly_base=NULL;
     if(bloom_mapping) CloseHandle(bloom_mapping);
     bloom_mapping=NULL;
+    bloom_cache_shutdown();
 }
 
 static BOOL bloom_packbits_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_len){
@@ -241,6 +432,7 @@ static BOOL bloom_packbits_decompress(const uint8_t* src, size_t src_len, uint8_
     }
     return o == dst_len;
 }
+
 #else
 static BOOL open_bloom(const wchar_t* dbPath){
     char bp[MAX_PATH];
@@ -254,6 +446,7 @@ static BOOL open_bloom(const wchar_t* dbPath){
     g_bloom_size = (size_t)st.st_size;
     bloom_readonly_base = (const uint8_t*)mmap(NULL, g_bloom_size, PROT_READ, MAP_SHARED, bloom_fd, 0);
     if(bloom_readonly_base == MAP_FAILED){ close(bloom_fd); bloom_fd = -1; bloom_readonly_base = NULL; return FALSE; }
+    bloom_cache_reset();
     return TRUE;
 }
 static void close_bloom(void){
@@ -261,8 +454,25 @@ static void close_bloom(void){
     bloom_readonly_base = NULL;
     if(bloom_fd != -1) close(bloom_fd);
     bloom_fd = -1;
+    bloom_cache_shutdown();
 }
 #endif
+
+static BOOL string_contains_lower_term(const MDB_val* text, const char* lower_term){
+    if(!text || !lower_term) return FALSE;
+    size_t len = text->mv_size;
+    char* tmp = (char*)malloc(len + 1);
+    if(!tmp) return FALSE;
+    memcpy(tmp, text->mv_data, len);
+    tmp[len] = 0;
+    lowercase_ascii(tmp, len);
+    for(size_t i=0;i<len;i++){
+        if(tmp[i]=='_' || tmp[i]=='-') tmp[i]=' ';
+    }
+    BOOL match = strstr(tmp, lower_term) != NULL;
+    free(tmp);
+    return match;
+}
 
 typedef struct {
     char* name_pattern;
@@ -329,15 +539,20 @@ static int search_names(Query* q, Result* results){
     char u8db[MAX_LONG_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
     if(mdb_env_open(env,u8db,MDB_RDONLY,0664)!=0){ mdb_env_close(env); return 0; }
     if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ mdb_env_close(env); return 0; }
-    if(mdb_dbi_open(txn,"filename_index",0,&dbi_fname)!=0 ||
-       mdb_dbi_open(txn,"trigram_index",0,&dbi_trigram)!=0 ||
-       mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
-       mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0 ||
-       mdb_dbi_open(txn,"extension_index",0,&dbi_ext)!=0 ||
-       mdb_dbi_open(txn,"size_index",0,&dbi_size)!=0 ||
-       mdb_dbi_open(txn,"mtime_index",0,&dbi_mtime)!=0){
-        mdb_txn_abort(txn); mdb_env_close(env); return 0;
+    int rc = 0;
+    if((rc = mdb_dbi_open(txn,"filename_index",0,&dbi_fname))!=0) goto fail;
+    if((rc = mdb_dbi_open(txn,"trigram_index",0,&dbi_trigram))!=0) goto fail;
+    if((rc = mdb_dbi_open(txn,"strings",0,&dbi_strings))!=0) goto fail;
+    dbi_smeta = MDB_DBI_INVALID;
+    rc = mdb_dbi_open(txn,"string_meta",0,&dbi_smeta);
+    if(rc == MDB_NOTFOUND){
+        dbi_smeta = MDB_DBI_INVALID;
+    } else if(rc != 0){
+        goto fail;
     }
+    if((rc = mdb_dbi_open(txn,"extension_index",0,&dbi_ext))!=0) goto fail;
+    if((rc = mdb_dbi_open(txn,"size_index",0,&dbi_size))!=0) goto fail;
+    if((rc = mdb_dbi_open(txn,"mtime_index",0,&dbi_mtime))!=0) goto fail;
 
     IdVec base; idvec_init(&base);
     BOOL have_base = FALSE;
@@ -405,6 +620,10 @@ static int search_names(Query* q, Result* results){
     idvec_free(&ids);
     mdb_txn_abort(txn); mdb_env_close(env);
     return (int)n;
+fail:
+    mdb_txn_abort(txn);
+    mdb_env_close(env);
+    return 0;
 }
 
 // Stage 1: metadata indexes (author/camera/etc.).
@@ -1817,8 +2036,15 @@ static DWORD WINAPI filter_worker_thread(void* p){
         MDB_val nk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, nv;
         if(mdb_get(txn, dbi_strings, &pk, &pv)!=0) continue;
         if(mdb_get(txn, dbi_strings, &nk, &nv)!=0) continue;
-        char* parent = (char*)pv.mv_data;
-        char* name = (char*)nv.mv_data;
+        MDB_val parent_val; StringMeta parent_meta;
+        MDB_val name_val; StringMeta name_meta;
+        string_value_parse(&pv, &parent_val, &parent_meta);
+        string_value_parse(&nv, &name_val, &name_meta);
+        char* parent = (char*)_malloca(parent_val.mv_size + 1);
+        char* name = (char*)_malloca(name_val.mv_size + 1);
+        if(!parent || !name){ if(parent) _freea(parent); if(name) _freea(name); continue; }
+        memcpy(parent, parent_val.mv_data, parent_val.mv_size); parent[parent_val.mv_size]=0;
+        memcpy(name, name_val.mv_data, name_val.mv_size); name[name_val.mv_size]=0;
         if(a->q->path_filter){ if(strncmp(parent,a->q->path_filter,strlen(a->q->path_filter))!=0) continue; }
         if(a->q->name_pattern){
             char norm[512];
@@ -1831,6 +2057,8 @@ static DWORD WINAPI filter_worker_thread(void* p){
             if(!ok) continue;
         }
         float score = calculate_relevance(txn, dbi_strings, r, parent, name, a->q, a->total_docs, a->docs_with_term);
+        _freea(parent);
+        _freea(name);
         if(a->outn < a->outcap){
             a->out[a->outn].rec_id = rid;
             a->out[a->outn].score = score;
@@ -1877,53 +2105,102 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
     if(q->content_pattern && r->content_str_id){
         MDB_val ck={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, cv;
         if(mdb_get(txn, dbi_strings, &ck, &cv)==0){
-            const char* content=(const char*)cv.mv_data;
-            int tf = count_term_occurrences(content, q->content_pattern);
-            int dl = (int)strlen(content);
-            const float avgdl = 1000.0f;
-            content_score = bm25_score(tf, dl, avgdl, (int)total_docs, (int)docs_with_term);
+            MDB_val text_val; StringMeta meta;
+            string_value_parse(&cv, &text_val, &meta);
+            char* content = (char*)_malloca(text_val.mv_size + 1);
+            if(content){
+                memcpy(content, text_val.mv_data, text_val.mv_size);
+                content[text_val.mv_size] = 0;
+                int tf = count_term_occurrences(content, q->content_pattern);
+                int dl = (int)text_val.mv_size;
+                const float avgdl = 1000.0f;
+                content_score = bm25_score(tf, dl, avgdl, (int)total_docs, (int)docs_with_term);
+                _freea(content);
+            }
         }
     }
     if(q->author_pattern && r->author_str_id){
         MDB_val ak={.mv_data=&r->author_str_id,.mv_size=sizeof(r->author_str_id)}, av;
         if(mdb_get(txn, dbi_strings, &ak, &av)==0){
-            const char* author=(const char*)av.mv_data;
-            if(_stricmp(author, q->author_pattern)==0) meta_score += 1.0f;
+            MDB_val text_val; StringMeta meta;
+            string_value_parse(&av, &text_val, &meta);
+            char* author=(char*)_malloca(text_val.mv_size + 1);
+            if(author){
+                memcpy(author, text_val.mv_data, text_val.mv_size);
+                author[text_val.mv_size] = 0;
+                if(_stricmp(author, q->author_pattern)==0) meta_score += 1.0f;
+                _freea(author);
+            }
         }
     }
     if(q->camera_pattern && r->camera_str_id){
         MDB_val ck={.mv_data=&r->camera_str_id,.mv_size=sizeof(r->camera_str_id)}, cv;
         if(mdb_get(txn, dbi_strings, &ck, &cv)==0){
-            const char* camera=(const char*)cv.mv_data;
-            if(_stricmp(camera, q->camera_pattern)==0) meta_score += 1.0f;
+            MDB_val text_val; StringMeta meta;
+            string_value_parse(&cv, &text_val, &meta);
+            char* camera=(char*)_malloca(text_val.mv_size + 1);
+            if(camera){
+                memcpy(camera, text_val.mv_data, text_val.mv_size);
+                camera[text_val.mv_size] = 0;
+                if(_stricmp(camera, q->camera_pattern)==0) meta_score += 1.0f;
+                _freea(camera);
+            }
         }
     }
     if(q->lens_pattern && r->lens_str_id){
         MDB_val lk={.mv_data=&r->lens_str_id,.mv_size=sizeof(r->lens_str_id)}, lv;
         if(mdb_get(txn, dbi_strings, &lk, &lv)==0){
-            const char* lens=(const char*)lv.mv_data;
-            if(_stricmp(lens, q->lens_pattern)==0) meta_score += 1.0f;
+            MDB_val text_val; StringMeta meta;
+            string_value_parse(&lv, &text_val, &meta);
+            char* lens=(char*)_malloca(text_val.mv_size + 1);
+            if(lens){
+                memcpy(lens, text_val.mv_data, text_val.mv_size);
+                lens[text_val.mv_size] = 0;
+                if(_stricmp(lens, q->lens_pattern)==0) meta_score += 1.0f;
+                _freea(lens);
+            }
         }
     }
     if(q->artist_pattern && r->artist_str_id){
         MDB_val ark={.mv_data=&r->artist_str_id,.mv_size=sizeof(r->artist_str_id)}, av2;
         if(mdb_get(txn, dbi_strings, &ark, &av2)==0){
-            const char* artist=(const char*)av2.mv_data;
-            if(_stricmp(artist, q->artist_pattern)==0) meta_score += 1.0f;
+            MDB_val text_val; StringMeta meta;
+            string_value_parse(&av2, &text_val, &meta);
+            char* artist=(char*)_malloca(text_val.mv_size + 1);
+            if(artist){
+                memcpy(artist, text_val.mv_data, text_val.mv_size);
+                artist[text_val.mv_size] = 0;
+                if(_stricmp(artist, q->artist_pattern)==0) meta_score += 1.0f;
+                _freea(artist);
+            }
         }
     }
     if(q->album_pattern && r->album_str_id){
         MDB_val abk={.mv_data=&r->album_str_id,.mv_size=sizeof(r->album_str_id)}, abv;
         if(mdb_get(txn, dbi_strings, &abk, &abv)==0){
-            const char* album=(const char*)abv.mv_data;
-            if(_stricmp(album, q->album_pattern)==0) meta_score += 1.0f;
+            MDB_val text_val; StringMeta meta;
+            string_value_parse(&abv, &text_val, &meta);
+            char* album=(char*)_malloca(text_val.mv_size + 1);
+            if(album){
+                memcpy(album, text_val.mv_data, text_val.mv_size);
+                album[text_val.mv_size] = 0;
+                if(_stricmp(album, q->album_pattern)==0) meta_score += 1.0f;
+                _freea(album);
+            }
         }
     }
     if(q->title_pattern && r->title_str_id){
         MDB_val tk={.mv_data=&r->title_str_id,.mv_size=sizeof(r->title_str_id)}, tv;
         if(mdb_get(txn, dbi_strings, &tk, &tv)==0){
-            const char* title=(const char*)tv.mv_data;
-            if(_stricmp(title, q->title_pattern)==0) meta_score += 1.0f;
+            MDB_val text_val; StringMeta meta;
+            string_value_parse(&tv, &text_val, &meta);
+            char* title=(char*)_malloca(text_val.mv_size + 1);
+            if(title){
+                memcpy(title, text_val.mv_data, text_val.mv_size);
+                title[text_val.mv_size] = 0;
+                if(_stricmp(title, q->title_pattern)==0) meta_score += 1.0f;
+                _freea(title);
+            }
         }
     }
     if(q->ext_pattern){
@@ -2335,40 +2612,53 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
         size_t limit = tlen > DB_BLOOM_MAX_BYTES ? DB_BLOOM_MAX_BYTES : tlen;
         size_t full = limit < DB_BLOOM_STRIDE_AFTER ? limit : DB_BLOOM_STRIDE_AFTER;
         for(size_t i=0;i+3<=full && hn<4096;i++){
-            uint32_t h=2166136261u ^ 0xA5A5A5A5u; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
-            h=2166136261u ^ 0x3C3C3C3Cu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
-            h=2166136261u ^ 0x5A5A5A5Au; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
-            h=2166136261u ^ 0x1F1F1F1Fu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
+            uint32_t h=2166136261u ^ 0xA5A5A5A5u; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h;
+            h=2166136261u ^ 0x3C3C3C3Cu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h;
+            h=2166136261u ^ 0x5A5A5A5Au; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h;
+            h=2166136261u ^ 0x1F1F1F1Fu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h;
         }
         for(size_t i=full;i+3<=limit && hn<4096;i+=DB_BLOOM_STRIDE){
-            uint32_t h=2166136261u ^ 0xA5A5A5A5u; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
-            h=2166136261u ^ 0x3C3C3C3Cu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
-            h=2166136261u ^ 0x5A5A5A5Au; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
-            h=2166136261u ^ 0x1F1F1F1Fu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h&0xFFFFu;
+            uint32_t h=2166136261u ^ 0xA5A5A5A5u; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h;
+            h=2166136261u ^ 0x3C3C3C3Cu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h;
+            h=2166136261u ^ 0x5A5A5A5Au; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h;
+            h=2166136261u ^ 0x1F1F1F1Fu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h;
         }
         for(size_t i=0;i<name_ids.n;i++){
-            MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
-            if(mdb_get(txn, dbi_smeta,&k,&v)!=0 || v.mv_size<sizeof(StringMeta)) continue;
-            const StringMeta* sm = (const StringMeta*)v.mv_data;
-            if(sm->bloom_offset >= g_bloom_size || g_bloom_size - sm->bloom_offset < sm->bloom_length) continue;
-            const uint8_t* encoded = bloom_readonly_base + sm->bloom_offset;
-            uint8_t* bloom_buf = g_bloom_decode_buf;
-            if(sm->bloom_length == 8192){
-                memcpy(bloom_buf, encoded, 8192);
-            } else if(!bloom_packbits_decompress(encoded, sm->bloom_length, bloom_buf, 8192)){
-                continue;
-            }
-            const uint8_t* bloom = bloom_buf;
-            uint32_t hash_to_check = sm->hash_count;
-            if(hash_to_check == 0 || hash_to_check > 4) hash_to_check = 4;
-            BOOL ok=TRUE;
-            size_t idx=0;
-            while(idx < hn && ok){
-                for(uint32_t h=0; h<hash_to_check && idx + h < hn; ++h){
-                    uint32_t bit = hbuf[idx + h];
-                    if((bloom[bit>>3] & (1u<<(bit&7)))==0){ ok=FALSE; break; }
+            MDB_val key={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, val;
+            if(mdb_get(txn, dbi_strings,&key,&val)!=0) continue;
+            MDB_val text_val; StringMeta inline_meta;
+            BOOL has_inline = string_value_parse(&val, &text_val, &inline_meta);
+            const StringMeta* sm = has_inline ? &inline_meta : NULL;
+            StringMeta legacy_meta;
+            if(!sm && dbi_smeta != MDB_DBI_INVALID){
+                MDB_val mv;
+                if(mdb_get(txn, dbi_smeta, &key, &mv)==0 && mv.mv_size>=sizeof(StringMeta)){
+                    memcpy(&legacy_meta, mv.mv_data, sizeof(StringMeta));
+                    sm = &legacy_meta;
                 }
-                idx += 4;
+            }
+            BOOL ok = FALSE;
+            if(sm && sm->bloom_offset < g_bloom_size && g_bloom_size - sm->bloom_offset >= sm->bloom_length){
+                size_t bloom_bytes = 0;
+                uint8_t* bloom = bloom_cache_get(name_ids.ids[i], sm, &bloom_bytes);
+                if(bloom){
+                    uint32_t mask = string_meta_bloom_mask(sm);
+                    if(mask == 0 && bloom_bytes){ mask = (uint32_t)(bloom_bytes * 8 - 1); }
+                    uint32_t hash_to_check = sm->hash_count;
+                    if(hash_to_check == 0 || hash_to_check > 4) hash_to_check = 4;
+                    if(mask){
+                        ok = TRUE;
+                        for(size_t base=0;base<hn && ok;base+=4){
+                            for(uint32_t h=0; h<hash_to_check && base + h < hn; ++h){
+                                uint32_t bit = hbuf[base + h] & mask;
+                                if((bloom[bit>>3] & (uint8_t)(1u << (bit & 7))) == 0){ ok = FALSE; break; }
+                            }
+                        }
+                    }
+                }
+            }
+            if(!ok){
+                ok = string_contains_lower_term(&text_val, tl);
             }
             if(ok){ name_ids.ids[keep++]=name_ids.ids[i]; }
         }
@@ -2401,8 +2691,10 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
         int maxd=(int)((npat_len+4)/5);
         while(rc==0 && !limit_reached){
             uint64_t sid=*(uint64_t*)sk.mv_data;
-            char* name=(char*)sv.mv_data; size_t nlen=sv.mv_size;
-            char* tmp=(char*)_malloca(nlen+1); memcpy(tmp,name,nlen); tmp[nlen]=0;
+            MDB_val text_val; StringMeta meta_tmp;
+            string_value_parse(&sv, &text_val, &meta_tmp);
+            size_t nlen=text_val.mv_size;
+            char* tmp=(char*)_malloca(nlen+1); memcpy(tmp,text_val.mv_data,nlen); tmp[nlen]=0;
             normalize_filename_utf8(tmp,tmp,nlen+1);
             if(fuzzy_match(tmp,npat,maxd)){
                 MDB_val k={.mv_data=&sid,.mv_size=sizeof(sid)}, v;
@@ -2547,9 +2839,17 @@ int wmain(int argc, wchar_t** argv){
        mdb_dbi_open(txn,"size_index",0,&dbi_size)!=0 ||
        mdb_dbi_open(txn,"mtime_index",0,&dbi_mtime)!=0 ||
        mdb_dbi_open(txn,"date_index",0,&dbi_date)!=0 ||
-       mdb_dbi_open(txn,"extension_index",0,&dbi_ext)!=0 ||
-       mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0 ||
-       mdb_dbi_open(txn,"content_index",0,&dbi_content)!=0 ||
+       mdb_dbi_open(txn,"extension_index",0,&dbi_ext)!=0){
+       output_error(json_output,"dbi_open failed"); mdb_txn_abort(txn); mdb_env_close(env); close_bloom(); free_search_query(&q); tokenlist_free(&tokens); return 1;
+    }
+    dbi_smeta = MDB_DBI_INVALID;
+    int rc_smeta = mdb_dbi_open(txn,"string_meta",0,&dbi_smeta);
+    if(rc_smeta == MDB_NOTFOUND){
+        dbi_smeta = MDB_DBI_INVALID;
+    } else if(rc_smeta != 0){
+       output_error(json_output,"dbi_open failed"); mdb_txn_abort(txn); mdb_env_close(env); close_bloom(); free_search_query(&q); tokenlist_free(&tokens); return 1;
+    }
+    if(mdb_dbi_open(txn,"content_index",0,&dbi_content)!=0 ||
        mdb_dbi_open(txn,"author_index",0,&dbi_author)!=0 ||
        mdb_dbi_open(txn,"camera_index",0,&dbi_camera)!=0 ||
        mdb_dbi_open(txn,"lens_index",0,&dbi_lens)!=0 ||

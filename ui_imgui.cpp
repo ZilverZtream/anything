@@ -42,60 +42,226 @@
 #include <memory>
 #include <sstream>
 #include <array>
+#include <mutex>
 #include <cstring>
- extern "C" {
- #include "lmdb.h"
- #include "database.h"
- #include "util.h"
- #include "anything.h"
- }
- #endif
- #include <stdio.h>
+extern "C" {
+#include "lmdb.h"
+#include "database.h"
+#include "util.h"
+#include "anything.h"
+}
+#endif
+#include <stdio.h>
 
- #ifndef MAX_PATH
- #define MAX_PATH 260
- #endif
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
 #ifndef MAX_LONG_PATH
 #define MAX_LONG_PATH 32767
 #endif
 
 #ifdef HAS_IMGUI
+#ifndef MDB_DBI_INVALID
+#define MDB_DBI_INVALID ((MDB_dbi)~(unsigned)0)
+#endif
+
 struct StringMeta {
     uint32_t trigram_count;
     uint8_t  hash_count;
-    uint8_t  reserved[3];
+    uint8_t  bloom_log2;
+    uint8_t  magic0;
+    uint8_t  magic1;
     uint64_t bloom_offset;
     uint32_t bloom_length;
 };
+
+static constexpr uint8_t STRING_META_MAGIC0 = 'B';
+static constexpr uint8_t STRING_META_MAGIC1 = 'F';
+
 #ifdef _WIN32
 static HANDLE bloom_mapping = NULL;
+#else
+static int bloom_fd = -1;
 #endif
 static const uint8_t* bloom_readonly_base = nullptr;
 static size_t g_bloom_size = 0;
-static thread_local std::array<uint8_t, 8192> gBloomDecodeBuffer;
 
-static bool DecompressBloom(const uint8_t* src, size_t srcLen, uint8_t* dst, size_t dstLen) {
-    if (!src || !dst) return false;
+static inline size_t bloom_log2_to_bytes(uint8_t log2){
+    if(log2 >= 8 && log2 <= 20){
+        return static_cast<size_t>(1u) << log2;
+    }
+    return 0;
+}
+
+static bool string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta_out, bool* has_meta = nullptr){
+    if(!value) return false;
+    bool present = false;
+    size_t total = value->mv_size;
+    if(total >= sizeof(StringMeta)){
+        const uint8_t* base = static_cast<const uint8_t*>(value->mv_data);
+        const StringMeta* tail = reinterpret_cast<const StringMeta*>(base + total - sizeof(StringMeta));
+        if(tail->magic0 == STRING_META_MAGIC0 && tail->magic1 == STRING_META_MAGIC1){
+            present = true;
+            if(meta_out) *meta_out = *tail;
+            total -= sizeof(StringMeta);
+        }
+    }
+    if(meta_out && !present){
+        memset(meta_out, 0, sizeof(*meta_out));
+    }
+    if(text){
+        text->mv_data = value->mv_data;
+        text->mv_size = total;
+    }
+    if(has_meta) *has_meta = present;
+    return present;
+}
+
+static size_t string_meta_bloom_bytes(const StringMeta* sm){
+    if(!sm) return 0;
+    if(sm->magic0 == STRING_META_MAGIC0 && sm->magic1 == STRING_META_MAGIC1){
+        if(sm->bloom_log2){
+            size_t bytes = bloom_log2_to_bytes(sm->bloom_log2);
+            if(bytes) return bytes;
+        }
+    }
+    if(sm->bloom_length == 0) return 0;
+    if(sm->bloom_length == 2048 || sm->bloom_length == 4096 || sm->bloom_length == 8192){
+        return sm->bloom_length;
+    }
+    return 8192;
+}
+
+static uint32_t string_meta_bloom_mask(const StringMeta* sm){
+    size_t bytes = string_meta_bloom_bytes(sm);
+    if(bytes == 0) return 0;
+    size_t bits = bytes * 8;
+    if(bits > UINT32_MAX) bits = UINT32_MAX;
+    return static_cast<uint32_t>(bits - 1);
+}
+
+static bool bloom_packbits_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_len){
+    if(!src || !dst) return false;
     size_t i = 0;
     size_t o = 0;
-    while (i < srcLen && o < dstLen) {
+    while(i < src_len && o < dst_len){
         int8_t header = static_cast<int8_t>(src[i++]);
-        if (header >= 0) {
+        if(header >= 0){
             size_t count = static_cast<size_t>(header) + 1;
-            if (i + count > srcLen || o + count > dstLen) return false;
+            if(i + count > src_len || o + count > dst_len) return false;
             memcpy(dst + o, src + i, count);
             i += count;
             o += count;
-        } else if (header != -128) {
+        } else if(header != -128){
             size_t count = static_cast<size_t>(1 - header);
-            if (i >= srcLen || o + count > dstLen) return false;
+            if(i >= src_len || o + count > dst_len) return false;
             uint8_t value = src[i++];
             memset(dst + o, value, count);
             o += count;
         }
     }
-    return o == dstLen;
+    return o == dst_len;
 }
+
+struct BloomCacheEntry {
+    uint64_t string_id = 0;
+    uint64_t bloom_offset = 0;
+    uint32_t bloom_length = 0;
+    uint8_t  bloom_log2 = 0;
+    uint8_t  hash_count = 0;
+    size_t   bloom_bytes = 0;
+    std::vector<uint8_t> data;
+    uint64_t stamp = 0;
+    bool     in_use = false;
+};
+
+static constexpr size_t BLOOM_CACHE_CAP = 1000;
+static BloomCacheEntry g_bloom_cache[BLOOM_CACHE_CAP];
+static size_t g_bloom_cache_count = 0;
+static uint64_t g_bloom_cache_clock = 0;
+static std::mutex g_bloom_cache_mu;
+
+static void bloom_cache_reset(){
+    std::lock_guard<std::mutex> lock(g_bloom_cache_mu);
+    for(size_t i = 0; i < g_bloom_cache_count; ++i){
+        g_bloom_cache[i].data.clear();
+        g_bloom_cache[i].data.shrink_to_fit();
+        g_bloom_cache[i].in_use = false;
+        g_bloom_cache[i].stamp = 0;
+        g_bloom_cache[i].bloom_bytes = 0;
+    }
+    g_bloom_cache_count = 0;
+    g_bloom_cache_clock = 0;
+}
+
+static uint8_t* bloom_cache_get(uint64_t string_id, const StringMeta* meta, size_t* out_len){
+    if(!meta || meta->hash_count == 0 || meta->bloom_length == 0) return nullptr;
+    size_t bloom_bytes = string_meta_bloom_bytes(meta);
+    if(bloom_bytes == 0 || !bloom_readonly_base) return nullptr;
+
+    std::lock_guard<std::mutex> lock(g_bloom_cache_mu);
+    BloomCacheEntry* slot = nullptr;
+    for(size_t i = 0; i < g_bloom_cache_count; ++i){
+        BloomCacheEntry& e = g_bloom_cache[i];
+        if(e.in_use && e.string_id == string_id){
+            if(e.bloom_offset == meta->bloom_offset && e.bloom_length == meta->bloom_length && e.bloom_log2 == meta->bloom_log2){
+                e.stamp = ++g_bloom_cache_clock;
+                if(out_len) *out_len = e.bloom_bytes;
+                return e.data.data();
+            }
+            slot = &e;
+            break;
+        }
+        if(!e.in_use && !slot){
+            slot = &e;
+        }
+    }
+    if(!slot){
+        if(g_bloom_cache_count < BLOOM_CACHE_CAP){
+            slot = &g_bloom_cache[g_bloom_cache_count++];
+        } else {
+            size_t victim = 0;
+            uint64_t best_stamp = UINT64_MAX;
+            for(size_t i = 0; i < BLOOM_CACHE_CAP; ++i){
+                if(!g_bloom_cache[i].in_use){
+                    victim = i;
+                    break;
+                }
+                if(g_bloom_cache[i].stamp < best_stamp){
+                    best_stamp = g_bloom_cache[i].stamp;
+                    victim = i;
+                }
+            }
+            slot = &g_bloom_cache[victim];
+        }
+    }
+
+    if(slot->data.size() != bloom_bytes){
+        slot->data.assign(bloom_bytes, 0);
+    }
+
+    const uint8_t* encoded = bloom_readonly_base + meta->bloom_offset;
+    if(meta->bloom_length == bloom_bytes){
+        memcpy(slot->data.data(), encoded, bloom_bytes);
+    } else {
+        if(!bloom_packbits_decompress(encoded, meta->bloom_length, slot->data.data(), bloom_bytes)){
+            slot->in_use = false;
+            return nullptr;
+        }
+    }
+
+    slot->string_id = string_id;
+    slot->bloom_offset = meta->bloom_offset;
+    slot->bloom_length = meta->bloom_length;
+    slot->bloom_log2 = meta->bloom_log2;
+    slot->hash_count = meta->hash_count;
+    slot->bloom_bytes = bloom_bytes;
+    slot->stamp = ++g_bloom_cache_clock;
+    slot->in_use = true;
+    if(out_len) *out_len = bloom_bytes;
+    return slot->data.data();
+}
+
 static bool open_bloom(const wchar_t* dbPath){
 #ifdef _WIN32
     wchar_t bp[MAX_LONG_PATH]; swprintf(bp, MAX_LONG_PATH, L"%s\\bloom.dat", dbPath);
@@ -105,22 +271,31 @@ static bool open_bloom(const wchar_t* dbPath){
     LARGE_INTEGER sz; GetFileSizeEx(f,&sz); g_bloom_size = sz.QuadPart;
     bloom_mapping = CreateFileMappingW(f,NULL,PAGE_READONLY,0,0,NULL);
     CloseHandle(f);
-    if(!bloom_mapping) return false;
+    if(!bloom_mapping){ g_bloom_size = 0; return false; }
     bloom_readonly_base = (const uint8_t*)MapViewOfFile(bloom_mapping, FILE_MAP_READ, 0,0,0);
-    if(!bloom_readonly_base){ CloseHandle(bloom_mapping); bloom_mapping=NULL; return false; }
+    if(!bloom_readonly_base){ CloseHandle(bloom_mapping); bloom_mapping=NULL; g_bloom_size = 0; return false; }
+    bloom_cache_reset();
     return true;
 #else
     char bp[MAX_PATH]; wcstombs(bp, dbPath, MAX_PATH);
     strncat(bp, "/bloom.dat", MAX_PATH - strlen(bp) - 1);
-    int fd = open(bp, O_RDONLY);
-    if(fd<0) return false;
-    struct stat st; if(fstat(fd,&st)!=0){ close(fd); return false; }
+    bloom_fd = open(bp, O_RDONLY);
+    if(bloom_fd < 0) return false;
+    struct stat st; if(fstat(bloom_fd,&st)!=0){ close(bloom_fd); bloom_fd=-1; return false; }
     g_bloom_size = st.st_size;
-    bloom_readonly_base = (const uint8_t*)mmap(NULL, g_bloom_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    return bloom_readonly_base != MAP_FAILED;
+    bloom_readonly_base = (const uint8_t*)mmap(NULL, g_bloom_size, PROT_READ, MAP_PRIVATE, bloom_fd, 0);
+    if(bloom_readonly_base == MAP_FAILED){
+        bloom_readonly_base = nullptr;
+        close(bloom_fd);
+        bloom_fd = -1;
+        g_bloom_size = 0;
+        return false;
+    }
+    bloom_cache_reset();
+    return true;
 #endif
 }
+
 static void close_bloom(){
     if(!bloom_readonly_base) return;
 #ifdef _WIN32
@@ -129,8 +304,14 @@ static void close_bloom(){
     bloom_mapping=NULL;
 #else
     munmap((void*)bloom_readonly_base, g_bloom_size);
+    if(bloom_fd >= 0){
+        close(bloom_fd);
+        bloom_fd = -1;
+    }
 #endif
     bloom_readonly_base = nullptr;
+    g_bloom_size = 0;
+    bloom_cache_reset();
 }
 struct Result {
     std::string filename;
@@ -738,68 +919,119 @@ void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const std::st
     *out = candidates;
 }
 
+static bool string_contains_lower_term(const MDB_val* text, const std::string& lower_term){
+    if(!text) return false;
+    std::string tmp(static_cast<const char*>(text->mv_data), text->mv_size);
+    std::transform(tmp.begin(), tmp.end(), tmp.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    for(char& c : tmp){
+        if(c == '_' || c == '-') c = ' ';
+    }
+    return tmp.find(lower_term) != std::string::npos;
+}
+
+static std::string string_from_value_trimmed(const MDB_val& value){
+    MDB_val text;
+    StringMeta meta;
+    string_value_parse(&value, &text, &meta);
+    return std::string(static_cast<const char*>(text.mv_data), text.mv_size);
+}
+
 void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_dbi dbi_strings, MDB_dbi dbi_smeta, const std::string& term, IdVec* out) {
     IdVec name_ids; idvec_init(&name_ids);
     collect_trigram_candidates(txn, dbi_trigram, term, &name_ids);
     sort_unique(&name_ids);
-    if (name_ids.n > 0) {
-        size_t keep = 0;
-        size_t tlen = term.length();
-        std::string tl = to_lower(term);
-        uint32_t hbuf[4096]; size_t hn = 0;
-        for (size_t i = 0; i + 3 <= tlen && hn < 4096; i++) {
-            uint32_t h = 2166136261u ^ 0xA5A5A5A5u;
-            for (int k = 0; k < 3; k++) { h ^= (uint8_t)tl[i + k]; h *= 16777619u; }
-            hbuf[hn++] = h & 0xFFFFu;
-            h = 2166136261u ^ 0x3C3C3C3Cu;
-            for (int k = 0; k < 3; k++) { h ^= (uint8_t)tl[i + k]; h *= 16777619u; }
-            hbuf[hn++] = h & 0xFFFFu;
-            h = 2166136261u ^ 0x5A5A5A5Au;
-            for (int k = 0; k < 3; k++) { h ^= (uint8_t)tl[i + k]; h *= 16777619u; }
-            hbuf[hn++] = h & 0xFFFFu;
-            h = 2166136261u ^ 0x1F1F1F1Fu;
-            for (int k = 0; k < 3; k++) { h ^= (uint8_t)tl[i + k]; h *= 16777619u; }
-            hbuf[hn++] = h & 0xFFFFu;
-        }
-        for (size_t i = 0; i < name_ids.n; i++) {
-            MDB_val k = {.mv_data = &name_ids.ids[i], .mv_size = sizeof(uint64_t)};
-            MDB_val v;
-            if (mdb_get(txn, dbi_smeta, &k, &v) != 0 || v.mv_size < sizeof(StringMeta)) continue;
-            const StringMeta* sm = (const StringMeta*)v.mv_data;
-            if (sm->bloom_offset >= g_bloom_size || g_bloom_size - sm->bloom_offset < sm->bloom_length) continue;
-            const uint8_t* encoded = bloom_readonly_base + sm->bloom_offset;
-            uint8_t* bloomData = gBloomDecodeBuffer.data();
-            if (sm->bloom_length == 8192) {
-                memcpy(bloomData, encoded, 8192);
-            } else if (!DecompressBloom(encoded, sm->bloom_length, bloomData, 8192)) {
-                continue;
-            }
-            const uint8_t* bloom = bloomData;
-            uint32_t hashToCheck = sm->hash_count;
-            if (hashToCheck == 0 || hashToCheck > 4) hashToCheck = 4;
-            bool ok = true;
-            size_t idx = 0;
-            while (idx < hn && ok) {
-                for (uint32_t h = 0; h < hashToCheck && idx + h < hn; ++h) {
-                    uint32_t bit = hbuf[idx + h];
-                    if ((bloom[bit >> 3] & (1u << (bit & 7))) == 0) { ok = false; break; }
+
+    const size_t term_len = term.length();
+    std::string lower_term = to_lower(term);
+    const bool use_bloom = term_len >= 5;
+    uint32_t hbuf[4096]; size_t hn = 0;
+    if(use_bloom){
+        const uint32_t seeds[4] = {0xA5A5A5A5u, 0x3C3C3C3Cu, 0x5A5A5A5Au, 0x1F1F1F1Fu};
+        size_t limit = std::min(term_len, static_cast<size_t>(DB_BLOOM_MAX_BYTES));
+        size_t full = std::min(limit, static_cast<size_t>(DB_BLOOM_STRIDE_AFTER));
+        auto append_hashes = [&](size_t idx){
+            if(idx + 3 > limit || hn + 4 > (sizeof(hbuf)/sizeof(hbuf[0]))) return;
+            for(uint32_t seed : seeds){
+                uint32_t h = 2166136261u ^ seed;
+                for(int k = 0; k < 3; ++k){
+                    h ^= static_cast<uint8_t>(lower_term[idx + k]);
+                    h *= 16777619u;
                 }
-                idx += 4;
+                hbuf[hn++] = h;
             }
-            if (ok) { name_ids.ids[keep++] = name_ids.ids[i]; }
+        };
+        for(size_t i = 0; i + 3 <= full && hn + 4 <= (sizeof(hbuf)/sizeof(hbuf[0])); ++i){
+            append_hashes(i);
+        }
+        for(size_t i = full; i + 3 <= limit && hn + 4 <= (sizeof(hbuf)/sizeof(hbuf[0])); i += DB_BLOOM_STRIDE){
+            append_hashes(i);
+        }
+    }
+
+    if(name_ids.n > 0){
+        size_t keep = 0;
+        for(size_t i = 0; i < name_ids.n; ++i){
+            MDB_val key = {.mv_data = &name_ids.ids[i], .mv_size = sizeof(uint64_t)};
+            MDB_val val;
+            if(mdb_get(txn, dbi_strings, &key, &val) != 0) continue;
+            MDB_val text_val;
+            StringMeta inline_meta;
+            bool has_inline = string_value_parse(&val, &text_val, &inline_meta);
+            const StringMeta* sm = has_inline ? &inline_meta : nullptr;
+            StringMeta legacy_meta;
+            if(!sm && dbi_smeta != MDB_DBI_INVALID){
+                MDB_val mv;
+                if(mdb_get(txn, dbi_smeta, &key, &mv) == 0 && mv.mv_size >= sizeof(StringMeta)){
+                    memcpy(&legacy_meta, mv.mv_data, sizeof(StringMeta));
+                    sm = &legacy_meta;
+                }
+            }
+
+            bool ok = false;
+            if(use_bloom && sm && sm->bloom_offset < g_bloom_size && g_bloom_size - sm->bloom_offset >= sm->bloom_length){
+                size_t bloom_bytes = 0;
+                uint8_t* bloom = bloom_cache_get(name_ids.ids[i], sm, &bloom_bytes);
+                if(bloom){
+                    uint32_t mask = string_meta_bloom_mask(sm);
+                    if(mask == 0 && bloom_bytes) mask = static_cast<uint32_t>(bloom_bytes * 8 - 1);
+                    uint32_t hash_to_check = sm->hash_count;
+                    if(hash_to_check == 0 || hash_to_check > 4) hash_to_check = 4;
+                    if(mask){
+                        ok = true;
+                        for(size_t base = 0; base < hn && ok; base += 4){
+                            for(uint32_t h = 0; h < hash_to_check && base + h < hn; ++h){
+                                uint32_t bit = hbuf[base + h] & mask;
+                                if((bloom[bit >> 3] & static_cast<uint8_t>(1u << (bit & 7))) == 0){
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if(!ok){
+                ok = string_contains_lower_term(&text_val, lower_term);
+            }
+
+            if(ok){
+                name_ids.ids[keep++] = name_ids.ids[i];
+            }
         }
         name_ids.n = keep;
     }
+
     MDB_cursor* cix = nullptr;
     mdb_cursor_open(txn, dbi_fname, &cix);
-    if (name_ids.n > 0) {
-        for (size_t i = 0; i < name_ids.n; i++) {
+    if(name_ids.n > 0){
+        for(size_t i = 0; i < name_ids.n; ++i){
             MDB_val k = {.mv_data = &name_ids.ids[i], .mv_size = sizeof(uint64_t)};
             MDB_val v;
-            if (mdb_cursor_get(cix, &k, &v, MDB_SET_KEY) == 0) {
+            if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY) == 0){
                 do {
                     idvec_push(out, *(uint64_t*)v.mv_data);
-                } while (mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP) == 0);
+                } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP) == 0);
             }
         }
     } else {
@@ -807,22 +1039,24 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
         mdb_cursor_open(txn, dbi_strings, &cs);
         MDB_val sk, sv;
         int rc = mdb_cursor_get(cs, &sk, &sv, MDB_FIRST);
-        std::string npat = to_lower(term);
-        for (size_t j = 0; j < npat.length(); ++j) { if (npat[j] == '_' || npat[j] == '-') npat[j] = ' '; }
-        int maxd = (int)((npat.length() + 4) / 5);
-        while (rc == 0) {
+        std::string npat = lower_term;
+        for(char& c : npat){ if(c == '_' || c == '-') c = ' '; }
+        int maxd = static_cast<int>((npat.length() + 4) / 5);
+        while(rc == 0){
             uint64_t sid = *(uint64_t*)sk.mv_data;
-            std::string name = std::string((char*)sv.mv_data, sv.mv_size);
+            MDB_val text_val; StringMeta meta_tmp;
+            string_value_parse(&sv, &text_val, &meta_tmp);
+            std::string name(static_cast<const char*>(text_val.mv_data), text_val.mv_size);
             std::string norm = name;
-            std::transform(norm.begin(), norm.end(), norm.begin(), [](unsigned char c){ return std::tolower(c); });
-            for (char& c : norm) { if (c == '_' || c == '-' || c == '.') c = ' '; }
-            if (fuzzy_match(norm.c_str(), npat.c_str(), maxd)) {
+            std::transform(norm.begin(), norm.end(), norm.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+            for(char& c : norm){ if(c == '_' || c == '-' || c == '.') c = ' '; }
+            if(fuzzy_match(norm.c_str(), npat.c_str(), maxd)){
                 MDB_val k = {.mv_data = &sid, .mv_size = sizeof(sid)};
                 MDB_val v;
-                if (mdb_cursor_get(cix, &k, &v, MDB_SET_KEY) == 0) {
+                if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY) == 0){
                     do {
                         idvec_push(out, *(uint64_t*)v.mv_data);
-                    } while (mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP) == 0);
+                    } while(mdb_cursor_get(cix, &k, &v, MDB_NEXT_DUP) == 0);
                 }
             }
             rc = mdb_cursor_get(cs, &sk, &sv, MDB_NEXT);
@@ -975,7 +1209,11 @@ static void search_thread(SearchThreadArgs* sta) {
     mdb_dbi_open(txn, "size_index", 0, &dbi_size);
     mdb_dbi_open(txn, "date_index", 0, &dbi_date);
     mdb_dbi_open(txn, "extension_index", 0, &dbi_ext);
-    mdb_dbi_open(txn, "string_meta", 0, &dbi_smeta);
+    dbi_smeta = MDB_DBI_INVALID;
+    int rc_smeta = mdb_dbi_open(txn, "string_meta", 0, &dbi_smeta);
+    if(rc_smeta == MDB_NOTFOUND){
+        dbi_smeta = MDB_DBI_INVALID;
+    }
     mdb_dbi_open(txn, "content_index", 0, &dbi_content);
     mdb_dbi_open(txn, "author_index", 0, &dbi_author);
     mdb_dbi_open(txn, "strrev", 0, &dbi_strrev);
@@ -1019,8 +1257,8 @@ static void search_thread(SearchThreadArgs* sta) {
         MDB_val nv;
         if (mdb_get(txn, dbi_strings, &pk, &pv) != 0) continue;
         if (mdb_get(txn, dbi_strings, &nk, &nv) != 0) continue;
-        std::string parent = std::string((char*)pv.mv_data, pv.mv_size);
-        std::string name = std::string((char*)nv.mv_data, nv.mv_size);
+        std::string parent = string_from_value_trimmed(pv);
+        std::string name = string_from_value_trimmed(nv);
         std::string lower_parent = to_lower(parent);
         if (!sq.path_filter.empty() && lower_parent.find(to_lower(sq.path_filter)) == std::string::npos) continue;
         std::string ext = "";
@@ -1047,8 +1285,8 @@ static void search_thread(SearchThreadArgs* sta) {
         ProgressiveResult* stage0 = new ProgressiveResult();
         stage0->stage = 0;
         stage0->result.stage = 0;
-        stage0->result.path = std::string((char*)pv.mv_data, pv.mv_size);
-        stage0->result.filename = std::string((char*)nv.mv_data, nv.mv_size);
+        stage0->result.path = string_from_value_trimmed(pv);
+        stage0->result.filename = string_from_value_trimmed(nv);
         stage0->result.size = (int64_t)r->file_size;
         stage0->result.modified = (time_t)(r->modified_time / 10000000 - 11644473600LL);
         stage0->result.score = ranked[i].score;
@@ -1074,14 +1312,15 @@ static void search_thread(SearchThreadArgs* sta) {
             MDB_val ck = {.mv_data = &r->content_str_id, .mv_size = sizeof(r->content_str_id)};
             MDB_val cv;
             if (mdb_get(txn, dbi_strings, &ck, &cv) == 0) {
-                snippet = std::string((char*)cv.mv_data, cv.mv_size).substr(0, 500);
+                snippet = string_from_value_trimmed(cv);
+                if (snippet.size() > 500) snippet.resize(500);
             }
         }
         if (r->preview_str_id) {
             MDB_val pk_img = {.mv_data = &r->preview_str_id, .mv_size = sizeof(r->preview_str_id)};
             MDB_val pvimg;
             if (mdb_get(txn, dbi_strings, &pk_img, &pvimg) == 0) {
-                preview_path = std::string((char*)pvimg.mv_data, pvimg.mv_size);
+                preview_path = string_from_value_trimmed(pvimg);
             }
         }
         ProgressiveResult* stage2 = new ProgressiveResult();
