@@ -4,6 +4,24 @@ Anything is a high-performance desktop search engine designed to find not only y
 
 It achieves this through a highly optimized, multi-stage indexing pipeline, a sophisticated query engine, and a fluid, GPU-accelerated user interface.
 
+## Project Structure
+
+The repository follows a layered layout that separates the public interface, core engine, platform code, plugins, and tests:
+
+```
+anything/
+├── include/anything/   # Public headers shared across modules
+├── src/                # Application, core engine, services, platform, and UI sources
+├── plugins/            # Optional feature plugins grouped by category
+├── tests/              # Unit and integration tests with supporting stubs
+├── third_party/        # Vendored external dependencies (e.g., cJSON, LMDB headers)
+├── cmake/              # Helper CMake modules
+├── docs/               # Architecture and design documentation
+└── .github/workflows/  # Continuous integration pipelines
+```
+
+Each subdirectory contains focused functionality, making it easier to navigate the codebase, onboard new contributors, and scale the project with additional modules or platform support.
+
 ✨ **Key Features**
 Instant File & Folder Search: Utilizes the NTFS USN Journal on Windows for real-time file change detection, providing instantaneous name-based search results. For other filesystems, it employs a highly parallel, work-stealing directory scanner.
 

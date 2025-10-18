@@ -5,8 +5,9 @@
 #include <unistd.h>
 #include <wchar.h>
 
-#include "../database.h"
-#include "../lmdb.h"
+#include "anything/database.h"
+#include "anything/anything.h"
+#include "../third_party/lmdb/lmdb.h"
 
 extern void extract_trigrams(const char* text, uint32_t** out_tris, size_t* out_count);
 extern uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom);

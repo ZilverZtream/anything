@@ -13,7 +13,7 @@
 #define _strnicmp strncasecmp
 #define _strdup strdup
 
-#include "../util.h"
+#include "anything/util.h"
 
 // --- Begin code copied from search.c for tokenization and query parsing ---
 
