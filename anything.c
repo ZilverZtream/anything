@@ -78,6 +78,15 @@ static int _snwprintf(wchar_t* dst, size_t cch, const wchar_t* fmt, ...){
     va_end(ap);
     return r;
 }
+#ifdef _WIN32
+static LONG64 atomic_inc64(volatile LONG64* v){ return InterlockedIncrement64(v); }
+static LONG64 atomic_dec64(volatile LONG64* v){ return InterlockedDecrement64(v); }
+static LONG64 atomic_load64(volatile LONG64* v){ return *v; }
+#else
+static LONG64 atomic_inc64(volatile LONG64* v){ return __sync_add_and_fetch(v, 1); }
+static LONG64 atomic_dec64(volatile LONG64* v){ return __sync_sub_and_fetch(v, 1); }
+static LONG64 atomic_load64(volatile LONG64* v){ return __sync_add_and_fetch(v, 0); }
+#endif
 #define CP_UTF8 65001
 #ifdef __APPLE__
 static void utf8_to_wide(const char* src, wchar_t* dst, size_t dstlen){
@@ -465,16 +474,38 @@ cleanup:
 #endif
 }
 
-static void intern_email_header_value(Db* db, const char* value, uint64_t* out){
-    if(!db || !value || !out) return;
+static wchar_t* alloc_wide_from_utf8(const char* value){
+    if(!value) return NULL;
     int needed = MultiByteToWideChar(CP_UTF8, 0, value, -1, NULL, 0);
-    if(needed <= 0) return;
+    if(needed <= 0) return NULL;
     wchar_t* wtmp = (wchar_t*)malloc((size_t)needed * sizeof(wchar_t));
-    if(!wtmp) return;
-    if(MultiByteToWideChar(CP_UTF8, 0, value, -1, wtmp, needed) > 0){
-        *out = db_intern_wstring(db, wtmp);
+    if(!wtmp) return NULL;
+    if(MultiByteToWideChar(CP_UTF8, 0, value, -1, wtmp, needed) <= 0){
+        free(wtmp);
+        return NULL;
     }
-    free(wtmp);
+    return wtmp;
+}
+
+static void assign_utf8_if_empty(const char* value, wchar_t** target){
+    if(!value || !target) return;
+    if(*target) return;
+    wchar_t* wide = alloc_wide_from_utf8(value);
+    if(!wide) return;
+    *target = wide;
+}
+
+static void capture_email_header_value(const char* value, wchar_t** out){
+    assign_utf8_if_empty(value, out);
+}
+
+static void assign_wide_if_empty(const wchar_t* value, wchar_t** target){
+    if(!value || !target) return;
+    if(*target) return;
+    if(!value[0]) return;
+    wchar_t* copy = dup_wstring_local(value);
+    if(!copy) return;
+    *target = copy;
 }
 
 static char* copy_email_header_value(const char* line, size_t len, size_t prefix){
@@ -495,9 +526,11 @@ static char* copy_email_header_value(const char* line, size_t len, size_t prefix
     return tmp;
 }
 
-static wchar_t* extract_email_content(Db* db, const wchar_t* path, uint64_t* author_out, uint64_t* title_out){
-    *author_out = 0;
-    *title_out = 0;
+static wchar_t* extract_email_content(const wchar_t* path, wchar_t** author_out, wchar_t** title_out){
+    if(author_out) *author_out = NULL;
+    if(title_out) *title_out = NULL;
+    wchar_t* author_w = NULL;
+    wchar_t* title_w = NULL;
     FILE* f = _wfopen(path, L"rb");
     if(!f) return NULL;
     if(fseek(f,0,SEEK_END)!=0){ fclose(f); return NULL; }
@@ -528,7 +561,7 @@ static wchar_t* extract_email_content(Db* db, const wchar_t* path, uint64_t* aut
                 if(len > 5 && line + 5 <= header_end){
                     char* tmp = copy_email_header_value(line, len, 5);
                     if(tmp){
-                        intern_email_header_value(db, tmp, author_out);
+                        capture_email_header_value(tmp, &author_w);
                         free(tmp);
                     }
                 }
@@ -536,7 +569,7 @@ static wchar_t* extract_email_content(Db* db, const wchar_t* path, uint64_t* aut
                 if(len > 8 && line + 8 <= header_end){
                     char* tmp = copy_email_header_value(line, len, 8);
                     if(tmp){
-                        intern_email_header_value(db, tmp, title_out);
+                        capture_email_header_value(tmp, &title_w);
                         free(tmp);
                     }
                 }
@@ -552,6 +585,16 @@ static wchar_t* extract_email_content(Db* db, const wchar_t* path, uint64_t* aut
     wchar_t* wbuf = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
     if(wbuf) MultiByteToWideChar(CP_UTF8,0,body,-1,wbuf,wlen);
     free(buf);
+    if(author_out){
+        *author_out = author_w;
+    } else if(author_w){
+        free(author_w);
+    }
+    if(title_out){
+        *title_out = title_w;
+    } else if(title_w){
+        free(title_w);
+    }
     return wbuf;
 }
 
@@ -569,9 +612,11 @@ static char* strip_html_tags(const char* in){
     return out;
 }
 
-static wchar_t* extract_epub_content(Db* db, const wchar_t* path, uint64_t* author_out, uint64_t* title_out){
-    *author_out = 0;
-    *title_out = 0;
+static wchar_t* extract_epub_content(const wchar_t* path, wchar_t** author_out, wchar_t** title_out){
+    if(author_out) *author_out = NULL;
+    if(title_out) *title_out = NULL;
+    wchar_t* author_w = NULL;
+    wchar_t* title_w = NULL;
     char u8[MAX_LONG_PATH*3];
     to_utf8(path, u8, sizeof(u8));
     int err=0; zip_t* z = zip_open(u8,0,&err);
@@ -594,9 +639,9 @@ static wchar_t* extract_epub_content(Db* db, const wchar_t* path, uint64_t* auth
                 zip_file_t* of=zip_fopen(z,root,0);
                 zip_fread(of,obuf,st.size); zip_fclose(of); obuf[st.size]=0;
                 char* t=strstr(obuf,"<dc:title");
-                if(t){ t=strchr(t,'>'); if(t){ t++; char* e=strstr(t,"</dc:title>"); if(e){ char tmp[256]; size_t l=e-t; if(l>255) l=255; memcpy(tmp,t,l); tmp[l]=0; wchar_t wtmp[256]; to_wide(tmp,wtmp,256); *title_out=db_intern_wstring(db,wtmp); }}}
+                if(t){ t=strchr(t,'>'); if(t){ t++; char* e=strstr(t,"</dc:title>"); if(e){ char tmp[256]; size_t l=e-t; if(l>255) l=255; memcpy(tmp,t,l); tmp[l]=0; assign_utf8_if_empty(tmp, &title_w); }}}
                 char* a=strstr(obuf,"<dc:creator");
-                if(a){ a=strchr(a,'>'); if(a){ a++; char* e=strstr(a,"</dc:creator>"); if(e){ char tmp[256]; size_t l=e-a; if(l>255) l=255; memcpy(tmp,a,l); tmp[l]=0; wchar_t wtmp[256]; to_wide(tmp,wtmp,256); *author_out=db_intern_wstring(db,wtmp); }}}
+                if(a){ a=strchr(a,'>'); if(a){ a++; char* e=strstr(a,"</dc:creator>"); if(e){ char tmp[256]; size_t l=e-a; if(l>255) l=255; memcpy(tmp,a,l); tmp[l]=0; assign_utf8_if_empty(tmp, &author_w); }}}
                 free(obuf);
             }
         }
@@ -656,6 +701,16 @@ static wchar_t* extract_epub_content(Db* db, const wchar_t* path, uint64_t* auth
         if(wbuf) MultiByteToWideChar(CP_UTF8,0,textbuf,-1,wbuf,wlen);
         free(textbuf);
     }
+    if(author_out){
+        *author_out = author_w;
+    } else if(author_w){
+        free(author_w);
+    }
+    if(title_out){
+        *title_out = title_w;
+    } else if(title_w){
+        free(title_w);
+    }
     return wbuf;
 }
 
@@ -697,10 +752,9 @@ static void walk_pst_tree(pst_file* pf, pst_desc_tree* node, char** buf, size_t*
     }
 }
 
-static wchar_t* extract_pst_content(Db* db, const wchar_t* path, uint64_t* author_out, uint64_t* title_out){
-    *author_out = 0;
-    *title_out = 0;
-    (void)db;
+static wchar_t* extract_pst_content(const wchar_t* path, wchar_t** author_out, wchar_t** title_out){
+    if(author_out) *author_out = NULL;
+    if(title_out) *title_out = NULL;
     char u8[MAX_LONG_PATH*3];
     to_utf8(path, u8, sizeof(u8));
     pst_file pf; memset(&pf,0,sizeof(pf));
@@ -725,75 +779,485 @@ static wchar_t* extract_pst_content(Db* db, const wchar_t* path, uint64_t* autho
     return wbuf;
 }
 
-static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t* name, uint64_t* author_out, uint64_t* title_out){
-    *author_out = 0;
-    *title_out = 0;
+static uint16_t exif_rd16(const uint8_t* p, int be){
+    return be ? (uint16_t)(p[0]<<8 | p[1]) : (uint16_t)(p[1]<<8 | p[0]);
+}
+
+static uint32_t exif_rd32(const uint8_t* p, int be){
+    return be ? (uint32_t)(p[0]<<24 | p[1]<<16 | p[2]<<8 | p[3])
+               : (uint32_t)(p[3]<<24 | p[2]<<16 | p[1]<<8 | p[0]);
+}
+
+static void parse_ifd_strings(const uint8_t* base, size_t len, int be, uint32_t off,
+                              wchar_t** camera_out, wchar_t** lens_out){
+    if(off >= len) return;
+    const uint8_t* p = base + off;
+    if(p + 2 > base + len) return;
+    uint16_t count = exif_rd16(p, be); p += 2;
+    for(uint16_t i = 0; i < count; ++i){
+        if(p + 12 > base + len) return;
+        uint16_t tag = exif_rd16(p, be);
+        uint16_t type = exif_rd16(p + 2, be);
+        uint32_t num = exif_rd32(p + 4, be);
+        uint32_t valoff = exif_rd32(p + 8, be);
+        if(type == 2){
+            const uint8_t* val = NULL;
+            size_t count_bytes = (size_t)num;
+            if(num <= 4){
+                val = p + 8;
+            } else {
+                size_t offset = (size_t)valoff;
+                if(offset > len || count_bytes > len - offset){ p += 12; continue; }
+                val = base + offset;
+            }
+            size_t slen = count_bytes < 255 ? count_bytes : 255;
+            char tmp[256];
+            memcpy(tmp, val, slen);
+            tmp[slen] = 0;
+            if(tag == 0x0110){
+                assign_utf8_if_empty(tmp, camera_out);
+            } else if(tag == 0xA434){
+                assign_utf8_if_empty(tmp, lens_out);
+            }
+        } else if(tag == 0x8769){
+            parse_ifd_strings(base, len, be, valoff, camera_out, lens_out);
+        }
+        p += 12;
+    }
+}
+
+static void extract_exif_metadata_strings(const wchar_t* path, wchar_t** camera_out, wchar_t** lens_out){
+    if(camera_out) *camera_out = NULL;
+    if(lens_out) *lens_out = NULL;
+    char u8[MAX_LONG_PATH];
+    to_utf8(path, u8, sizeof(u8));
+    FILE* f = fopen(u8, "rb");
+    if(!f) return;
+    uint8_t buf[64*1024];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    const uint8_t* exif = NULL;
+    size_t len = n;
+    for(size_t i = 2; i + 4 < n; i++){
+        if(buf[i] == 0xFF){
+            uint8_t marker = buf[i+1];
+            if(marker == 0xE1){
+                uint16_t seglen = (buf[i+2]<<8) | buf[i+3];
+                if(i + 4 + 6 < n && memcmp(buf + i + 4, "Exif\0\0", 6) == 0){
+                    exif = buf + i + 10;
+                    len = seglen - 8;
+                    break;
+                }
+                i += 1 + seglen;
+            } else {
+                uint16_t seglen = (buf[i+2]<<8) | buf[i+3];
+                i += 1 + seglen;
+            }
+        }
+    }
+    if(!exif) return;
+    int be;
+    if(exif[0]=='M' && exif[1]=='M') be=1;
+    else if(exif[0]=='I' && exif[1]=='I') be=0;
+    else return;
+    uint32_t ifd0 = exif_rd32(exif+4, be);
+    parse_ifd_strings(exif, len, be, ifd0, camera_out, lens_out);
+}
+
+static void extract_id3_metadata_strings(const wchar_t* path, wchar_t** artist_out, wchar_t** album_out){
+    if(artist_out) *artist_out = NULL;
+    if(album_out) *album_out = NULL;
+    wchar_t* artist_local = NULL;
+    wchar_t* album_local = NULL;
+    char u8[MAX_LONG_PATH];
+    to_utf8(path, u8, sizeof(u8));
+    FILE* f = fopen(u8, "rb");
+    if(!f) return;
+    uint8_t hdr[10];
+    if(fread(hdr,1,10,f)==10 && memcmp(hdr,"ID3",3)==0){
+        uint32_t size = ((hdr[6]&0x7F)<<21)|((hdr[7]&0x7F)<<14)|((hdr[8]&0x7F)<<7)|(hdr[9]&0x7F);
+        uint8_t* buf=(uint8_t*)malloc(size);
+        if(buf){
+            size_t got=fread(buf,1,size,f);
+            size_t pos=0;
+            while(pos+10<=got){
+                char id[5]; memcpy(id,buf+pos,4); id[4]=0;
+                uint32_t fsize=(buf[pos+4]<<24)|(buf[pos+5]<<16)|(buf[pos+6]<<8)|buf[pos+7];
+                if(fsize==0||pos+10+fsize>got) break;
+                uint8_t enc=buf[pos+10];
+                const uint8_t* data=buf+pos+11; size_t dlen=fsize-1;
+                char tmp[256]={0};
+                if(enc==0||enc==3){
+                    size_t len=dlen<255?dlen:255; memcpy(tmp,data,len); tmp[len]=0;
+                } else if(enc==1 && dlen>=2){
+                    const uint8_t* p=data;
+                    if(p[0]==0xFF && p[1]==0xFE){
+                        p+=2; dlen-=2;
+                        wchar_t wtmp[256]; size_t wlen=0;
+                        while(dlen>=2 && wlen<255){
+                            wchar_t ch=p[0]|(p[1]<<8); if(ch==0) break;
+                            wtmp[wlen++]=ch; p+=2; dlen-=2;
+                        }
+                        wtmp[wlen]=0; assign_wide_if_empty(wtmp, strcmp(id,"TPE1")==0?&artist_local:&album_local);
+                    } else if(p[0]==0xFE && p[1]==0xFF){
+                        p+=2; dlen-=2;
+                        wchar_t wtmp[256]; size_t wlen=0;
+                        while(dlen>=2 && wlen<255){
+                            wchar_t ch=(p[0]<<8)|p[1]; if(ch==0) break;
+                            wtmp[wlen++]=ch; p+=2; dlen-=2;
+                        }
+                        wtmp[wlen]=0; assign_wide_if_empty(wtmp, strcmp(id,"TPE1")==0?&artist_local:&album_local);
+                    }
+                }
+                if(tmp[0]){
+                    if(strcmp(id,"TPE1")==0) assign_utf8_if_empty(tmp, &artist_local);
+                    else if(strcmp(id,"TALB")==0) assign_utf8_if_empty(tmp, &album_local);
+                }
+                pos+=10+fsize;
+            }
+            free(buf);
+        }
+        fclose(f);
+    } else {
+        fseek(f,-128,SEEK_END);
+        uint8_t v1[128];
+        if(fread(v1,1,128,f)==128 && memcmp(v1,"TAG",3)==0){
+            char tmp[31]; memcpy(tmp,v1+33,30); tmp[30]=0;
+            if(tmp[0]) assign_utf8_if_empty(tmp, &artist_local);
+            char tmp2[31]; memcpy(tmp2,v1+63,30); tmp2[30]=0;
+            if(tmp2[0]) assign_utf8_if_empty(tmp2, &album_local);
+        }
+        fclose(f);
+    }
+    if(artist_out){
+        *artist_out = artist_local;
+    } else if(artist_local){
+        free(artist_local);
+    }
+    if(album_out){
+        *album_out = album_local;
+    } else if(album_local){
+        free(album_local);
+    }
+}
+
+static BOOL index_file_content(const wchar_t* parent,
+                               const wchar_t* name,
+                               wchar_t** content_out,
+                               wchar_t** author_out,
+                               wchar_t** title_out){
+    if(content_out) *content_out = NULL;
+    if(author_out) *author_out = NULL;
+    if(title_out) *title_out = NULL;
     ContentMode mode = get_content_mode(name);
-    if(mode==CONTENT_NONE) return 0;
+    if(mode == CONTENT_NONE) return TRUE;
     wchar_t path[MAX_LONG_PATH];
     _snwprintf(path, MAX_LONG_PATH, L"%s\\%s", parent, name);
 
+    wchar_t* author_local = NULL;
+    wchar_t* title_local = NULL;
     wchar_t* wbuf = NULL;
+
     if(mode == CONTENT_TEXT){
         size_t raw_len = 0;
         char* buf = read_text_file_sequential(path, &raw_len);
-        if(!buf) return 0;
-        if(memchr(buf, '\0', raw_len)){ free(buf); return 0; }
-        char* a = StrStrIA(buf, "author:");
-        if(a){
-            a += 7;
-            while(*a==' '||*a=='\t') a++;
-            char tmp[256]; size_t len=0;
-            while(a[len] && a[len]!='\r' && a[len]!='\n' && len<255) len++;
-            memcpy(tmp,a,len); tmp[len]=0;
-            wchar_t wa[256]; to_wide(tmp, wa, 256);
-            *author_out = db_intern_wstring(db, wa);
+        if(buf){
+            if(!memchr(buf, '\0', raw_len)){
+                char* a = StrStrIA(buf, "author:");
+                if(a){
+                    a += 7;
+                    while(*a==' '||*a=='\t') a++;
+                    char tmp[256]; size_t len=0;
+                    while(a[len] && a[len]!='\r' && a[len]!='\n' && len<255) len++;
+                    memcpy(tmp,a,len); tmp[len]=0;
+                    assign_utf8_if_empty(tmp, &author_local);
+                }
+                char* t = StrStrIA(buf, "title:");
+                if(t){
+                    t += 6;
+                    while(*t==' '||*t=='\t') t++;
+                    char tmp[256]; size_t len=0;
+                    while(t[len] && t[len]!='\r' && t[len]!='\n' && len<255) len++;
+                    memcpy(tmp,t,len); tmp[len]=0;
+                    assign_utf8_if_empty(tmp, &title_local);
+                }
+                int wlen = MultiByteToWideChar(CP_UTF8,0,buf,-1,NULL,0);
+                wbuf = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
+                if(wbuf) MultiByteToWideChar(CP_UTF8,0,buf,-1,wbuf,wlen);
+            }
+            free(buf);
         }
-        char* t = StrStrIA(buf, "title:");
-        if(t){
-            t += 6;
-            while(*t==' '||*t=='\t') t++;
-            char tmp[256]; size_t len=0;
-            while(t[len] && t[len]!='\r' && t[len]!='\n' && len<255) len++;
-            memcpy(tmp,t,len); tmp[len]=0;
-            wchar_t wt[256]; to_wide(tmp, wt, 256);
-            *title_out = db_intern_wstring(db, wt);
-        }
-        int wlen = MultiByteToWideChar(CP_UTF8,0,buf,-1,NULL,0);
-        wbuf = (wchar_t*)malloc(sizeof(wchar_t)*wlen);
-        if(wbuf) MultiByteToWideChar(CP_UTF8,0,buf,-1,wbuf,wlen);
-        free(buf);
     } else if(mode == CONTENT_IFILTER){
         wbuf = extract_with_filter(path);
     } else if(mode == CONTENT_EMAIL){
-        wbuf = extract_email_content(db, path, author_out, title_out);
+        wbuf = extract_email_content(path, &author_local, &title_local);
     } else if(mode == CONTENT_EPUB){
-        wbuf = extract_epub_content(db, path, author_out, title_out);
+        wbuf = extract_epub_content(path, &author_local, &title_local);
     } else if(mode == CONTENT_PST){
-        wbuf = extract_pst_content(db, path, author_out, title_out);
+        wbuf = extract_pst_content(path, &author_local, &title_local);
     }
-    if(!wbuf) return 0;
-    wchar_t* meta_a = StrStrIW(wbuf, L"author:");
-    if(meta_a){
-        meta_a += 7;
-        while(*meta_a==L' '||*meta_a==L'\t') meta_a++;
-        wchar_t tmp[256]; size_t len=0;
-        while(meta_a[len] && meta_a[len]!=L'\r' && meta_a[len]!=L'\n' && len<255) len++;
-        wcsncpy_s(tmp,256,meta_a,len);
-        *author_out = db_intern_wstring(db, tmp);
+
+    if(!wbuf){
+        if(author_out){
+            *author_out = author_local;
+        } else if(author_local){
+            free(author_local);
+        }
+        if(title_out){
+            *title_out = title_local;
+        } else if(title_local){
+            free(title_local);
+        }
+        return TRUE;
     }
-    wchar_t* meta_t = StrStrIW(wbuf, L"title:");
-    if(meta_t){
-        meta_t += 6;
-        while(*meta_t==L' '||*meta_t==L'\t') meta_t++;
-        wchar_t tmp[256]; size_t len=0;
-        while(meta_t[len] && meta_t[len]!=L'\r' && meta_t[len]!=L'\n' && len<255) len++;
-        wcsncpy_s(tmp,256,meta_t,len);
-        *title_out = db_intern_wstring(db, tmp);
+
+    if(!author_local){
+        wchar_t* meta_a = StrStrIW(wbuf, L"author:");
+        if(meta_a){
+            meta_a += 7;
+            while(*meta_a==L' '||*meta_a==L'\t') meta_a++;
+            wchar_t tmp[256]; size_t len=0;
+            while(meta_a[len] && meta_a[len]!=L'\r' && meta_a[len]!=L'\n' && len<255) len++;
+            wcsncpy_s(tmp,256,meta_a,len);
+            assign_wide_if_empty(tmp, &author_local);
+        }
     }
-    uint64_t id = db_intern_wstring(db, wbuf);
-    free(wbuf);
-    return id;
+    if(!title_local){
+        wchar_t* meta_t = StrStrIW(wbuf, L"title:");
+        if(meta_t){
+            meta_t += 6;
+            while(*meta_t==L' '||*meta_t==L'\t') meta_t++;
+            wchar_t tmp[256]; size_t len=0;
+            while(meta_t[len] && meta_t[len]!=L'\r' && meta_t[len]!=L'\n' && len<255) len++;
+            wcsncpy_s(tmp,256,meta_t,len);
+            assign_wide_if_empty(tmp, &title_local);
+        }
+    }
+
+    if(content_out){
+        *content_out = wbuf;
+    } else {
+        free(wbuf);
+    }
+
+    if(author_out){
+        *author_out = author_local;
+    } else if(author_local){
+        free(author_local);
+    }
+    if(title_out){
+        *title_out = title_local;
+    } else if(title_local){
+        free(title_local);
+    }
+    return TRUE;
+}
+
+static void content_work_item_cleanup(ContentWorkItem* wi, BOOL free_self){
+    if(!wi) return;
+    if(wi->initial_content){
+        free(wi->initial_content);
+        wi->initial_content = NULL;
+    }
+    if(wi->initial_preview){
+        free(wi->initial_preview);
+        wi->initial_preview = NULL;
+    }
+    if(free_self) free(wi);
+}
+
+static ContentWorkItem* content_work_item_from_dbwork(DbWorkItem* wi, const DbRecord* base){
+    if(!wi || !base) return NULL;
+    ContentWorkItem* cwi = (ContentWorkItem*)calloc(1, sizeof(ContentWorkItem));
+    if(!cwi) return NULL;
+    cwi->rec_id = base->rec_id;
+    cwi->base_record = *base;
+    wcscpy_s(cwi->parent_path, MAX_LONG_PATH, wi->parent_path);
+    wcscpy_s(cwi->name, MAX_PATH, wi->name);
+    cwi->initial_content = wi->content;
+    wi->content = NULL;
+    cwi->initial_preview = wi->preview;
+    wi->preview = NULL;
+    cwi->clone_id = wi->clone_id;
+    cwi->attributes = wi->attributes;
+    return cwi;
+}
+
+static void content_result_free(ContentResultItem* result){
+    if(!result) return;
+    if(result->content_text){ free(result->content_text); result->content_text = NULL; }
+    if(result->preview_text){ free(result->preview_text); result->preview_text = NULL; }
+    if(result->author_text){ free(result->author_text); result->author_text = NULL; }
+    if(result->title_text){ free(result->title_text); result->title_text = NULL; }
+    if(result->camera_text){ free(result->camera_text); result->camera_text = NULL; }
+    if(result->lens_text){ free(result->lens_text); result->lens_text = NULL; }
+    if(result->artist_text){ free(result->artist_text); result->artist_text = NULL; }
+    if(result->album_text){ free(result->album_text); result->album_text = NULL; }
+    free(result);
+}
+
+static ContentResultItem* content_process_item(ContentWorkItem* wi, CancelToken* cancel){
+    if(!wi) return NULL;
+    ContentResultItem* result = (ContentResultItem*)calloc(1, sizeof(ContentResultItem));
+    if(!result) return NULL;
+    result->rec_id = wi->rec_id;
+    result->base_record = wi->base_record;
+    wcscpy_s(result->parent_path, MAX_LONG_PATH, wi->parent_path);
+    wcscpy_s(result->name, MAX_PATH, wi->name);
+    result->success = TRUE;
+
+    if(is_cancelled(cancel)){
+        result->success = FALSE;
+        return result;
+    }
+
+    wchar_t full[MAX_LONG_PATH];
+    _snwprintf(full, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
+
+    if(wi->initial_content){
+        result->content_text = wi->initial_content;
+        wi->initial_content = NULL;
+    } else {
+        wchar_t* content_text = NULL;
+        wchar_t* author_text = NULL;
+        wchar_t* title_text = NULL;
+        if(index_file_content(wi->parent_path, wi->name, &content_text, &author_text, &title_text)){
+            result->content_text = content_text;
+            result->author_text = author_text;
+            result->title_text = title_text;
+        } else {
+            if(content_text) free(content_text);
+            if(author_text) free(author_text);
+            if(title_text) free(title_text);
+        }
+    }
+
+    if(wi->initial_preview){
+        result->preview_text = wi->initial_preview;
+        wi->initial_preview = NULL;
+    } else if(needs_thumbnail(wi->name)){
+        result->preview_text = GenerateThumbnail(full);
+    }
+
+    wchar_t* camera = NULL;
+    wchar_t* lens = NULL;
+    extract_exif_metadata_strings(full, &camera, &lens);
+    result->camera_text = camera;
+    result->lens_text = lens;
+
+    wchar_t* artist = NULL;
+    wchar_t* album = NULL;
+    extract_id3_metadata_strings(full, &artist, &album);
+    result->artist_text = artist;
+    result->album_text = album;
+
+    result->needs_archive_index = is_archive_file(wi->name);
+
+    if(!is_cancelled(cancel)){
+        result->hash_crc = crc64_file(full, cancel, NULL, NULL);
+        result->has_hash = TRUE;
+    } else {
+        result->success = FALSE;
+    }
+
+    return result;
+}
+
+static BOOL writer_apply_content_result(WriterCtx* ctx,
+                                        ContentResultItem* result,
+                                        DbRecord** buf,
+                                        size_t* buf_capacity,
+                                        size_t* in_batch,
+                                        BOOL* batch_requires_sync,
+                                        BatchInternRequest** intern_requests,
+                                        size_t* intern_count,
+                                        size_t* intern_capacity){
+    if(!ctx || !result) return TRUE;
+    if(!result->success) return TRUE;
+    DbRecord record = result->base_record;
+    if(result->content_text){
+        if(!writer_add_intern_request(intern_requests, intern_count, intern_capacity, result->content_text, &record.content_str_id, NULL)){
+            return FALSE;
+        }
+        result->content_text = NULL;
+    }
+    if(result->author_text){
+        if(!writer_add_intern_request(intern_requests, intern_count, intern_capacity, result->author_text, &record.author_str_id, NULL)){
+            return FALSE;
+        }
+        result->author_text = NULL;
+    }
+    if(result->title_text){
+        if(!writer_add_intern_request(intern_requests, intern_count, intern_capacity, result->title_text, &record.title_str_id, NULL)){
+            return FALSE;
+        }
+        result->title_text = NULL;
+    }
+    if(result->preview_text){
+        if(!writer_add_intern_request(intern_requests, intern_count, intern_capacity, result->preview_text, &record.preview_str_id, NULL)){
+            return FALSE;
+        }
+        result->preview_text = NULL;
+    }
+    if(result->camera_text){
+        if(!writer_add_intern_request(intern_requests, intern_count, intern_capacity, result->camera_text, &record.camera_str_id, NULL)){
+            return FALSE;
+        }
+        result->camera_text = NULL;
+    }
+    if(result->lens_text){
+        if(!writer_add_intern_request(intern_requests, intern_count, intern_capacity, result->lens_text, &record.lens_str_id, NULL)){
+            return FALSE;
+        }
+        result->lens_text = NULL;
+    }
+    if(result->artist_text){
+        if(!writer_add_intern_request(intern_requests, intern_count, intern_capacity, result->artist_text, &record.artist_str_id, NULL)){
+            return FALSE;
+        }
+        result->artist_text = NULL;
+    }
+    if(result->album_text){
+        if(!writer_add_intern_request(intern_requests, intern_count, intern_capacity, result->album_text, &record.album_str_id, NULL)){
+            return FALSE;
+        }
+        result->album_text = NULL;
+    }
+    if(result->has_hash){
+        record.hash_crc = result->hash_crc;
+    }
+    if(!writer_ensure_record_capacity(buf, buf_capacity, *in_batch + 1)){
+        return FALSE;
+    }
+    (*buf)[(*in_batch)++] = record;
+    if(batch_requires_sync) *batch_requires_sync = TRUE;
+    if(result->needs_archive_index){
+        wchar_t full[MAX_LONG_PATH];
+        _snwprintf(full, MAX_LONG_PATH, L"%s\\%s", result->parent_path, result->name);
+        index_archive(ctx->db, full);
+    }
+    return TRUE;
+}
+
+static BOOL writer_process_content_results(WriterCtx* ctx,
+                                           DbRecord** buf,
+                                           size_t* buf_capacity,
+                                           size_t* in_batch,
+                                           BOOL* batch_requires_sync,
+                                           BatchInternRequest** intern_requests,
+                                           size_t* intern_count,
+                                           size_t* intern_capacity){
+    if(!ctx || !ctx->content_pool) return TRUE;
+    void* item = NULL;
+    while(MPMC_Pop(&ctx->content_pool->result_queue, &item)){
+        if(!item) continue;
+        ContentResultItem* result = (ContentResultItem*)item;
+        BOOL ok = writer_apply_content_result(ctx, result, buf, buf_capacity, in_batch, batch_requires_sync,
+                                              intern_requests, intern_count, intern_capacity);
+        content_result_free(result);
+        if(!ok) return FALSE;
+    }
+    return TRUE;
 }
 
 BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size){
@@ -1121,6 +1585,7 @@ typedef struct WriterCtx {
     volatile BOOL done;
     MPMCQueue queue;
     CancelToken cancel;
+    ContentThreadPool* content_pool;
     size_t grow_attempts;
     DbWorkItem** backlog;
     size_t backlog_head;
@@ -1134,6 +1599,8 @@ typedef struct WriterCtx {
     size_t consecutive_full_batches;
     size_t consecutive_idle_waits;
     WriterSignal data_signal;
+    int content_threads;
+    wchar_t db_path[MAX_PATH];
 } WriterCtx;
 
 static const size_t MAP_GROWTH_INCREMENT = 1ull * 1024ull * 1024ull * 1024ull; // 1 GB
@@ -1253,6 +1720,198 @@ static BOOL push_with_backoff(MPMCQueue* q, void* data, DWORD timeout_ms, const 
     }
 }
 
+typedef struct ContentWorkerCtx {
+    ContentThreadPool* pool;
+    Db* ro_db;
+} ContentWorkerCtx;
+
+#ifdef _WIN32
+static unsigned __stdcall content_worker_thread(void* param)
+#else
+static void* content_worker_thread(void* param)
+#endif
+{
+    ContentWorkerCtx* wctx = (ContentWorkerCtx*)param;
+    ContentThreadPool* pool = wctx ? wctx->pool : NULL;
+    if(!pool){
+        if(wctx){
+            if(wctx->ro_db) db_close(wctx->ro_db);
+            free(wctx);
+        }
+#ifdef _WIN32
+        return 0;
+#else
+        return NULL;
+#endif
+    }
+    for(;;){
+        void* item = NULL;
+        if(!MPMC_Pop(&pool->work_queue, &item)){
+            if(pool->shutting_down){
+                Sleep(1);
+                continue;
+            }
+            Sleep(1);
+            continue;
+        }
+        if(item == NULL){
+            break;
+        }
+        ContentWorkItem* wi = (ContentWorkItem*)item;
+        ContentResultItem* result = content_process_item(wi, pool->cancel_token);
+        if(result){
+            if(!push_with_backoff(&pool->result_queue, result, INFINITE, "content result")){
+                content_result_free(result);
+            }
+        }
+        content_work_item_cleanup(wi, TRUE);
+        atomic_dec64(&pool->pending);
+        if(pool->shutting_down && atomic_load64(&pool->pending) == 0){
+            // continue draining until sentinel arrives
+        }
+    }
+    if(wctx){
+        if(wctx->ro_db) db_close(wctx->ro_db);
+        free(wctx);
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static ContentThreadPool* content_pool_create(const wchar_t* db_path, CancelToken* cancel, int threads){
+    if(!cancel || threads <= 0) return NULL;
+    ContentThreadPool* pool = (ContentThreadPool*)calloc(1, sizeof(ContentThreadPool));
+    if(!pool) return NULL;
+    if(!MPMC_Init(&pool->work_queue, 1 << 12)){
+        free(pool);
+        return NULL;
+    }
+    if(!MPMC_Init(&pool->result_queue, 1 << 12)){
+        MPMC_Destroy(&pool->work_queue);
+        free(pool);
+        return NULL;
+    }
+    pool->cancel_token = cancel;
+    pool->thread_count = threads;
+    pool->pending = 0;
+    pool->shutting_down = FALSE;
+    if(db_path){
+        wcsncpy_s(pool->db_path, MAX_PATH, db_path, _TRUNCATE);
+    } else {
+        pool->db_path[0] = 0;
+    }
+    for(int i = 0; i < threads; ++i){
+        ContentWorkerCtx* wctx = (ContentWorkerCtx*)calloc(1, sizeof(ContentWorkerCtx));
+        if(!wctx){
+            pool->thread_count = i;
+            pool->shutting_down = TRUE;
+            goto fail;
+        }
+        wctx->pool = pool;
+        wctx->ro_db = NULL;
+        if(pool->db_path[0]){
+            Db* ro_db = NULL;
+            if(db_open_readonly(pool->db_path, &ro_db)){
+                wctx->ro_db = ro_db;
+            }
+        }
+        pool->worker_contexts[i] = wctx;
+#ifdef _WIN32
+        uintptr_t th = _beginthreadex(NULL, 0, content_worker_thread, wctx, 0, NULL);
+        if(!th){
+            if(wctx->ro_db) db_close(wctx->ro_db);
+            free(wctx);
+            pool->worker_contexts[i] = NULL;
+            pool->thread_count = i;
+            pool->shutting_down = TRUE;
+            goto fail;
+        }
+        pool->threads[i] = (HANDLE)th;
+#else
+        if(pthread_create(&pool->threads[i], NULL, content_worker_thread, wctx) != 0){
+            if(wctx->ro_db) db_close(wctx->ro_db);
+            free(wctx);
+            pool->worker_contexts[i] = NULL;
+            pool->thread_count = i;
+            pool->shutting_down = TRUE;
+            goto fail;
+        }
+#endif
+    }
+    return pool;
+fail:
+    for(int j = 0; j < pool->thread_count; ++j){
+        if(pool->worker_contexts[j]){
+            // threads already created will clean up their context on exit
+        }
+    }
+    pool->shutting_down = TRUE;
+    for(int j = 0; j < pool->thread_count; ++j){
+        push_with_backoff(&pool->work_queue, NULL, INFINITE, "content shutdown");
+    }
+#ifdef _WIN32
+    WaitForMultipleObjects(pool->thread_count, pool->threads, TRUE, INFINITE);
+    for(int j=0;j<pool->thread_count;j++){
+        if(pool->threads[j]) CloseHandle(pool->threads[j]);
+    }
+#else
+    for(int j=0;j<pool->thread_count;j++){
+        if(pool->threads[j]) pthread_join(pool->threads[j], NULL);
+    }
+#endif
+    MPMC_Destroy(&pool->work_queue);
+    MPMC_Destroy(&pool->result_queue);
+    free(pool);
+    return NULL;
+}
+
+static BOOL content_pool_submit(ContentThreadPool* pool, ContentWorkItem* wi){
+    if(!pool || !wi) return FALSE;
+    atomic_inc64(&pool->pending);
+    if(push_with_backoff(&pool->work_queue, wi, INFINITE, "content work")){
+        return TRUE;
+    }
+    atomic_dec64(&pool->pending);
+    return FALSE;
+}
+
+static LONG64 content_pool_pending(const ContentThreadPool* pool){
+    if(!pool) return 0;
+    return atomic_load64(&pool->pending);
+}
+
+static void content_pool_shutdown(ContentThreadPool* pool){
+    if(!pool) return;
+    pool->shutting_down = TRUE;
+    for(int i = 0; i < pool->thread_count; ++i){
+        push_with_backoff(&pool->work_queue, NULL, INFINITE, "content shutdown");
+    }
+#ifdef _WIN32
+    if(pool->thread_count > 0){
+        WaitForMultipleObjects(pool->thread_count, pool->threads, TRUE, INFINITE);
+    }
+    for(int i = 0; i < pool->thread_count; ++i){
+        if(pool->threads[i]){
+            CloseHandle(pool->threads[i]);
+            pool->threads[i] = NULL;
+        }
+    }
+#else
+    for(int i = 0; i < pool->thread_count; ++i){
+        if(pool->threads[i]){
+            pthread_join(pool->threads[i], NULL);
+            pool->threads[i] = 0;
+        }
+    }
+#endif
+    MPMC_Destroy(&pool->work_queue);
+    MPMC_Destroy(&pool->result_queue);
+    free(pool);
+}
+
 static BOOL writer_enqueue(WriterCtx* ctx, DbWorkItem* wi, const char* stage){
     if(!ctx || !wi) return FALSE;
     if(push_with_backoff(&ctx->queue, wi, ctx->push_timeout_ms, stage)){
@@ -1287,6 +1946,13 @@ static DWORD WINAPI DbWriterThread(void* p){
     if(ctx->batch_size < ctx->min_batch_size) ctx->batch_size = ctx->min_batch_size;
     if(ctx->batch_size > ctx->max_batch_size) ctx->batch_size = ctx->max_batch_size;
 
+    if(ctx->content_threads > 0 && !ctx->content_pool){
+        ctx->content_pool = content_pool_create(ctx->db_path, &ctx->cancel, ctx->content_threads);
+        if(!ctx->content_pool){
+            fprintf(stderr, "DbWriterThread: failed to start content processing pool, continuing synchronously\n");
+        }
+    }
+
     size_t buf_capacity = ctx->batch_size > 0 ? (size_t)ctx->batch_size : 1;
     DbRecord* buf = (DbRecord*)malloc(sizeof(DbRecord) * buf_capacity);
     if(!buf) return 1;
@@ -1300,9 +1966,22 @@ static DWORD WINAPI DbWriterThread(void* p){
 
     for(;;){
         writer_drain_backlog(ctx);
+        if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                           &intern_requests, &intern_count, &intern_capacity)){
+            success = FALSE;
+            goto cleanup;
+        }
         void* item = NULL;
         if(!MPMC_Pop(&ctx->queue, &item)){
-            if(ctx->done && ctx->backlog_count == 0) break;
+            if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                               &intern_requests, &intern_count, &intern_capacity)){
+                success = FALSE;
+                goto cleanup;
+            }
+            if(ctx->done && ctx->backlog_count == 0){
+                LONG64 pending = ctx->content_pool ? content_pool_pending(ctx->content_pool) : 0;
+                if(pending == 0) break;
+            }
             BOOL timed_out = FALSE;
             if(!writer_signal_wait(&ctx->data_signal, ctx->idle_wait_ms, &timed_out)){
                 Sleep(1);
@@ -1319,7 +1998,8 @@ static DWORD WINAPI DbWriterThread(void* p){
             continue;
         }
         if(item == NULL){
-            if(ctx->backlog_count == 0) break;
+            LONG64 pending = ctx->content_pool ? content_pool_pending(ctx->content_pool) : 0;
+            if(ctx->backlog_count == 0 && pending == 0) break;
             ctx->done = TRUE;
             continue;
         }
@@ -1425,45 +2105,49 @@ static DWORD WINAPI DbWriterThread(void* p){
             DbRecord existing;
             if(db_get_record_by_path(ctx->db, wi->parent_path, wi->name, &existing)){
                 if(existing.type == DB_REC_FILE){
-                    DbRecord rfull = existing;
-                    wchar_t fpath[MAX_LONG_PATH];
-                    _snwprintf(fpath, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
-                    if(wi->content){
-                        wchar_t* owned = wi->content;
-                        wi->content = NULL;
-                        if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, owned, &rfull.content_str_id, NULL)){
-                            aligned_free(wi);
-                            success = FALSE;
-                            goto cleanup;
-                        }
-                    } else {
-                        rfull.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &rfull.author_str_id, &rfull.title_str_id);
-                        wi->content = NULL;
-                    }
-                    if(wi->preview){
-                        wchar_t* owned = wi->preview;
-                        wi->preview = NULL;
-                        if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, owned, &rfull.preview_str_id, NULL)){
-                            aligned_free(wi);
-                            success = FALSE;
-                            goto cleanup;
-                        }
-                    } else if(needs_thumbnail(wi->name)){
-                        wchar_t* thumb = GenerateThumbnail(fpath);
-                        if(thumb){
-                            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, thumb, &rfull.preview_str_id, NULL)){
-                                success = FALSE;
-                                aligned_free(wi);
-                                goto cleanup;
+                    BOOL offloaded = FALSE;
+                    if(ctx->content_pool){
+                        ContentWorkItem* cwi = content_work_item_from_dbwork(wi, &existing);
+                        if(cwi){
+                            if(content_pool_submit(ctx->content_pool, cwi)){
+                                offloaded = TRUE;
+                            } else {
+                                wi->content = cwi->initial_content;
+                                wi->preview = cwi->initial_preview;
+                                cwi->initial_content = NULL;
+                                cwi->initial_preview = NULL;
+                                content_work_item_cleanup(cwi, TRUE);
                             }
                         }
-                        wi->preview = NULL;
                     }
-                    extract_exif_metadata(ctx->db, fpath, &rfull);
-                    extract_id3_metadata(ctx->db, fpath, &rfull);
-                    if(is_archive_file(wi->name)){ index_archive(ctx->db, fpath); }
-                    rfull.hash_crc = crc64_file(fpath, &ctx->cancel, NULL, NULL);
-                    buf[in_batch++] = rfull;
+                    if(offloaded){
+                        aligned_free(wi);
+                        continue;
+                    }
+                    ContentWorkItem stack_item;
+                    memset(&stack_item, 0, sizeof(stack_item));
+                    stack_item.rec_id = existing.rec_id;
+                    stack_item.base_record = existing;
+                    wcscpy_s(stack_item.parent_path, MAX_LONG_PATH, wi->parent_path);
+                    wcscpy_s(stack_item.name, MAX_PATH, wi->name);
+                    stack_item.initial_content = wi->content;
+                    stack_item.initial_preview = wi->preview;
+                    stack_item.clone_id = wi->clone_id;
+                    stack_item.attributes = wi->attributes;
+                    wi->content = NULL;
+                    wi->preview = NULL;
+                    ContentResultItem* immediate = content_process_item(&stack_item, &ctx->cancel);
+                    content_work_item_cleanup(&stack_item, FALSE);
+                    if(immediate){
+                        BOOL applied = writer_apply_content_result(ctx, immediate, &buf, &buf_capacity, &in_batch,
+                                                                   &batch_requires_sync, &intern_requests, &intern_count, &intern_capacity);
+                        content_result_free(immediate);
+                        if(!applied){
+                            aligned_free(wi);
+                            success = FALSE;
+                            goto cleanup;
+                        }
+                    }
                 }
             }
             aligned_free(wi);
@@ -1492,6 +2176,22 @@ static DWORD WINAPI DbWriterThread(void* p){
         }
     }
 
+    if(ctx->content_pool){
+        while(content_pool_pending(ctx->content_pool) > 0){
+            if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                               &intern_requests, &intern_count, &intern_capacity)){
+                success = FALSE;
+                goto cleanup;
+            }
+            Sleep(1);
+        }
+        if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                           &intern_requests, &intern_count, &intern_capacity)){
+            success = FALSE;
+            goto cleanup;
+        }
+    }
+
     if(in_batch){
         if(!writer_finalize_batch(ctx, intern_requests, &intern_count)){
             success = FALSE;
@@ -1510,6 +2210,10 @@ cleanup:
     writer_release_intern_requests(intern_requests, intern_count);
     free(intern_requests);
     free(buf);
+    if(ctx->content_pool){
+        content_pool_shutdown(ctx->content_pool);
+        ctx->content_pool = NULL;
+    }
     writer_backlog_free(ctx);
     return success ? 0 : 1;
 }
@@ -1606,6 +2310,12 @@ int wmain(int argc, wchar_t** argv){
 
     WriterCtx ctx = {0};
     ctx.db = db; ctx.batch_size = args.batch; ctx.done=FALSE; ctx.cancel.signaled = FALSE;
+    ctx.content_pool = NULL;
+    ctx.content_threads = args.threads;
+    if(ctx.content_threads < 1) ctx.content_threads = 1;
+    if(ctx.content_threads > MAX_THREADS) ctx.content_threads = MAX_THREADS;
+    if(ctx.content_threads > 4) ctx.content_threads = 4;
+    wcscpy_s(ctx.db_path, MAX_PATH, args.dbPath);
     size_t desired_queue = (size_t)args.threads * (size_t)args.batch;
     size_t min_queue = (size_t)args.threads * 4096;
     if(desired_queue < min_queue) desired_queue = min_queue;
