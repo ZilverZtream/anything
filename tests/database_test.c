@@ -6,6 +6,7 @@
 #include <wchar.h>
 
 #include "../database.h"
+#include "../lmdb.h"
 
 extern void extract_trigrams(const char* text, uint32_t** out_tris, size_t* out_count);
 extern uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom);
@@ -24,6 +25,52 @@ static void make_temp_dir(wchar_t* out, size_t outsz){
     char* dir = mkdtemp(tmpl);
     assert(dir);
     mbstowcs(out, dir, outsz);
+}
+
+typedef struct {
+    uint32_t trigram_count;
+    uint8_t  hash_count;
+    uint8_t  bloom_log2;
+    uint8_t  magic0;
+    uint8_t  magic1;
+    uint64_t bloom_offset;
+    uint32_t bloom_length;
+} TestStringMeta;
+
+#define STRING_META_MAGIC0 'B'
+#define STRING_META_MAGIC1 'F'
+
+static int read_string_meta(const wchar_t* path, uint64_t id, TestStringMeta* out){
+    MDB_env* env = NULL;
+    if(mdb_env_create(&env) != 0) return 0;
+    mdb_env_set_maxdbs(env, 32);
+    char utf8[MAX_PATH * 3];
+    size_t conv = wcstombs(utf8, path, sizeof(utf8));
+    if(conv == (size_t)-1 || conv >= sizeof(utf8)){
+        mdb_env_close(env);
+        return 0;
+    }
+    utf8[conv] = '\0';
+    if(mdb_env_open(env, utf8, MDB_RDONLY, 0664) != 0){ mdb_env_close(env); return 0; }
+    MDB_txn* txn = NULL;
+    if(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn) != 0){ mdb_env_close(env); return 0; }
+    MDB_dbi dbi;
+    if(mdb_dbi_open(txn, "strings", 0, &dbi) != 0){ mdb_txn_abort(txn); mdb_env_close(env); return 0; }
+    MDB_val key = {.mv_data = (void*)&id, .mv_size = sizeof(id)};
+    MDB_val val;
+    int rc = mdb_get(txn, dbi, &key, &val);
+    int ok = 0;
+    if(rc == 0 && val.mv_size >= sizeof(TestStringMeta)){
+        const uint8_t* base = (const uint8_t*)val.mv_data;
+        const TestStringMeta* sm = (const TestStringMeta*)(base + val.mv_size - sizeof(TestStringMeta));
+        if(sm->magic0 == STRING_META_MAGIC0 && sm->magic1 == STRING_META_MAGIC1){
+            if(out) *out = *sm;
+            ok = 1;
+        }
+    }
+    mdb_txn_abort(txn);
+    mdb_env_close(env);
+    return ok;
 }
 
 static void test_db_intern_wstring(){
@@ -48,14 +95,18 @@ static void test_trigram_bloom(){
     assert(count == 2);
     assert(tris[0] == (((uint32_t)'a'<<16)|((uint32_t)'b'<<8)|'c'));
     assert(tris[1] == (((uint32_t)'b'<<16)|((uint32_t)'c'<<8)|'d'));
+    static const char* long_name =
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
     uint8_t bloom[8192];
-    uint32_t tc = build_bloom_for_name("abc", bloom);
-    assert(tc == 1);
+    uint32_t tc = build_bloom_for_name(long_name, bloom);
+    assert(tc > 0);
     uint32_t hs[4];
-    build_bloom_hashes_simd("abc", hs);
+    build_bloom_hashes_simd("abcd", hs);
     for(int i=0;i<4;i++){
         assert(bloom_has_local(bloom, hs[i]));
     }
+    uint32_t short_tc = build_bloom_for_name("abc", bloom);
+    assert(short_tc == 0);
 }
 
 static void test_bloom_cap(){
@@ -73,6 +124,65 @@ static void test_bloom_cap(){
         expected += ((rem - 3) / DB_BLOOM_STRIDE) + 1;
     }
     assert(tc == expected);
+}
+
+static void test_bloom_meta_sizes(){
+    wchar_t path[MAX_PATH];
+    make_temp_dir(path, MAX_PATH);
+    Db* db = NULL;
+    assert(db_create(path, 1, 1, &db));
+
+    uint64_t parent = db_intern_wstring(db, L"parent");
+    assert(parent != 0);
+    assert(db_commit_write(db));
+
+    struct {
+        const char* text;
+        uint8_t expected_hash;
+        uint8_t expected_log2;
+        BOOL    expect_bloom;
+    } cases[] = {
+        {"abcd", 0, 0, FALSE},
+        {"this_is_twenty_chars!", 2, 11, TRUE},
+        {"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh", 3, 12, TRUE},
+        {"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz", 4, 13, TRUE}
+    };
+
+    for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);++i){
+        const char* text = cases[i].text;
+        size_t len = strlen(text);
+        wchar_t wbuf[512];
+        size_t converted = mbstowcs(wbuf, text, sizeof(wbuf)/sizeof(wbuf[0]));
+        assert(converted != (size_t)-1);
+        if(converted >= sizeof(wbuf)/sizeof(wbuf[0])) converted = (sizeof(wbuf)/sizeof(wbuf[0])) - 1;
+        wbuf[converted] = L'\0';
+        uint64_t name_id = db_intern_wstring(db, wbuf);
+        assert(name_id != 0);
+        assert(db_commit_write(db));
+
+        DbRecord rec = {0};
+        rec.parent_str_id = parent;
+        rec.name_str_id = name_id;
+        rec.type = DB_REC_FILE;
+        rec.file_size = 1;
+        rec.creation_time = rec.modified_time = rec.access_time = 1;
+        assert(db_put_records(db, &rec, 1));
+        assert(db_commit_write(db));
+
+        TestStringMeta meta;
+        assert(read_string_meta(path, name_id, &meta));
+        assert(meta.trigram_count >= (uint32_t)((len >= 3) ? (len - 2) : 0));
+        assert(meta.hash_count == cases[i].expected_hash);
+        if(cases[i].expect_bloom){
+            assert(meta.bloom_log2 == cases[i].expected_log2);
+            assert(meta.bloom_length > 0);
+        } else {
+            assert(meta.bloom_log2 == 0);
+            assert(meta.bloom_length == 0);
+        }
+    }
+
+    db_close(db);
 }
 
 static void test_db_put_records_and_get_by_path(){
@@ -106,6 +216,7 @@ int main(void){
     test_db_intern_wstring();
     test_trigram_bloom();
     test_bloom_cap();
+    test_bloom_meta_sizes();
     test_db_put_records_and_get_by_path();
     printf("All database tests passed\n");
     return 0;
