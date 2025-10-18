@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <wchar.h>
 #include <shlwapi.h>
 #include <inttypes.h>
@@ -198,7 +199,6 @@ static uint64_t g_db_generation = 0;
 // Magic marker and version for cache files so we can detect incompatible
 // formats and upgrade transparently.
 #define CACHE_MAGIC   0xCACEF00D
-#define CACHE_VERSION 2
 #ifdef _WIN32
 static BOOL open_bloom(const wchar_t* dbPath){
     wchar_t bp[MAX_LONG_PATH]; swprintf(bp, MAX_LONG_PATH, L"%s\\bloom.dat", dbPath);
@@ -339,14 +339,42 @@ static int search_names(Query* q, Result* results){
         mdb_txn_abort(txn); mdb_env_close(env); return 0;
     }
 
-    IdVec ids; idvec_init(&ids);
+    IdVec base; idvec_init(&base);
+    BOOL have_base = FALSE;
     if(q->name_pattern){
-        records_for_name(txn, dbi_trigram, dbi_fname, dbi_strings, dbi_smeta, q->name_pattern, &ids);
+        if(load_stage_cache(0, q, &base)){
+            have_base = TRUE;
+        } else {
+            if(!try_load_term_cache(TERM_NAME, q->name_pattern, &base)){
+                records_for_name(txn, dbi_trigram, dbi_fname, dbi_strings, dbi_smeta, q->name_pattern, &base);
+                sort_unique(&base);
+                save_term_cache(TERM_NAME, q->name_pattern, &base);
+            } else {
+                sort_unique(&base);
+            }
+            save_stage_cache(0, q, &base);
+            have_base = TRUE;
+        }
+    }
+
+    IdVec ids; idvec_init(&ids);
+    if(have_base && base.n>0){
+        ids.ids = (uint64_t*)malloc(base.n * sizeof(uint64_t));
+        if(ids.ids){
+            memcpy(ids.ids, base.ids, base.n * sizeof(uint64_t));
+            ids.n = ids.cap = base.n;
+        }
     }
 
     if(q->ext_pattern){
         IdVec ext; idvec_init(&ext);
-        records_for_ext(txn, dbi_ext, q->ext_pattern, &ext);
+        if(!try_load_term_cache(TERM_EXT, q->ext_pattern, &ext)){
+            records_for_ext(txn, dbi_ext, q->ext_pattern, &ext);
+            sort_unique(&ext);
+            save_term_cache(TERM_EXT, q->ext_pattern, &ext);
+        } else {
+            sort_unique(&ext);
+        }
         if(ids.n>0){ galloping_intersect(&ids,&ext); idvec_free(&ext); }
         else { ids = ext; }
     }
@@ -364,6 +392,7 @@ static int search_names(Query* q, Result* results){
         if(ids.n>0){ galloping_intersect(&ids,&dt); idvec_free(&dt); }
         else { ids = dt; }
     }
+    idvec_free(&base);
 
     size_t n = ids.n;
     if(g_prog_state && n>0){
@@ -399,13 +428,74 @@ static int search_metadata(Query* q, Result* results){
         mdb_txn_abort(txn); mdb_env_close(env); prog_mark_done(g_prog_state,1); return 0;
     }
 
+    BOOL wants_cache = q->author_pattern || q->camera_pattern || q->lens_pattern ||
+                       q->artist_pattern || q->album_pattern || q->title_pattern;
     IdVec ids; idvec_init(&ids);
-    if(q->author_pattern){ IdVec tmp; idvec_init(&tmp); records_for_author(txn, dbi_author, dbi_strrev, q->author_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
-    if(q->camera_pattern){ IdVec tmp; idvec_init(&tmp); records_for_camera(txn, dbi_camera, dbi_strrev, q->camera_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
-    if(q->lens_pattern){ IdVec tmp; idvec_init(&tmp); records_for_lens(txn, dbi_lens, dbi_strrev, q->lens_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
-    if(q->artist_pattern){ IdVec tmp; idvec_init(&tmp); records_for_artist(txn, dbi_artist, dbi_strrev, q->artist_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
-    if(q->album_pattern){ IdVec tmp; idvec_init(&tmp); records_for_album(txn, dbi_album, dbi_strrev, q->album_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
-    if(q->title_pattern){ IdVec tmp; idvec_init(&tmp); records_for_title(txn, dbi_title, dbi_strrev, q->title_pattern, &tmp); union_inplace(&ids,&tmp); idvec_free(&tmp); }
+    BOOL from_cache = FALSE;
+    if(wants_cache && load_stage_cache(1, q, &ids)){
+        from_cache = TRUE;
+    }
+
+    if(!from_cache){
+        if(q->author_pattern){
+            IdVec tmp; idvec_init(&tmp);
+            if(!try_load_term_cache(TERM_AUTHOR, q->author_pattern, &tmp)){
+                records_for_author(txn, dbi_author, dbi_strrev, q->author_pattern, &tmp);
+                sort_unique(&tmp);
+                save_term_cache(TERM_AUTHOR, q->author_pattern, &tmp);
+            } else {
+                sort_unique(&tmp);
+            }
+            union_inplace(&ids,&tmp); idvec_free(&tmp);
+        }
+        if(q->camera_pattern){
+            IdVec tmp; idvec_init(&tmp);
+            if(!try_load_term_cache(TERM_CAMERA, q->camera_pattern, &tmp)){
+                records_for_camera(txn, dbi_camera, dbi_strrev, q->camera_pattern, &tmp);
+                sort_unique(&tmp);
+                save_term_cache(TERM_CAMERA, q->camera_pattern, &tmp);
+            } else { sort_unique(&tmp); }
+            union_inplace(&ids,&tmp); idvec_free(&tmp);
+        }
+        if(q->lens_pattern){
+            IdVec tmp; idvec_init(&tmp);
+            if(!try_load_term_cache(TERM_LENS, q->lens_pattern, &tmp)){
+                records_for_lens(txn, dbi_lens, dbi_strrev, q->lens_pattern, &tmp);
+                sort_unique(&tmp);
+                save_term_cache(TERM_LENS, q->lens_pattern, &tmp);
+            } else { sort_unique(&tmp); }
+            union_inplace(&ids,&tmp); idvec_free(&tmp);
+        }
+        if(q->artist_pattern){
+            IdVec tmp; idvec_init(&tmp);
+            if(!try_load_term_cache(TERM_ARTIST, q->artist_pattern, &tmp)){
+                records_for_artist(txn, dbi_artist, dbi_strrev, q->artist_pattern, &tmp);
+                sort_unique(&tmp);
+                save_term_cache(TERM_ARTIST, q->artist_pattern, &tmp);
+            } else { sort_unique(&tmp); }
+            union_inplace(&ids,&tmp); idvec_free(&tmp);
+        }
+        if(q->album_pattern){
+            IdVec tmp; idvec_init(&tmp);
+            if(!try_load_term_cache(TERM_ALBUM, q->album_pattern, &tmp)){
+                records_for_album(txn, dbi_album, dbi_strrev, q->album_pattern, &tmp);
+                sort_unique(&tmp);
+                save_term_cache(TERM_ALBUM, q->album_pattern, &tmp);
+            } else { sort_unique(&tmp); }
+            union_inplace(&ids,&tmp); idvec_free(&tmp);
+        }
+        if(q->title_pattern){
+            IdVec tmp; idvec_init(&tmp);
+            if(!try_load_term_cache(TERM_TITLE, q->title_pattern, &tmp)){
+                records_for_title(txn, dbi_title, dbi_strrev, q->title_pattern, &tmp);
+                sort_unique(&tmp);
+                save_term_cache(TERM_TITLE, q->title_pattern, &tmp);
+            } else { sort_unique(&tmp); }
+            union_inplace(&ids,&tmp); idvec_free(&tmp);
+        }
+        if(ids.n>0) sort_unique(&ids);
+        if(wants_cache) save_stage_cache(1, q, &ids);
+    }
 
     size_t n = ids.n;
     if(g_prog_state && n>0){
@@ -437,7 +527,18 @@ static int search_content(Query* q, Result* results){
     }
 
     IdVec ids; idvec_init(&ids);
-    if(q->content_pattern){ records_for_content(txn, dbi_trigram, dbi_content, q->content_pattern, &ids); }
+    if(q->content_pattern){
+        if(!load_stage_cache(2, q, &ids)){
+            if(!try_load_term_cache(TERM_CONTENT, q->content_pattern, &ids)){
+                records_for_content(txn, dbi_trigram, dbi_content, q->content_pattern, &ids);
+                sort_unique(&ids);
+                save_term_cache(TERM_CONTENT, q->content_pattern, &ids);
+            } else {
+                sort_unique(&ids);
+            }
+            save_stage_cache(2, q, &ids);
+        }
+    }
 
     size_t n = ids.n;
     if(g_prog_state && n>0){
@@ -505,6 +606,49 @@ static unsigned get_hw_threads(void){
 }
 
 static double g_stage1_ms_avg = 0.0;
+
+#define STAGE_KEY_BUF 1024
+
+static void build_stage_key(const SearchQuery* q, int stage, char* out, size_t len){
+    const char* empty = "";
+    switch(stage){
+        case 0:
+            snprintf(out, len, "stage0|name=%s|regex=%d|whole=%d",
+                     q->name_pattern ? q->name_pattern : empty,
+                     q->regex_mode ? 1 : 0,
+                     q->whole_word ? 1 : 0);
+            break;
+        case 1:
+            snprintf(out, len, "stage1|author=%s|camera=%s|lens=%s|artist=%s|album=%s|title=%s",
+                     q->author_pattern ? q->author_pattern : empty,
+                     q->camera_pattern ? q->camera_pattern : empty,
+                     q->lens_pattern ? q->lens_pattern : empty,
+                     q->artist_pattern ? q->artist_pattern : empty,
+                     q->album_pattern ? q->album_pattern : empty,
+                     q->title_pattern ? q->title_pattern : empty);
+            break;
+        default:
+            snprintf(out, len, "stage2|content=%s|regex=%d|whole=%d",
+                     q->content_pattern ? q->content_pattern : empty,
+                     q->regex_mode ? 1 : 0,
+                     q->whole_word ? 1 : 0);
+            break;
+    }
+}
+
+static BOOL load_stage_cache(int stage, const SearchQuery* q, IdVec* out){
+    if(!g_db_path[0]) return FALSE;
+    char key[STAGE_KEY_BUF];
+    build_stage_key(q, stage, key, sizeof(key));
+    return try_load_cache_internal(g_db_path, key, CACHE_KIND_STAGE, (uint16_t)stage, out);
+}
+
+static void save_stage_cache(int stage, const SearchQuery* q, const IdVec* ids){
+    if(!g_db_path[0]) return;
+    char key[STAGE_KEY_BUF];
+    build_stage_key(q, stage, key, sizeof(key));
+    save_cache_internal(g_db_path, key, CACHE_KIND_STAGE, (uint16_t)stage, ids);
+}
 
 #define SMALL_POSTINGS_MAX 4096
 #define TINY_QUERY_MS 2.0
@@ -816,88 +960,90 @@ typedef struct {
     size_t n, cap;
 } IdVec;
 static void idvec_init(IdVec* v){ v->ids=NULL; v->n=v->cap=0; }
+static void idvec_reserve(IdVec* v, size_t need){
+    if(need <= v->cap) return;
+    size_t cap = v->cap ? v->cap : 512;
+    while(cap < need) cap <<= 1;
+    uint64_t* ni = (uint64_t*)realloc(v->ids, cap * sizeof(uint64_t));
+    if(!ni) return;
+    v->ids = ni;
+    v->cap = cap;
+}
 static void idvec_push(IdVec* v, uint64_t x){
-    if(v->n==v->cap){ v->cap = v->cap? v->cap*2:512; v->ids=(uint64_t*)realloc(v->ids,v->cap*sizeof(uint64_t)); }
+    if(v->n==v->cap){
+        size_t newcap = v->cap? v->cap*2:512;
+        uint64_t* ni = (uint64_t*)realloc(v->ids,newcap*sizeof(uint64_t));
+        if(!ni) return;
+        v->ids = ni;
+        v->cap = newcap;
+    }
     v->ids[v->n++]=x;
 }
 static void idvec_free(IdVec* v){ free(v->ids); v->ids=NULL; v->n=v->cap=0; }
 
 // Result cache — last query & rec_ids
+#define CACHE_VERSION 3
+
+typedef enum {
+    CACHE_KIND_QUERY = 0,
+    CACHE_KIND_TERM  = 1,
+    CACHE_KIND_STAGE = 2,
+} CacheKind;
+
 typedef struct {
     uint32_t magic;
     uint16_t version;
-    uint16_t pad;
+    uint8_t kind;
+    uint8_t tag;
     uint64_t generation;
     uint64_t bloom_size;
     uint64_t sig;
     uint32_t count;
-    // followed by rec_ids[count]
+    uint32_t data_bytes;
+    // followed by delta-encoded ids[data_bytes]
 } CacheHeader;
 
 #define CACHE_SIZE_LIMIT (128ULL*1024*1024) // 128 MB
 #define CACHE_MAX_ENTRIES 100000000U
 #define CACHE_TTL_SECONDS (30ULL*24*60*60) // 30 days
-typedef struct CacheEntry {
-    uint64_t access_time;
-    uint64_t size;
-    wchar_t path[MAX_LONG_PATH];
-    struct CacheEntry* next;
-} CacheEntry;
+typedef struct {
+    uint64_t sig;
+    uint64_t last_access;
+    uint64_t file_size;
+    uint32_t count;
+    uint32_t data_bytes;
+    uint16_t kind;
+    uint16_t tag;
+} CacheIndexEntry;
 
-static BOOL mul_size(size_t a, size_t b, size_t* out){
-    if(a && b > SIZE_MAX / a) return FALSE;
-    *out = a * b;
-    return TRUE;
-}
+#define CACHE_INDEX_MAGIC   0x43414348u
+#define CACHE_INDEX_VERSION 1
+#define CACHE_BLOOM_BITS_DEFAULT (1u<<18)
+#define CACHE_BLOOM_HASHES 4
 
-static BOOL add_size(size_t a, size_t b, size_t* out){
-    if(a > SIZE_MAX - b) return FALSE;
-    *out = a + b;
-    return TRUE;
-}
+typedef struct {
+    BOOL loaded;
+    BOOL dirty;
+    CacheIndexEntry* entries;
+    size_t entry_count;
+    size_t entry_cap;
+    size_t total_bytes;
+    uint8_t* bloom;
+    size_t bloom_bits;
+    size_t bloom_bytes;
+    uint32_t bloom_hashes;
+    uint64_t generation;
+    uint64_t bloom_size;
+#ifdef _WIN32
+    wchar_t dir[MAX_LONG_PATH];
+#else
+    char dir[PATH_MAX];
+#endif
+} CacheIndexState;
 
-static BOOL cache_size(size_t count, size_t* total, size_t* ids_bytes){
-    size_t ids;
-    if(!mul_size(count, sizeof(uint64_t), &ids)) return FALSE;
-    size_t tot;
-    if(!add_size(sizeof(CacheHeader), ids, &tot)) return FALSE;
-    if(total) *total = tot;
-    if(ids_bytes) *ids_bytes = ids;
-    return TRUE;
-}
-
-static int cmp_cache_entry(const void* a, const void* b){
-    const CacheEntry* const* x = (const CacheEntry* const*)a;
-    const CacheEntry* const* y = (const CacheEntry* const*)b;
-    return ((*x)->access_time > (*y)->access_time) - ((*x)->access_time < (*y)->access_time);
-}
-
-static void evict_lru_cache_entries(CacheEntry* head, size_t max_size, uint64_t ttl_seconds){
-    FILETIME ft; GetSystemTimeAsFileTime(&ft);
-    ULARGE_INTEGER now; now.LowPart = ft.dwLowDateTime; now.HighPart = ft.dwHighDateTime;
-    uint64_t cutoff = now.QuadPart - ttl_seconds*10000000ULL; // FILETIME is 100ns units
-    size_t total = 0, count = 0;
-    for(CacheEntry* e=head; e; e=e->next){
-        if(e->access_time < cutoff){
-            wchar_t lp[MAX_LONG_PATH]; make_long_path(e->path, lp, MAX_LONG_PATH);
-            DeleteFileW(lp);
-        } else {
-            total += e->size;
-            count++;
-        }
-    }
-    if(total <= max_size) return;
-    CacheEntry** arr = (CacheEntry**)malloc(count*sizeof(CacheEntry*));
-    if(!arr) return;
-    size_t i=0; for(CacheEntry* e=head; e; e=e->next){ if(e->access_time >= cutoff) arr[i++]=e; }
-    qsort(arr, count, sizeof(CacheEntry*), cmp_cache_entry);
-    for(i=0; i<count && total>max_size; i++){
-        wchar_t lp[MAX_LONG_PATH]; make_long_path(arr[i]->path, lp, MAX_LONG_PATH);
-        DeleteFileW(lp);
-        if(arr[i]->size <= total) total -= arr[i]->size; else total = 0;
-    }
-    free(arr);
-}
+static CacheIndexState g_cache_index = {0};
+static CRITICAL_SECTION g_cache_index_mu;
+static BOOL g_cache_index_mu_init = FALSE;
 
 static wchar_t* path_dirname_w(wchar_t* path){
     wchar_t* a = wcsrchr(path, L'\\');
@@ -906,199 +1052,590 @@ static wchar_t* path_dirname_w(wchar_t* path){
     return a ? a : b;
 }
 
-#ifdef _WIN32
-static void prune_cache_dir(const wchar_t* anyPath){
-    wchar_t dir[MAX_LONG_PATH]; wcscpy_s(dir, MAX_LONG_PATH, anyPath);
-    wchar_t* p = path_dirname_w(dir); if(!p) return; *p = 0;
-    CacheEntry* head = NULL;
-    const wchar_t* patterns[2] = {L"cache_*.tmp", L"cache_term_*.tmp"};
-    for(int i=0;i<2;i++){
-        wchar_t pat[MAX_LONG_PATH]; swprintf(pat, MAX_LONG_PATH, L"%s\\%s", dir, patterns[i]);
-        WIN32_FIND_DATAW fd; HANDLE h=FindFirstFileW(pat, &fd);
-        if(h!=INVALID_HANDLE_VALUE){
-            do{
-                if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)){
-                    CacheEntry* e = (CacheEntry*)malloc(sizeof(CacheEntry));
-                    if(!e) continue;
-                    swprintf(e->path, MAX_LONG_PATH, L"%s\\%s", dir, fd.cFileName);
-                    ULARGE_INTEGER ui;
-                    ui.LowPart = fd.ftLastAccessTime.dwLowDateTime;
-                    ui.HighPart = fd.ftLastAccessTime.dwHighDateTime;
-                    e->access_time = ui.QuadPart;
-                    ui.LowPart = fd.nFileSizeLow;
-                    ui.HighPart = fd.nFileSizeHigh;
-                    e->size = ui.QuadPart;
-                    e->next = head;
-                    head = e;
-                }
-            }while(FindNextFileW(h,&fd));
-            FindClose(h);
-        }
-    }
-    evict_lru_cache_entries(head, CACHE_SIZE_LIMIT, CACHE_TTL_SECONDS);
-    while(head){
-        CacheEntry* next = head->next;
-        free(head);
-        head = next;
-    }
+#ifndef _WIN32
+static char* path_dirname(char* path){
+    char* a = strrchr(path, '/');
+    return a;
 }
-#else
-static void prune_cache_dir(const char* anyPath){ (void)anyPath; }
 #endif
 
-static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
-    uint64_t sig = hash64(qstr, strlen(qstr));
+static void cache_index_lock(void){
+    if(!g_cache_index_mu_init){
+        InitializeCriticalSection(&g_cache_index_mu);
+        g_cache_index_mu_init = TRUE;
+    }
+    EnterCriticalSection(&g_cache_index_mu);
+}
+
+static void cache_index_unlock(void){
+    if(g_cache_index_mu_init){
+        LeaveCriticalSection(&g_cache_index_mu);
+    }
+}
+
+static uint64_t cache_now_seconds(void){
 #ifdef _WIN32
-    wchar_t cachePath[MAX_LONG_PATH]; wcscpy_s(cachePath, MAX_LONG_PATH, dbPath);
-    wchar_t* dp = path_dirname_w(cachePath);
-    if(!dp) return FALSE;
-    swprintf(dp+1, (size_t)(MAX_LONG_PATH-(dp+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
-    wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
-    HANDLE f = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
-    HANDLE m = NULL; BYTE* base = NULL; BOOL ok = FALSE; BOOL locked = FALSE; OVERLAPPED ov={0};
-    if(f==INVALID_HANDLE_VALUE) goto cleanup;
-    if(!LockFileEx(f, 0, 0, MAXDWORD, MAXDWORD, &ov)) goto cleanup; locked = TRUE;
-    DWORD sz = GetFileSize(f, NULL);
-    if(sz < sizeof(CacheHeader)) goto cleanup;
-    m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
-    if(!m) goto cleanup;
-    base = (BYTE*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0);
-    if(!base) goto cleanup;
-    const CacheHeader* h = (const CacheHeader*)base;
-    size_t need, ids_bytes;
-    if(h->magic == CACHE_MAGIC &&
-       h->version == CACHE_VERSION &&
-       h->sig == sig &&
-       h->generation == g_db_generation &&
-       h->bloom_size == g_bloom_size &&
-       h->count <= CACHE_MAX_ENTRIES &&
-       cache_size(h->count, &need, &ids_bytes) &&
-       (size_t)sz >= need){
-        out->ids = (uint64_t*)malloc(ids_bytes);
-        if(out->ids){
-            memcpy(out->ids, base+sizeof(CacheHeader), ids_bytes);
-            out->n = h->count; out->cap = h->count;
-            ok = TRUE;
-        }
-    }
-cleanup:
-    if(base) UnmapViewOfFile(base);
-    if(m) CloseHandle(m);
-    if(f!=INVALID_HANDLE_VALUE){
-        if(locked) UnlockFileEx(f, 0, MAXDWORD, MAXDWORD, &ov);
-        CloseHandle(f);
-    }
-    return ok;
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+    return u.QuadPart / 10000000ULL;
 #else
-    char path[PATH_MAX];
-    to_utf8(dbPath, path, sizeof(path));
-    char* p = strrchr(path, '/'); if(!p) return FALSE;
-    snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_%016llx.tmp", (unsigned long long)sig);
-    int fd = open(path, O_RDONLY);
-    void* base = MAP_FAILED; BOOL ok = FALSE; struct stat st;
-    if(fd < 0) return FALSE;
-    if(flock(fd, LOCK_SH) != 0) goto cleanup;
-    if(fstat(fd, &st) < 0) goto cleanup;
-    if(st.st_size < (off_t)sizeof(CacheHeader)) goto cleanup;
-    base = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if(base == MAP_FAILED) goto cleanup;
-    const CacheHeader* h = (const CacheHeader*)base;
-    size_t need, ids_bytes;
-    if(h->magic == CACHE_MAGIC &&
-       h->version == CACHE_VERSION &&
-       h->sig == sig &&
-       h->generation == g_db_generation &&
-       h->bloom_size == g_bloom_size &&
-       h->count <= CACHE_MAX_ENTRIES &&
-       cache_size(h->count, &need, &ids_bytes) &&
-       (size_t)st.st_size >= need){
-        out->ids = (uint64_t*)malloc(ids_bytes);
-        if(out->ids){
-            memcpy(out->ids, (const uint8_t*)base+sizeof(CacheHeader), ids_bytes);
-            out->n = h->count; out->cap = h->count;
-            ok = TRUE;
-        }
-    }
-cleanup:
-    if(base != MAP_FAILED) munmap(base, st.st_size);
-    if(fd >= 0){ flock(fd, LOCK_UN); close(fd); }
-    return ok;
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec;
 #endif
 }
-static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids){
-    uint64_t sig = hash64(qstr, strlen(qstr));
+
+static uint64_t bloom_mix(uint64_t x){
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+static void cache_index_bloom_clear_locked(void){
+    if(!g_cache_index.bloom){
+        g_cache_index.bloom_bits = CACHE_BLOOM_BITS_DEFAULT;
+        g_cache_index.bloom_bytes = g_cache_index.bloom_bits / 8;
+        g_cache_index.bloom_hashes = CACHE_BLOOM_HASHES;
+        g_cache_index.bloom = (uint8_t*)calloc(g_cache_index.bloom_bytes, 1);
+    } else {
+        memset(g_cache_index.bloom, 0, g_cache_index.bloom_bytes);
+    }
+    if(g_cache_index.bloom_hashes == 0) g_cache_index.bloom_hashes = CACHE_BLOOM_HASHES;
+    if(g_cache_index.bloom_bits == 0){
+        g_cache_index.bloom_bits = CACHE_BLOOM_BITS_DEFAULT;
+        g_cache_index.bloom_bytes = g_cache_index.bloom_bits / 8;
+        g_cache_index.bloom = (uint8_t*)realloc(g_cache_index.bloom, g_cache_index.bloom_bytes);
+        memset(g_cache_index.bloom, 0, g_cache_index.bloom_bytes);
+    }
+    for(size_t i=0;i<g_cache_index.entry_count;i++){
+        CacheIndexEntry* e = &g_cache_index.entries[i];
+        uint64_t h1 = e->sig;
+        uint64_t h2 = bloom_mix(e->sig ^ ((uint64_t)e->kind<<32) ^ e->tag);
+        for(uint32_t j=0;j<g_cache_index.bloom_hashes;j++){
+            uint64_t h = h1 + j*h2;
+            size_t bit = (size_t)(h % g_cache_index.bloom_bits);
+            g_cache_index.bloom[bit>>3] |= (uint8_t)(1u << (bit & 7));
+        }
+    }
+}
+
+static void cache_index_reset_locked(void){
+    free(g_cache_index.entries);
+    g_cache_index.entries = NULL;
+    g_cache_index.entry_count = 0;
+    g_cache_index.entry_cap = 0;
+    g_cache_index.total_bytes = 0;
+    g_cache_index.loaded = FALSE;
+    g_cache_index.dirty = FALSE;
+    if(g_cache_index.bloom){ memset(g_cache_index.bloom,0,g_cache_index.bloom_bytes); }
+}
+
+static void cache_index_reserve_locked(size_t cap){
+    if(cap <= g_cache_index.entry_cap) return;
+    size_t newcap = g_cache_index.entry_cap ? g_cache_index.entry_cap : 16;
+    while(newcap < cap) newcap *= 2;
+    CacheIndexEntry* ne = (CacheIndexEntry*)realloc(g_cache_index.entries, newcap * sizeof(CacheIndexEntry));
+    if(ne){ g_cache_index.entries = ne; g_cache_index.entry_cap = newcap; }
+}
+
+static BOOL cache_index_meta_path(const wchar_t* dbPath,
 #ifdef _WIN32
-    wchar_t cachePath[MAX_LONG_PATH]; wcscpy_s(cachePath, MAX_LONG_PATH, dbPath);
-    wchar_t* p = path_dirname_w(cachePath); if(!p) return;
-    swprintf(p+1, (size_t)(MAX_LONG_PATH-(p+1-cachePath)), L"cache_%016llx.tmp", (unsigned long long)sig);
-    wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
-    HANDLE lock = CreateFileW(lp, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, 0, NULL);
-    if(lock==INVALID_HANDLE_VALUE) return;
-    OVERLAPPED ov = {0};
-    if(!LockFileEx(lock, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &ov)){ CloseHandle(lock); return; }
-    wchar_t tmpPath[MAX_LONG_PATH];
-    swprintf(tmpPath, MAX_LONG_PATH, L"%s.tmp", lp);
-    HANDLE f = CreateFileW(tmpPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-    if(f==INVALID_HANDLE_VALUE){ UnlockFileEx(lock, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(lock); return; }
-    size_t total, ids_bytes;
-    if(!cache_size(ids->n, &total, &ids_bytes) || total > UINT32_MAX){ CloseHandle(f); DeleteFileW(tmpPath); UnlockFileEx(lock, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(lock); return; }
-    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, (DWORD)total, NULL);
-    if(!m){ CloseHandle(f); DeleteFileW(tmpPath); UnlockFileEx(lock, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(lock); return; }
-    BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_WRITE, 0,0,0);
-    if(!base){ CloseHandle(m); CloseHandle(f); DeleteFileW(tmpPath); UnlockFileEx(lock, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(lock); return; }
-    CacheHeader* h = (CacheHeader*)base;
-    h->magic = CACHE_MAGIC;
-    h->version = CACHE_VERSION;
-    h->pad = 0;
-    h->generation = g_db_generation;
-    h->bloom_size = g_bloom_size;
-    h->sig = hash64(qstr, strlen(qstr));
-    h->count = (uint32_t)ids->n;
-    memcpy(base+sizeof(CacheHeader), ids->ids, ids_bytes);
-    FlushViewOfFile(base, (SIZE_T)total);
-    UnmapViewOfFile(base);
-    CloseHandle(m);
-    FlushFileBuffers(f);
+                                 wchar_t* out, size_t outlen
+#else
+                                 char* out, size_t outlen
+#endif
+){
+#ifdef _WIN32
+    wchar_t tmp[MAX_LONG_PATH]; wcscpy_s(tmp, MAX_LONG_PATH, dbPath);
+    wchar_t* d = path_dirname_w(tmp);
+    if(!d) return FALSE;
+    *(d+1) = 0;
+    if(swprintf(out, outlen, L"%scache_index.dat", tmp) < 0) return FALSE;
+    return TRUE;
+#else
+    char tmp[PATH_MAX];
+    to_utf8(dbPath, tmp, sizeof(tmp));
+    char* d = path_dirname(tmp);
+    if(!d) return FALSE;
+    *(d+1) = 0;
+    if(snprintf(out, outlen, "%scache_index.dat", tmp) < 0) return FALSE;
+    return TRUE;
+#endif
+}
+
+static void cache_index_set_dir_locked(const wchar_t* dbPath){
+#ifdef _WIN32
+    wcscpy_s(g_cache_index.dir, MAX_LONG_PATH, dbPath);
+    wchar_t* d = path_dirname_w(g_cache_index.dir);
+    if(d) *(d+1)=0; else g_cache_index.dir[0]=0;
+#else
+    to_utf8(dbPath, g_cache_index.dir, sizeof(g_cache_index.dir));
+    char* d = path_dirname(g_cache_index.dir);
+    if(d) *(d+1)=0; else g_cache_index.dir[0]=0;
+#endif
+}
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t bloom_hashes;
+    uint32_t bloom_bits;
+    uint32_t entry_count;
+    uint32_t reserved;
+    uint64_t generation;
+    uint64_t bloom_size;
+} CacheIndexHeader;
+
+static BOOL cache_index_load_locked(const wchar_t* dbPath){
+    cache_index_set_dir_locked(dbPath);
+#ifdef _WIN32
+    wchar_t meta[MAX_LONG_PATH];
+    if(!cache_index_meta_path(dbPath, meta, MAX_LONG_PATH)) return FALSE;
+    FILE* fp = _wfopen(meta, L"rb");
+#else
+    char meta[PATH_MAX];
+    if(!cache_index_meta_path(dbPath, meta, sizeof(meta))) return FALSE;
+    FILE* fp = fopen(meta, "rb");
+#endif
+    if(!fp){
+        g_cache_index.loaded = TRUE;
+        g_cache_index.dirty = TRUE;
+        g_cache_index.generation = g_db_generation;
+        g_cache_index.bloom_size = g_bloom_size;
+        cache_index_bloom_clear_locked();
+        return TRUE;
+    }
+    CacheIndexHeader hdr;
+    if(fread(&hdr, sizeof(hdr), 1, fp)!=1 || hdr.magic != CACHE_INDEX_MAGIC || hdr.version != CACHE_INDEX_VERSION){
+        fclose(fp);
+        g_cache_index.loaded = TRUE;
+        g_cache_index.dirty = TRUE;
+        g_cache_index.generation = g_db_generation;
+        g_cache_index.bloom_size = g_bloom_size;
+        cache_index_bloom_clear_locked();
+        return TRUE;
+    }
+    if(hdr.generation != g_db_generation || hdr.bloom_size != g_bloom_size){
+        fclose(fp);
+        g_cache_index.loaded = TRUE;
+        g_cache_index.dirty = TRUE;
+        g_cache_index.generation = g_db_generation;
+        g_cache_index.bloom_size = g_bloom_size;
+        cache_index_bloom_clear_locked();
+        return TRUE;
+    }
+    g_cache_index.generation = hdr.generation;
+    g_cache_index.bloom_size = hdr.bloom_size;
+    g_cache_index.bloom_bits = hdr.bloom_bits ? hdr.bloom_bits : CACHE_BLOOM_BITS_DEFAULT;
+    g_cache_index.bloom_bytes = g_cache_index.bloom_bits / 8;
+    g_cache_index.bloom_hashes = hdr.bloom_hashes ? hdr.bloom_hashes : CACHE_BLOOM_HASHES;
+    g_cache_index.bloom = (uint8_t*)realloc(g_cache_index.bloom, g_cache_index.bloom_bytes);
+    if(!g_cache_index.bloom){ fclose(fp); return FALSE; }
+    if(fread(g_cache_index.bloom, g_cache_index.bloom_bytes, 1, fp)!=1){ fclose(fp); return FALSE; }
+    cache_index_reserve_locked(hdr.entry_count);
+    g_cache_index.entry_count = hdr.entry_count;
+    if(g_cache_index.entry_count>0){
+        if(fread(g_cache_index.entries, sizeof(CacheIndexEntry), g_cache_index.entry_count, fp)!=g_cache_index.entry_count){ fclose(fp); return FALSE; }
+    }
+    fclose(fp);
+    g_cache_index.total_bytes = 0;
+    for(size_t i=0;i<g_cache_index.entry_count;i++) g_cache_index.total_bytes += g_cache_index.entries[i].file_size;
+    g_cache_index.loaded = TRUE;
+    g_cache_index.dirty = FALSE;
+    return TRUE;
+}
+
+static BOOL cache_index_flush_locked(void){
+    if(!g_cache_index.dirty) return TRUE;
+    if(!g_cache_index.dir[0]) return FALSE;
+#ifdef _WIN32
+    wchar_t meta[MAX_LONG_PATH];
+    if(swprintf(meta, MAX_LONG_PATH, L"%scache_index.dat", g_cache_index.dir) < 0) return FALSE;
+    wchar_t tmp[MAX_LONG_PATH];
+    if(swprintf(tmp, MAX_LONG_PATH, L"%scache_index.tmp", g_cache_index.dir) < 0) return FALSE;
+    FILE* fp = _wfopen(tmp, L"wb");
+#else
+    char meta[PATH_MAX];
+    snprintf(meta, sizeof(meta), "%scache_index.dat", g_cache_index.dir);
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%scache_index.tmp", g_cache_index.dir);
+    FILE* fp = fopen(tmp, "wb");
+#endif
+    if(!fp) return FALSE;
+    CacheIndexHeader hdr = {
+        .magic = CACHE_INDEX_MAGIC,
+        .version = CACHE_INDEX_VERSION,
+        .bloom_hashes = (uint16_t)g_cache_index.bloom_hashes,
+        .bloom_bits = (uint32_t)g_cache_index.bloom_bits,
+        .entry_count = (uint32_t)g_cache_index.entry_count,
+        .reserved = 0,
+        .generation = g_cache_index.generation,
+        .bloom_size = g_cache_index.bloom_size,
+    };
+    fwrite(&hdr, sizeof(hdr), 1, fp);
+    fwrite(g_cache_index.bloom, g_cache_index.bloom_bytes, 1, fp);
+    if(g_cache_index.entry_count>0){
+        fwrite(g_cache_index.entries, sizeof(CacheIndexEntry), g_cache_index.entry_count, fp);
+    }
+    fclose(fp);
+#ifdef _WIN32
+    _wremove(meta);
+    _wrename(tmp, meta);
+#else
+    remove(meta);
+    rename(tmp, meta);
+#endif
+    g_cache_index.dirty = FALSE;
+    return TRUE;
+}
+
+static ptrdiff_t cache_index_find_locked(uint64_t sig, uint16_t kind, uint16_t tag){
+    for(size_t i=0;i<g_cache_index.entry_count;i++){
+        CacheIndexEntry* e = &g_cache_index.entries[i];
+        if(e->sig==sig && e->kind==kind && e->tag==tag) return (ptrdiff_t)i;
+    }
+    return -1;
+}
+
+static BOOL cache_index_bloom_maybe_has_locked(uint64_t sig, uint16_t kind, uint16_t tag){
+    if(!g_cache_index.bloom || g_cache_index.bloom_bits==0) return TRUE;
+    uint64_t h1 = sig;
+    uint64_t h2 = bloom_mix(sig ^ ((uint64_t)kind<<32) ^ tag);
+    for(uint32_t j=0;j<g_cache_index.bloom_hashes;j++){
+        uint64_t h = h1 + j*h2;
+        size_t bit = (size_t)(h % g_cache_index.bloom_bits);
+        if(!(g_cache_index.bloom[bit>>3] & (uint8_t)(1u << (bit & 7)))) return FALSE;
+    }
+    return TRUE;
+}
+
+static void cache_index_bloom_add_locked(uint64_t sig, uint16_t kind, uint16_t tag){
+    if(!g_cache_index.bloom || g_cache_index.bloom_bits==0) return;
+    uint64_t h1 = sig;
+    uint64_t h2 = bloom_mix(sig ^ ((uint64_t)kind<<32) ^ tag);
+    for(uint32_t j=0;j<g_cache_index.bloom_hashes;j++){
+        uint64_t h = h1 + j*h2;
+        size_t bit = (size_t)(h % g_cache_index.bloom_bits);
+        g_cache_index.bloom[bit>>3] |= (uint8_t)(1u << (bit & 7));
+    }
+}
+
+static BOOL cache_index_delete_entry_locked(size_t idx){
+    if(idx >= g_cache_index.entry_count) return FALSE;
+    CacheIndexEntry e = g_cache_index.entries[idx];
+#ifdef _WIN32
+    if(g_cache_index.dir[0]){
+        wchar_t path[MAX_LONG_PATH];
+        if(e.kind == CACHE_KIND_QUERY){
+            swprintf(path, MAX_LONG_PATH, L"%scache_%016llx.tmp", g_cache_index.dir, (unsigned long long)e.sig);
+        } else if(e.kind == CACHE_KIND_TERM){
+            swprintf(path, MAX_LONG_PATH, L"%scache_term_%016llx.tmp", g_cache_index.dir, (unsigned long long)e.sig);
+        } else {
+            swprintf(path, MAX_LONG_PATH, L"%scache_stage%u_%016llx.tmp", g_cache_index.dir, e.tag, (unsigned long long)e.sig);
+        }
+        _wremove(path);
+    }
+#else
+    if(g_cache_index.dir[0]){
+        char path[PATH_MAX];
+        if(e.kind == CACHE_KIND_QUERY){
+            snprintf(path, sizeof(path), "%scache_%016llx.tmp", g_cache_index.dir, (unsigned long long)e.sig);
+        } else if(e.kind == CACHE_KIND_TERM){
+            snprintf(path, sizeof(path), "%scache_term_%016llx.tmp", g_cache_index.dir, (unsigned long long)e.sig);
+        } else {
+            snprintf(path, sizeof(path), "%scache_stage%u_%016llx.tmp", g_cache_index.dir, e.tag, (unsigned long long)e.sig);
+        }
+        remove(path);
+    }
+#endif
+    if(idx+1 < g_cache_index.entry_count){
+        memmove(&g_cache_index.entries[idx], &g_cache_index.entries[idx+1], (g_cache_index.entry_count-idx-1)*sizeof(CacheIndexEntry));
+    }
+    g_cache_index.entry_count--;
+    g_cache_index.total_bytes = (g_cache_index.total_bytes >= e.file_size) ? g_cache_index.total_bytes - e.file_size : 0;
+    cache_index_bloom_clear_locked();
+    g_cache_index.dirty = TRUE;
+    return TRUE;
+}
+
+static void cache_index_evict_locked(void){
+    uint64_t now = cache_now_seconds();
+    for(size_t i=0;i<g_cache_index.entry_count;){
+        CacheIndexEntry* e = &g_cache_index.entries[i];
+        if(now > e->last_access && now - e->last_access > CACHE_TTL_SECONDS){
+            cache_index_delete_entry_locked(i);
+            continue;
+        }
+        i++;
+    }
+    while(g_cache_index.total_bytes > CACHE_SIZE_LIMIT && g_cache_index.entry_count>0){
+        size_t oldest = 0;
+        uint64_t best = g_cache_index.entries[0].last_access;
+        for(size_t i=1;i<g_cache_index.entry_count;i++){
+            if(g_cache_index.entries[i].last_access < best){ best = g_cache_index.entries[i].last_access; oldest = i; }
+        }
+        cache_index_delete_entry_locked(oldest);
+    }
+}
+
+static BOOL cache_index_prepare(const wchar_t* dbPath){
+    cache_index_lock();
+    BOOL ok = TRUE;
+    if(!g_cache_index.loaded || g_cache_index.generation != g_db_generation || g_cache_index.bloom_size != g_bloom_size){
+        cache_index_reset_locked();
+        ok = cache_index_load_locked(dbPath);
+        if(ok) cache_index_bloom_clear_locked();
+    }
+    if(ok) cache_index_evict_locked();
+    if(ok) cache_index_flush_locked();
+    cache_index_unlock();
+    return ok;
+}
+
+static BOOL cache_index_upsert(uint64_t sig, uint16_t kind, uint16_t tag, uint32_t count, uint32_t data_bytes, uint64_t file_size){
+    cache_index_lock();
+    if(!g_cache_index.loaded){
+        cache_index_unlock();
+        return FALSE;
+    }
+    ptrdiff_t idx = cache_index_find_locked(sig, kind, tag);
+    if(idx < 0){
+        cache_index_reserve_locked(g_cache_index.entry_count+1);
+        idx = (ptrdiff_t)g_cache_index.entry_count++;
+    }
+    CacheIndexEntry* e = &g_cache_index.entries[idx];
+    e->sig = sig;
+    e->kind = kind;
+    e->tag = tag;
+    e->count = count;
+    e->data_bytes = data_bytes;
+    g_cache_index.total_bytes -= (g_cache_index.total_bytes >= e->file_size) ? e->file_size : 0;
+    e->file_size = file_size;
+    e->last_access = cache_now_seconds();
+    g_cache_index.total_bytes += e->file_size;
+    g_cache_index.dirty = TRUE;
+    cache_index_bloom_add_locked(sig, kind, tag);
+    cache_index_evict_locked();
+    cache_index_flush_locked();
+    cache_index_unlock();
+    return TRUE;
+}
+
+static void cache_index_remove(uint64_t sig, uint16_t kind, uint16_t tag){
+    cache_index_lock();
+    ptrdiff_t idx = cache_index_find_locked(sig, kind, tag);
+    if(idx >= 0){
+        cache_index_delete_entry_locked((size_t)idx);
+        cache_index_flush_locked();
+    }
+    cache_index_unlock();
+}
+
+#ifdef _WIN32
+static BOOL cache_build_path(CacheKind kind, uint16_t tag, uint64_t sig, wchar_t* out, size_t outlen){
+    if(!g_cache_index.dir[0]) return FALSE;
+    switch(kind){
+        case CACHE_KIND_QUERY:
+            return swprintf(out, outlen, L"%scache_%016llx.tmp", g_cache_index.dir, (unsigned long long)sig) >= 0;
+        case CACHE_KIND_TERM:
+            return swprintf(out, outlen, L"%scache_term_%016llx.tmp", g_cache_index.dir, (unsigned long long)sig) >= 0;
+        case CACHE_KIND_STAGE:
+            return swprintf(out, outlen, L"%scache_stage%u_%016llx.tmp", g_cache_index.dir, tag, (unsigned long long)sig) >= 0;
+    }
+    return FALSE;
+}
+#else
+static BOOL cache_build_path(CacheKind kind, uint16_t tag, uint64_t sig, char* out, size_t outlen){
+    if(!g_cache_index.dir[0]) return FALSE;
+    switch(kind){
+        case CACHE_KIND_QUERY:
+            return snprintf(out, outlen, "%scache_%016llx.tmp", g_cache_index.dir, (unsigned long long)sig) >= 0;
+        case CACHE_KIND_TERM:
+            return snprintf(out, outlen, "%scache_term_%016llx.tmp", g_cache_index.dir, (unsigned long long)sig) >= 0;
+        case CACHE_KIND_STAGE:
+            return snprintf(out, outlen, "%scache_stage%u_%016llx.tmp", g_cache_index.dir, tag, (unsigned long long)sig) >= 0;
+    }
+    return FALSE;
+}
+#endif
+
+static size_t varint_length(uint64_t v){
+    size_t len = 1;
+    while(v >= 0x80){ v >>= 7; len++; }
+    return len;
+}
+
+static uint8_t* varint_write(uint8_t* p, uint64_t v){
+    while(v >= 0x80){ *p++ = (uint8_t)((v & 0x7F) | 0x80); v >>= 7; }
+    *p++ = (uint8_t)(v & 0x7F);
+    return p;
+}
+
+static BOOL varint_read(const uint8_t** p, const uint8_t* end, uint64_t* out){
+    uint64_t value = 0; int shift = 0;
+    const uint8_t* cur = *p;
+    while(cur < end && shift <= 63){
+        uint8_t byte = *cur++;
+        value |= (uint64_t)(byte & 0x7F) << shift;
+        if(!(byte & 0x80)){ *p = cur; *out = value; return TRUE; }
+        shift += 7;
+    }
+    return FALSE;
+}
+
+static size_t encode_ids_delta(const uint64_t* ids, size_t n, uint8_t** out_buf){
+    if(n==0){ *out_buf=NULL; return 0; }
+    size_t total = 0;
+    uint64_t prev = 0;
+    for(size_t i=0;i<n;i++){
+        uint64_t delta = (i==0) ? ids[i] : (ids[i] - prev);
+        total += varint_length(delta);
+        prev = ids[i];
+    }
+    uint8_t* buf = (uint8_t*)malloc(total);
+    if(!buf){ *out_buf=NULL; return 0; }
+    uint8_t* ptr = buf;
+    prev = 0;
+    for(size_t i=0;i<n;i++){
+        uint64_t delta = (i==0) ? ids[i] : (ids[i] - prev);
+        ptr = varint_write(ptr, delta);
+        prev = ids[i];
+    }
+    *out_buf = buf;
+    return total;
+}
+
+static BOOL decode_ids_delta(const uint8_t* data, size_t len, size_t count, IdVec* out){
+    const uint8_t* ptr = data;
+    const uint8_t* end = data + len;
+    uint64_t prev = 0;
+    idvec_reserve(out, count);
+    for(size_t i=0;i<count;i++){
+        uint64_t delta;
+        if(!varint_read(&ptr, end, &delta)) return FALSE;
+        uint64_t value = (i==0) ? delta : prev + delta;
+        idvec_push(out, value);
+        prev = value;
+    }
+    return ptr == end;
+}
+
+
+static BOOL try_load_cache_internal(const wchar_t* dbPath, const char* key, CacheKind kind, uint16_t tag, IdVec* out){
+    if(!key || !out) return FALSE;
+    uint64_t sig = hash64(key, strlen(key));
+    if(!cache_index_prepare(dbPath)) return FALSE;
+    cache_index_lock();
+    BOOL maybe = cache_index_bloom_maybe_has_locked(sig, kind, tag);
+    cache_index_unlock();
+    if(!maybe) return FALSE;
+#ifdef _WIN32
+    wchar_t path[MAX_LONG_PATH];
+    if(!cache_build_path(kind, tag, sig, path, MAX_LONG_PATH)) return FALSE;
+    wchar_t lp[MAX_LONG_PATH]; make_long_path(path, lp, MAX_LONG_PATH);
+    HANDLE f = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(f==INVALID_HANDLE_VALUE){ cache_index_remove(sig, kind, tag); return FALSE; }
+    DWORD sz_raw = GetFileSize(f, NULL);
+    if(sz_raw < sizeof(CacheHeader)){ CloseHandle(f); cache_index_remove(sig, kind, tag); return FALSE; }
+    size_t file_size = (size_t)sz_raw;
+    uint8_t* buf = (uint8_t*)malloc(file_size);
+    if(!buf){ CloseHandle(f); return FALSE; }
+    DWORD read = 0;
+    BOOL okread = ReadFile(f, buf, (DWORD)file_size, &read, NULL);
     CloseHandle(f);
-    MoveFileExW(tmpPath, lp, MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
-    UnlockFileEx(lock, 0, MAXDWORD, MAXDWORD, &ov);
-    CloseHandle(lock);
-    prune_cache_dir(cachePath);
+    if(!okread || read != file_size){ free(buf); cache_index_remove(sig, kind, tag); return FALSE; }
 #else
     char path[PATH_MAX];
-    to_utf8(dbPath, path, sizeof(path));
-    char* p = strrchr(path, '/'); if(!p) return;
-    snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_%016llx.tmp", (unsigned long long)sig);
-    size_t sz, ids_bytes;
-    if(!cache_size(ids->n, &sz, &ids_bytes)) return;
-    int lock_fd = open(path, O_RDWR|O_CREAT, 0666);
-    if(lock_fd < 0) return;
-    if(flock(lock_fd, LOCK_EX) != 0){ close(lock_fd); return; }
-    char tmp_template[PATH_MAX];
-    snprintf(tmp_template, sizeof(tmp_template), "%s.tmpXXXXXX", path);
-    int fd = mkstemp(tmp_template);
-    if(fd < 0){ flock(lock_fd, LOCK_UN); close(lock_fd); return; }
-    if(ftruncate(fd, (off_t)sz) != 0){ close(fd); unlink(tmp_template); flock(lock_fd, LOCK_UN); close(lock_fd); return; }
-    void* base = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if(base == MAP_FAILED){ close(fd); unlink(tmp_template); flock(lock_fd, LOCK_UN); close(lock_fd); return; }
-    CacheHeader* h = (CacheHeader*)base;
-    h->magic = CACHE_MAGIC;
-    h->version = CACHE_VERSION;
-    h->pad = 0;
-    h->generation = g_db_generation;
-    h->bloom_size = g_bloom_size;
-    h->sig = hash64(qstr, strlen(qstr));
-    h->count = (uint32_t)ids->n;
-    memcpy((uint8_t*)base+sizeof(CacheHeader), ids->ids, ids_bytes);
-    msync(base, sz, MS_SYNC);
-    munmap(base, sz);
+    if(!cache_build_path(kind, tag, sig, path, sizeof(path))) return FALSE;
+    int fd = open(path, O_RDONLY);
+    if(fd < 0){ cache_index_remove(sig, kind, tag); return FALSE; }
+    struct stat st;
+    if(fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(CacheHeader)){ close(fd); cache_index_remove(sig, kind, tag); return FALSE; }
+    size_t file_size = (size_t)st.st_size;
+    uint8_t* buf = (uint8_t*)malloc(file_size);
+    if(!buf){ close(fd); return FALSE; }
+    ssize_t rd = read(fd, buf, file_size);
+    close(fd);
+    if(rd != (ssize_t)file_size){ free(buf); cache_index_remove(sig, kind, tag); return FALSE; }
+#endif
+    CacheHeader header = *(CacheHeader*)buf;
+    const uint8_t* data = buf + sizeof(CacheHeader);
+    BOOL ok = FALSE;
+    size_t expected = sizeof(CacheHeader) + header.data_bytes;
+    if(header.magic == CACHE_MAGIC &&
+       header.version == CACHE_VERSION &&
+       header.kind == kind &&
+       header.tag == tag &&
+       header.sig == sig &&
+       header.generation == g_db_generation &&
+       header.bloom_size == g_bloom_size &&
+       header.count <= CACHE_MAX_ENTRIES &&
+       expected == file_size){
+        idvec_free(out); idvec_init(out);
+        if(header.count==0 || decode_ids_delta(data, header.data_bytes, header.count, out)){
+            out->n = header.count;
+            if(out->cap < out->n) out->cap = out->n;
+            ok = TRUE;
+        }
+    }
+    free(buf);
+    if(ok){
+        cache_index_upsert(sig, kind, tag, header.count, header.data_bytes, sizeof(CacheHeader)+header.data_bytes);
+        return TRUE;
+    }
+    cache_index_remove(sig, kind, tag);
+    return FALSE;
+}
+
+static BOOL try_load_cache(const wchar_t* dbPath, const char* qstr, IdVec* out){
+    return try_load_cache_internal(dbPath, qstr, CACHE_KIND_QUERY, 0, out);
+}
+static BOOL save_cache_internal(const wchar_t* dbPath, const char* key, CacheKind kind, uint16_t tag, const IdVec* ids){
+    if(!key || !ids) return FALSE;
+    uint64_t sig = hash64(key, strlen(key));
+    if(!cache_index_prepare(dbPath)) return FALSE;
+    uint8_t* encoded = NULL;
+    size_t data_bytes = encode_ids_delta(ids->ids, ids->n, &encoded);
+    size_t total = sizeof(CacheHeader) + data_bytes;
+#ifdef _WIN32
+    wchar_t path[MAX_LONG_PATH];
+    if(!cache_build_path(kind, tag, sig, path, MAX_LONG_PATH)){ free(encoded); return FALSE; }
+    wchar_t lp[MAX_LONG_PATH]; make_long_path(path, lp, MAX_LONG_PATH);
+    HANDLE f = CreateFileW(lp, GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(f==INVALID_HANDLE_VALUE){ free(encoded); return FALSE; }
+    CacheHeader header = { .magic=CACHE_MAGIC, .version=CACHE_VERSION, .kind=(uint8_t)kind, .tag=(uint8_t)tag, .generation=g_db_generation, .bloom_size=g_bloom_size, .sig=sig, .count=(uint32_t)ids->n, .data_bytes=(uint32_t)data_bytes };
+    DWORD written = 0;
+    if(!WriteFile(f, &header, sizeof(header), &written, NULL) || written != sizeof(header)){
+        CloseHandle(f); free(encoded); cache_index_remove(sig, kind, tag); return FALSE;
+    }
+    if(data_bytes>0){
+        if(!WriteFile(f, encoded, (DWORD)data_bytes, &written, NULL) || written != data_bytes){
+            CloseHandle(f); free(encoded); cache_index_remove(sig, kind, tag); return FALSE;
+        }
+    }
+    FlushFileBuffers(f);
+    CloseHandle(f);
+#else
+    char path[PATH_MAX];
+    if(!cache_build_path(kind, tag, sig, path, sizeof(path))){ free(encoded); return FALSE; }
+    int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0666);
+    if(fd < 0){ free(encoded); return FALSE; }
+    CacheHeader header = { .magic=CACHE_MAGIC, .version=CACHE_VERSION, .kind=(uint8_t)kind, .tag=(uint8_t)tag, .generation=g_db_generation, .bloom_size=g_bloom_size, .sig=sig, .count=(uint32_t)ids->n, .data_bytes=(uint32_t)data_bytes };
+    if(write(fd, &header, sizeof(header)) != (ssize_t)sizeof(header) || (data_bytes>0 && write(fd, encoded, data_bytes) != (ssize_t)data_bytes)){
+        close(fd); free(encoded); cache_index_remove(sig, kind, tag); return FALSE;
+    }
     fsync(fd);
     close(fd);
-    rename(tmp_template, path);
-    flock(lock_fd, LOCK_UN);
-    close(lock_fd);
-    prune_cache_dir(path);
 #endif
+    free(encoded);
+    cache_index_upsert(sig, kind, tag, (uint32_t)ids->n, (uint32_t)data_bytes, total);
+    return TRUE;
+}
+
+static void save_cache(const wchar_t* dbPath, const char* qstr, const IdVec* ids){
+    save_cache_internal(dbPath, qstr, CACHE_KIND_QUERY, 0, ids);
 }
 
 // Per-term cache helpers
@@ -1123,72 +1660,7 @@ static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out){
     key[0] = term_prefix(ttype);
     strncpy(key+1, term, sizeof(key)-2);
     key[sizeof(key)-1] = 0;
-    uint64_t sig = hash64(key, strlen(key));
-#ifdef _WIN32
-    wchar_t cachePath[MAX_LONG_PATH]; wcscpy_s(cachePath, MAX_LONG_PATH, g_db_path);
-    wchar_t* p = path_dirname_w(cachePath); if(!p) return FALSE;
-    swprintf(p+1, (size_t)(MAX_LONG_PATH-(p+1-cachePath)), L"cache_term_%016llx.tmp", (unsigned long long)sig);
-    wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
-    HANDLE f = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    if(f==INVALID_HANDLE_VALUE) return FALSE;
-    DWORD sz = GetFileSize(f, NULL);
-    if(sz < sizeof(CacheHeader)){ CloseHandle(f); return FALSE; }
-    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
-    if(!m){ CloseHandle(f); return FALSE; }
-    BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_READ, 0,0,0);
-    if(!base){ CloseHandle(m); CloseHandle(f); return FALSE; }
-    const CacheHeader* h = (const CacheHeader*)base;
-    BOOL ok = FALSE;
-    size_t need, ids_bytes;
-    if(h->magic == CACHE_MAGIC &&
-       h->version == CACHE_VERSION &&
-       h->sig == sig &&
-       h->generation == g_db_generation &&
-       h->bloom_size == g_bloom_size &&
-       h->count <= CACHE_MAX_ENTRIES &&
-       cache_size(h->count, &need, &ids_bytes) &&
-       (size_t)sz >= need){
-        out->ids = (uint64_t*)malloc(ids_bytes);
-        if(out->ids){
-            memcpy(out->ids, base+sizeof(CacheHeader), ids_bytes);
-            out->n = h->count; out->cap = h->count;
-            ok = TRUE;
-        }
-    }
-    UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
-    return ok;
-#else
-    char path[PATH_MAX];
-    to_utf8(g_db_path, path, sizeof(path));
-    char* p = strrchr(path, '/'); if(!p) return FALSE;
-    snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_term_%016llx.tmp", (unsigned long long)sig);
-    int fd = open(path, O_RDONLY);
-    if(fd < 0) return FALSE;
-    struct stat st; if(fstat(fd, &st) < 0){ close(fd); return FALSE; }
-    if(st.st_size < (off_t)sizeof(CacheHeader)){ close(fd); return FALSE; }
-    void* base = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if(base == MAP_FAILED){ close(fd); return FALSE; }
-    const CacheHeader* h = (const CacheHeader*)base;
-    BOOL ok = FALSE;
-    size_t need, ids_bytes;
-    if(h->magic == CACHE_MAGIC &&
-       h->version == CACHE_VERSION &&
-       h->sig == sig &&
-       h->generation == g_db_generation &&
-       h->bloom_size == g_bloom_size &&
-       h->count <= CACHE_MAX_ENTRIES &&
-       cache_size(h->count, &need, &ids_bytes) &&
-       (size_t)st.st_size >= need){
-        out->ids = (uint64_t*)malloc(ids_bytes);
-        if(out->ids){
-            memcpy(out->ids, (const uint8_t*)base+sizeof(CacheHeader), ids_bytes);
-            out->n = h->count; out->cap = h->count;
-            ok = TRUE;
-        }
-    }
-    munmap(base, st.st_size); close(fd);
-    return ok;
-#endif
+    return try_load_cache_internal(g_db_path, key, CACHE_KIND_TERM, (uint16_t)ttype, out);
 }
 
 static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
@@ -1197,56 +1669,7 @@ static void save_term_cache(TermType ttype, const char* term, const IdVec* ids){
     key[0] = term_prefix(ttype);
     strncpy(key+1, term, sizeof(key)-2);
     key[sizeof(key)-1] = 0;
-    uint64_t sig = hash64(key, strlen(key));
-#ifdef _WIN32
-    wchar_t cachePath[MAX_LONG_PATH]; wcscpy_s(cachePath, MAX_LONG_PATH, g_db_path);
-    wchar_t* p = path_dirname_w(cachePath); if(!p) return;
-    swprintf(p+1, (size_t)(MAX_LONG_PATH-(p+1-cachePath)), L"cache_term_%016llx.tmp", (unsigned long long)sig);
-    wchar_t lp[MAX_LONG_PATH]; make_long_path(cachePath, lp, MAX_LONG_PATH);
-    HANDLE f = CreateFileW(lp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-    if(f==INVALID_HANDLE_VALUE) return;
-    size_t total, ids_bytes;
-    if(!cache_size(ids->n, &total, &ids_bytes) || total > UINT32_MAX){ CloseHandle(f); return; }
-    HANDLE m = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, (DWORD)total, NULL);
-    if(!m){ CloseHandle(f); return; }
-    BYTE* base = (BYTE*)MapViewOfFile(m, FILE_MAP_WRITE, 0,0,0);
-    if(!base){ CloseHandle(m); CloseHandle(f); return; }
-    CacheHeader* h = (CacheHeader*)base;
-    h->magic = CACHE_MAGIC;
-    h->version = CACHE_VERSION;
-    h->pad = 0;
-    h->generation = g_db_generation;
-    h->bloom_size = g_bloom_size;
-    h->sig = sig;
-    h->count = (uint32_t)ids->n;
-    memcpy(base+sizeof(CacheHeader), ids->ids, ids_bytes);
-    UnmapViewOfFile(base); CloseHandle(m); CloseHandle(f);
-    prune_cache_dir(cachePath);
-#else
-    char path[PATH_MAX];
-    to_utf8(g_db_path, path, sizeof(path));
-    char* p = strrchr(path, '/'); if(!p) return;
-    snprintf(p+1, (size_t)(sizeof(path)-(p+1-path)), "cache_term_%016llx.tmp", (unsigned long long)sig);
-    size_t sz, ids_bytes;
-    if(!cache_size(ids->n, &sz, &ids_bytes)) return;
-    int fd = open(path, O_RDWR|O_CREAT|O_TRUNC, 0666);
-    if(fd < 0) return;
-    if(ftruncate(fd, (off_t)sz) != 0){ close(fd); return; }
-    void* base = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if(base == MAP_FAILED){ close(fd); return; }
-    CacheHeader* h = (CacheHeader*)base;
-    h->magic = CACHE_MAGIC;
-    h->version = CACHE_VERSION;
-    h->pad = 0;
-    h->generation = g_db_generation;
-    h->bloom_size = g_bloom_size;
-    h->sig = sig;
-    h->count = (uint32_t)ids->n;
-    memcpy((uint8_t*)base+sizeof(CacheHeader), ids->ids, ids_bytes);
-    msync(base, sz, MS_SYNC);
-    munmap(base, sz); close(fd);
-    prune_cache_dir(path);
-#endif
+    save_cache_internal(g_db_path, key, CACHE_KIND_TERM, (uint16_t)ttype, ids);
 }
 
 // Intersect postings
