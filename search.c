@@ -1787,6 +1787,8 @@ static void records_for_content(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_c
     idvec_free(&ids);
 }
 
+static const size_t MAX_NAME_RESULTS = 100000;
+
 static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_dbi dbi_strings, MDB_dbi dbi_smeta, const char* term, IdVec* out){
     IdVec name_ids; idvec_init(&name_ids);
     collect_trigram_candidates(txn, dbi_trigram, term, &name_ids);
@@ -1831,12 +1833,16 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
         name_ids.n=keep; free(tl);
     }
     MDB_cursor* cix=NULL; mdb_cursor_open(txn, dbi_fname, &cix);
+    BOOL limit_reached = FALSE;
     if(name_ids.n>0){
-        for(size_t i=0;i<name_ids.n;i++){
+        for(size_t i=0;i<name_ids.n && !limit_reached;i++){
             MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
             if(mdb_cursor_get(cix,&k,&v,MDB_SET_KEY)==0){
-                do{ idvec_push(out, *(uint64_t*)v.mv_data); }
-                while(mdb_cursor_get(cix,&k,&v,MDB_NEXT_DUP)==0);
+                do{
+                    if(out->n >= MAX_NAME_RESULTS){ limit_reached = TRUE; break; }
+                    idvec_push(out, *(uint64_t*)v.mv_data);
+                }
+                while(!limit_reached && mdb_cursor_get(cix,&k,&v,MDB_NEXT_DUP)==0);
             }
         }
     } else {
@@ -1851,7 +1857,7 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
         lowercase_ascii(npat,npat_len);
         for(size_t j=0;npat[j];++j){ if(npat[j]=='_'||npat[j]=='-') npat[j]=' '; }
         int maxd=(int)((npat_len+4)/5);
-        while(rc==0){
+        while(rc==0 && !limit_reached){
             uint64_t sid=*(uint64_t*)sk.mv_data;
             char* name=(char*)sv.mv_data; size_t nlen=sv.mv_size;
             char* tmp=(char*)_malloca(nlen+1); memcpy(tmp,name,nlen); tmp[nlen]=0;
@@ -1859,12 +1865,15 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
             if(fuzzy_match(tmp,npat,maxd)){
                 MDB_val k={.mv_data=&sid,.mv_size=sizeof(sid)}, v;
                 if(mdb_cursor_get(cix,&k,&v,MDB_SET_KEY)==0){
-                    do{ idvec_push(out, *(uint64_t*)v.mv_data); }
-                    while(mdb_cursor_get(cix,&k,&v,MDB_NEXT_DUP)==0);
+                    do{
+                        if(out->n >= MAX_NAME_RESULTS){ limit_reached = TRUE; break; }
+                        idvec_push(out, *(uint64_t*)v.mv_data);
+                    }
+                    while(!limit_reached && mdb_cursor_get(cix,&k,&v,MDB_NEXT_DUP)==0);
                 }
             }
             _freea(tmp);
-            rc=mdb_cursor_get(cs,&sk,&sv,MDB_NEXT);
+            if(!limit_reached){ rc=mdb_cursor_get(cs,&sk,&sv,MDB_NEXT); }
         }
         mdb_cursor_close(cs); free(npat);
     }
