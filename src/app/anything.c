@@ -255,7 +255,23 @@ void release_work_item(DbWorkItem* item){
     if(item->preview){ free(item->preview); item->preview = NULL; }
     work_item_clear(item);
     if(g_work_item_pool.initialized){
+        DbWorkItem* start = g_work_item_pool.items;
+        DbWorkItem* end = start ? start + g_work_item_pool.capacity : start;
+        BOOL from_pool = item >= start && item < end;
         if(MPMC_Push(&g_work_item_pool.free_queue, item)){
+            return;
+        }
+        if(from_pool){
+            int tries = 0;
+            while(g_work_item_pool.initialized){
+                if(MPMC_Push(&g_work_item_pool.free_queue, item)){
+                    return;
+                }
+                if(++tries > 1000){
+                    tries = 0;
+                    Sleep(0);
+                }
+            }
             return;
         }
     }
