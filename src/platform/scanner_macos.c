@@ -109,6 +109,8 @@ static void emit_zip_entries(FileScanner* s, const char* path){
         wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
         wi->attributes = 0;
         wi->clone_id = 0;
+        wi->hash_crc = 0;
+        wi->hash_ready = FALSE;
         wi->stage = INDEX_NAMES_ONLY;
         wi->op = WI_ADD;
         while(!MPMC_Push(s->outq, wi)) sched_yield();
@@ -132,6 +134,8 @@ static void emit_pst_tree(FileScanner* s, const wchar_t* parent, pst_file* pf, p
                 wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
                 wi->attributes = 0;
                 wi->clone_id = 0;
+                wi->hash_crc = 0;
+                wi->hash_ready = FALSE;
                 wi->stage = INDEX_NAMES_ONLY;
                 wi->op = WI_ADD;
                 while(!MPMC_Push(s->outq, wi)) sched_yield();
@@ -209,6 +213,8 @@ static void emit(FileScanner* s, const char* path, int base){
     } else {
         wi->clone_id = 0;
     }
+    wi->hash_crc = 0;
+    wi->hash_ready = FALSE;
     wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)) sched_yield();
@@ -263,6 +269,8 @@ static void fsevent_cb(ConstFSEventStreamRef streamRef,
             wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
             wi->attributes = 0;
             wi->clone_id = 0;
+            wi->hash_crc = 0;
+            wi->hash_ready = FALSE;
             wi->stage = INDEX_NAMES_ONLY;
             wi->op = WI_DELETE;
             while(!MPMC_Push(s->outq, wi)) sched_yield();

@@ -72,6 +72,8 @@ static void emit_net(struct NetworkScanner* s, const char* parent, const char* n
     wi->access_time = st->st_atime;
     wi->attributes = S_ISDIR(st->st_mode) ? FILE_ATTRIBUTE_DIRECTORY : 0;
     wi->clone_id = 0;
+    wi->hash_crc = 0;
+    wi->hash_ready = FALSE;
     wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)) sched_yield();
@@ -165,6 +167,8 @@ static void emit_net(struct NetworkScanner* s, const char* parent, const char* n
     wi->access_time = st->st_atime;
     wi->attributes = S_ISDIR(st->st_mode) ? FILE_ATTRIBUTE_DIRECTORY : 0;
     wi->clone_id = 0;
+    wi->hash_crc = 0;
+    wi->hash_ready = FALSE;
     wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)) sched_yield();
