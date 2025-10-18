@@ -398,6 +398,8 @@ static BOOL bloom_buffer_flush(DbImpl* d){
             LARGE_INTEGER rollback; rollback.QuadPart = (LONGLONG)original_size;
             SetFilePointerEx(d->bloom_file, rollback, NULL, FILE_BEGIN);
             SetEndOfFile(d->bloom_file);
+            d->bloom_file_size = original_size;
+            d->bloom_offset = original_size;
             return FALSE;
         }
         written += wr;
