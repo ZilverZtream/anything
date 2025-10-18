@@ -21,6 +21,9 @@
 #ifndef _strdup
 #define _strdup strdup
 #endif
+#ifndef ARRAYSIZE
+#define ARRAYSIZE(a) (sizeof(a)/sizeof((a)[0]))
+#endif
 
 typedef struct {
     uint32_t trigram_count;
@@ -28,36 +31,202 @@ typedef struct {
 } StringMeta;
 
 typedef struct {
-    uint64_t hash;
-    uint64_t string_id;
-    char* string;
+    volatile uint64_t hash;
+    volatile uint64_t string_id;
+    volatile char* string;
 } StringCache;
 
-#define STRING_CACHE_SIZE 65536u
+#define STRING_CACHE_SIZE 262144u
 #define STRING_CACHE_MASK (STRING_CACHE_SIZE-1u)
+#define STRING_CACHE_PROBE_LIMIT STRING_CACHE_SIZE
+
+#define L1_STRING_CACHE_SIZE 256u
+#define L1_STRING_CACHE_MASK (L1_STRING_CACHE_SIZE-1u)
 
 static StringCache g_string_cache[STRING_CACHE_SIZE];
 
+typedef struct {
+    volatile LONG64 stamp;
+    uint64_t wide_hash;
+    uint32_t wide_len;
+    uint32_t utf8_len;
+    uint64_t string_id;
+    volatile wchar_t* wide;
+    volatile char* utf8;
+} L1StringCache;
+
+static L1StringCache g_l1_string_cache[L1_STRING_CACHE_SIZE];
+static volatile LONG64 g_l1_clock = 0;
+
+static const char* const STRING_CACHE_BUSY = (const char*)(intptr_t)1;
+static const wchar_t* const L1_CACHE_BUSY_WIDE = (const wchar_t*)(intptr_t)1;
+static const char* const L1_CACHE_BUSY_UTF8 = (const char*)(intptr_t)1;
+
+static inline char* atomic_load_char(volatile char** p){
+    return (char*)InterlockedCompareExchangePointer((PVOID*)p, NULL, NULL);
+}
+
+static inline wchar_t* atomic_load_wchar(volatile wchar_t** p){
+    return (wchar_t*)InterlockedCompareExchangePointer((PVOID*)p, NULL, NULL);
+}
+
+static uint64_t hash_wide_string(const wchar_t* s, size_t* out_len){
+    if(!s){
+        if(out_len) *out_len = 0;
+        return 0;
+    }
+    size_t len = wcslen(s);
+    if(out_len) *out_len = len;
+    return hash64(s, len * sizeof(wchar_t));
+}
+
+static uint64_t l1_cache_lookup(const wchar_t* s, uint64_t wide_hash, size_t wlen, const char** out_u8, size_t* out_u8_len){
+    if(out_u8) *out_u8 = NULL;
+    if(out_u8_len) *out_u8_len = 0;
+    if(!s || wlen == 0) return 0;
+    LONG64 stamp = InterlockedIncrement64(&g_l1_clock);
+    for(uint32_t i = 0; i < L1_STRING_CACHE_SIZE; ++i){
+        L1StringCache* entry = &g_l1_string_cache[i];
+        wchar_t* cached_wide = atomic_load_wchar(&entry->wide);
+        if(!cached_wide || cached_wide == L1_CACHE_BUSY_WIDE) continue;
+        if(entry->wide_hash != wide_hash || entry->wide_len != (uint32_t)wlen) continue;
+        if(wmemcmp(cached_wide, s, wlen) != 0) continue;
+        InterlockedExchange64(&entry->stamp, stamp);
+        char* cached_utf8 = atomic_load_char(&entry->utf8);
+        if(cached_utf8 && cached_utf8 != L1_CACHE_BUSY_UTF8){
+            if(out_u8) *out_u8 = cached_utf8;
+            if(out_u8_len) *out_u8_len = entry->utf8_len;
+        }
+        return entry->string_id;
+    }
+    return 0;
+}
+
+static void l1_cache_update(const wchar_t* wide, size_t wlen, uint64_t wide_hash, const char* utf8, size_t utf8_len, uint64_t string_id){
+    if(!wide || wlen == 0 || !utf8 || utf8_len == 0 || string_id == 0) return;
+    LONG64 stamp = InterlockedIncrement64(&g_l1_clock);
+    L1StringCache* target = NULL;
+    LONG64 oldest = LLONG_MAX;
+    for(uint32_t i = 0; i < L1_STRING_CACHE_SIZE; ++i){
+        L1StringCache* entry = &g_l1_string_cache[i];
+        wchar_t* cached_wide = atomic_load_wchar(&entry->wide);
+        if(!cached_wide){
+            target = entry;
+            break;
+        }
+        if(cached_wide == L1_CACHE_BUSY_WIDE) continue;
+        LONG64 entry_stamp = entry->stamp;
+        if(entry_stamp < oldest){
+            oldest = entry_stamp;
+            target = entry;
+        }
+    }
+    if(!target) return;
+    for(;;){
+        wchar_t* expected_wide = atomic_load_wchar(&target->wide);
+        if(expected_wide == L1_CACHE_BUSY_WIDE) continue;
+        if(InterlockedCompareExchangePointer((PVOID*)&target->wide, (PVOID)L1_CACHE_BUSY_WIDE, expected_wide) == expected_wide){
+            char* expected_utf8;
+            do {
+                expected_utf8 = atomic_load_char(&target->utf8);
+            } while(expected_utf8 == L1_CACHE_BUSY_UTF8);
+            InterlockedExchangePointer((PVOID*)&target->utf8, (PVOID)L1_CACHE_BUSY_UTF8);
+            if(expected_wide && expected_wide != L1_CACHE_BUSY_WIDE) free(expected_wide);
+            if(expected_utf8 && expected_utf8 != L1_CACHE_BUSY_UTF8) free(expected_utf8);
+            wchar_t* wide_copy = _wcsdup(wide);
+            char* utf8_copy = _strdup(utf8);
+            if(!wide_copy || !utf8_copy){
+                if(wide_copy) free(wide_copy);
+                if(utf8_copy) free(utf8_copy);
+                InterlockedExchangePointer((PVOID*)&target->utf8, NULL);
+                InterlockedExchangePointer((PVOID*)&target->wide, NULL);
+                return;
+            }
+            target->wide_hash = wide_hash;
+            target->wide_len = (uint32_t)wlen;
+            target->utf8_len = (uint32_t)utf8_len;
+            target->string_id = string_id;
+            target->stamp = stamp;
+            MemoryBarrier();
+            InterlockedExchangePointer((PVOID*)&target->utf8, utf8_copy);
+            InterlockedExchangePointer((PVOID*)&target->wide, wide_copy);
+            return;
+        }
+    }
+}
+
 static uint64_t string_cache_lookup(const char* s, uint64_t h){
-    for(uint32_t i=0;i<STRING_CACHE_SIZE;i++){
-        StringCache* c = &g_string_cache[(h + i) & STRING_CACHE_MASK];
-        if(!c->string) return 0;
-        if(c->hash==h && strcmp(c->string, s)==0) return c->string_id;
+    if(!s) return 0;
+    uint32_t mask = STRING_CACHE_MASK;
+    uint32_t idx = (uint32_t)h & mask;
+    uint32_t step = (uint32_t)(((h >> 32) & mask) | 1u);
+    if(step == 0) step = 1u;
+    for(uint32_t probe = 0; probe < STRING_CACHE_PROBE_LIMIT; ++probe){
+        StringCache* c = &g_string_cache[idx];
+        char* str = atomic_load_char((volatile char**)&c->string);
+        if(!str) return 0;
+        if(str == STRING_CACHE_BUSY){
+            idx = (idx + step) & mask;
+            continue;
+        }
+        if(c->hash == h && strcmp(str, s) == 0){
+            return c->string_id;
+        }
+        idx = (idx + step) & mask;
     }
     return 0;
 }
 
 static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
-    for(uint32_t i=0;i<STRING_CACHE_SIZE;i++){
-        StringCache* c = &g_string_cache[(h + i) & STRING_CACHE_MASK];
-        if(!c->string){
-            c->hash=h; c->string_id=id; c->string=_strdup(s); return;
+    if(!s) return;
+    uint32_t mask = STRING_CACHE_MASK;
+    uint32_t idx = (uint32_t)h & mask;
+    uint32_t step = (uint32_t)(((h >> 32) & mask) | 1u);
+    if(step == 0) step = 1u;
+    uint32_t best_idx = idx;
+    uint64_t best_age = UINT64_MAX;
+    for(uint32_t probe = 0; probe < STRING_CACHE_PROBE_LIMIT; ++probe){
+        StringCache* c = &g_string_cache[idx];
+        char* str = atomic_load_char((volatile char**)&c->string);
+        if(!str){
+            if(InterlockedCompareExchangePointer((PVOID*)&c->string, (PVOID)STRING_CACHE_BUSY, NULL) == NULL){
+                c->hash = h;
+                c->string_id = id;
+                char* dup = _strdup(s);
+                MemoryBarrier();
+                InterlockedExchangePointer((PVOID*)&c->string, dup);
+                return;
+            }
+            continue;
         }
-        if(c->hash==h && strcmp(c->string,s)==0){ c->string_id=id; return; }
+        if(str == STRING_CACHE_BUSY){
+            idx = (idx + step) & mask;
+            continue;
+        }
+        if(c->hash == h && strcmp(str, s) == 0){
+            c->string_id = id;
+            return;
+        }
+        if(c->string_id < best_age){
+            best_age = c->string_id;
+            best_idx = idx;
+        }
+        idx = (idx + step) & mask;
     }
-    StringCache* c = &g_string_cache[h & STRING_CACHE_MASK];
-    free(c->string);
-    c->hash=h; c->string_id=id; c->string=_strdup(s);
+    StringCache* victim = &g_string_cache[best_idx];
+    for(;;){
+        char* expected = atomic_load_char((volatile char**)&victim->string);
+        if(expected == STRING_CACHE_BUSY) continue;
+        if(InterlockedCompareExchangePointer((PVOID*)&victim->string, (PVOID)STRING_CACHE_BUSY, expected) == expected){
+            if(expected) free(expected);
+            victim->hash = h;
+            victim->string_id = id;
+            char* dup = _strdup(s);
+            MemoryBarrier();
+            InterlockedExchangePointer((PVOID*)&victim->string, dup);
+            return;
+        }
+    }
 }
 
 static inline void bloom_set(uint8_t* bloom, uint32_t h){
@@ -447,56 +616,229 @@ static BOOL str_by_id_with_retry(DbImpl* d, uint64_t id, MDB_val* out, int max_r
     return FALSE;
 }
 
-uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
-    if(!s || !s[0]) return 0;
+typedef struct InternTask {
+    size_t index;
+    const wchar_t* wide;
+    size_t wide_len;
+    uint64_t wide_hash;
+    char* utf8;
+    size_t utf8_len;
+    uint64_t utf8_hash;
+    uint64_t id;
+    struct InternTask* leader;
+} InternTask;
+
+static int intern_task_cmp(const void* a, const void* b){
+    const InternTask* const* pa = (const InternTask* const*)a;
+    const InternTask* const* pb = (const InternTask* const*)b;
+    if((*pa)->utf8_hash < (*pb)->utf8_hash) return -1;
+    if((*pa)->utf8_hash > (*pb)->utf8_hash) return 1;
+    if((*pa)->utf8_len < (*pb)->utf8_len) return -1;
+    if((*pa)->utf8_len > (*pb)->utf8_len) return 1;
+    return strcmp((*pa)->utf8, (*pb)->utf8);
+}
+
+static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, size_t count, uint64_t* out_ids){
+    if(!db_ || !out_ids || !strings || count == 0) return;
     DbImpl* d = (DbImpl*)db_;
-    uint64_t result = 0;
-    int needed = WideCharToMultiByte(CP_UTF8,0,s,-1,NULL,0,NULL,NULL);
-    if(needed<=0) return 0;
-    char stack_u8[512];
-    BOOL heap = needed > (int)sizeof(stack_u8);
-    char* u8 = heap ? (char*)malloc(needed) : stack_u8;
-    if(!u8) return 0;
-    WideCharToMultiByte(CP_UTF8,0,s,-1,u8,needed,NULL,NULL);
-    size_t u8len = (size_t)(needed-1);
-    uint64_t h = hash64(u8, u8len);
-    uint64_t cached = string_cache_lookup(u8, h);
-    if(cached){ result = cached; goto cleanup; }
-    // Try to read using the current write txn if present; otherwise open a RO txn.
+    size_t task_cap = count;
+    InternTask stack_tasks[8];
+    InternTask* tasks = (count <= ARRAYSIZE(stack_tasks)) ? stack_tasks : (InternTask*)malloc(sizeof(InternTask) * task_cap);
+    InternTask** order = NULL;
+    InternTask** unique = NULL;
+    size_t task_count = 0;
+    size_t valid_tasks = 0;
+    size_t unique_count = 0;
+    if(!tasks) goto cleanup;
+
+    for(size_t i = 0; i < count; ++i){
+        const wchar_t* ws = strings[i];
+        if(!ws || !ws[0]){ out_ids[i] = 0; continue; }
+        size_t wlen = 0; uint64_t whash = hash_wide_string(ws, &wlen);
+        const char* cached_utf8 = NULL; size_t cached_utf8_len = 0;
+        uint64_t cached_id = l1_cache_lookup(ws, whash, wlen, &cached_utf8, &cached_utf8_len);
+        if(cached_id){
+            out_ids[i] = cached_id;
+            continue;
+        }
+        InternTask task = {0};
+        task.index = i;
+        task.wide = ws;
+        task.wide_len = wlen;
+        task.wide_hash = whash;
+        task.utf8 = NULL;
+        task.utf8_len = 0;
+        task.utf8_hash = 0;
+        task.id = 0;
+        task.leader = NULL;
+        if(task_count < task_cap){
+            tasks[task_count++] = task;
+        }
+    }
+
+    if(task_count == 0) goto cleanup;
+
+    order = (InternTask**)malloc(sizeof(InternTask*) * task_count);
+    unique = (InternTask**)malloc(sizeof(InternTask*) * task_count);
+    if(!order || !unique) goto cleanup;
+
+    for(size_t i = 0; i < task_count; ++i){
+        InternTask* t = &tasks[i];
+        int needed = WideCharToMultiByte(CP_UTF8, 0, t->wide, -1, NULL, 0, NULL, NULL);
+        if(needed <= 0){
+            out_ids[t->index] = 0;
+            continue;
+        }
+        char* buf = (char*)malloc((size_t)needed);
+        if(!buf){
+            out_ids[t->index] = 0;
+            continue;
+        }
+        int rc = WideCharToMultiByte(CP_UTF8, 0, t->wide, -1, buf, needed, NULL, NULL);
+        if(rc <= 0){
+            free(buf);
+            out_ids[t->index] = 0;
+            continue;
+        }
+        t->utf8 = buf;
+        t->utf8_len = (size_t)(needed - 1);
+        t->utf8_hash = hash64(buf, t->utf8_len);
+        order[valid_tasks++] = t;
+    }
+
+    if(valid_tasks == 0) goto cleanup;
+
+    qsort(order, valid_tasks, sizeof(InternTask*), intern_task_cmp);
+
+    InternTask* prev = NULL;
+    for(size_t i = 0; i < valid_tasks; ++i){
+        InternTask* t = order[i];
+        if(prev && prev->utf8_hash == t->utf8_hash && prev->utf8_len == t->utf8_len && strcmp(prev->utf8, t->utf8) == 0){
+            t->leader = prev->leader ? prev->leader : prev;
+        } else {
+            t->leader = t;
+            unique[unique_count++] = t;
+            prev = t;
+        }
+        prev = t;
+    }
+
+    for(size_t i = 0; i < unique_count; ++i){
+        InternTask* t = unique[i];
+        t->id = string_cache_lookup(t->utf8, t->utf8_hash);
+    }
+
     MDB_txn* rtxn = d->wtxn ? d->wtxn : NULL;
     BOOL need_abort = FALSE;
     if(!rtxn){
-        if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn)!=0) goto cleanup;
-        need_abort = TRUE;
+        int rc = mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn);
+        if(rc == 0){
+            need_abort = TRUE;
+        } else {
+            rtxn = NULL;
+            set_mdb_error(d, rc);
+        }
     }
-    MDB_val k={.mv_data=u8,.mv_size=u8len}, v;
-    int rc = mdb_get(rtxn, d->dbi_strrev, &k, &v);
-    if(rc==0){
-        result = *(uint64_t*)v.mv_data;
-        string_cache_insert(u8, h, result);
-        if(need_abort) mdb_txn_abort(rtxn);
-        goto cleanup;
+    if(rtxn){
+        for(size_t i = 0; i < unique_count; ++i){
+            InternTask* t = unique[i];
+            if(t->id) continue;
+            MDB_val k = {.mv_data = t->utf8, .mv_size = t->utf8_len};
+            MDB_val v;
+            if(mdb_get(rtxn, d->dbi_strrev, &k, &v) == 0){
+                t->id = *(uint64_t*)v.mv_data;
+                string_cache_insert(t->utf8, t->utf8_hash, t->id);
+            }
+        }
     }
-    if(need_abort) mdb_txn_abort(rtxn);
-    if(!d->wtxn && !db_begin_write(db_)) goto cleanup;
-    uint64_t new_id = d->header_cache.string_count + 1;
-    d->header_cache.string_count = new_id;
-    MDB_val idkey={.mv_data=&new_id,.mv_size=sizeof(new_id)};
-    MDB_val idval={.mv_data=u8,.mv_size=u8len};
-    rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
-    if(rc){ set_mdb_error(d,rc); goto cleanup; }
-    MDB_val revval={.mv_data=&new_id,.mv_size=sizeof(new_id)};
-    rc = mdb_put(d->wtxn, d->dbi_strrev, &k, &revval, 0);
-    if(rc){ set_mdb_error(d,rc); goto cleanup; }
-    // update header
-    MDB_val mk,mv; const char* H="header"; to_mdb_val(H, strlen(H), &mk);
-    to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
-    rc = mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
-    if(rc){ set_mdb_error(d,rc); goto cleanup; }
-    string_cache_insert(u8, h, new_id);
-    result = new_id;
+    if(need_abort && rtxn){
+        mdb_txn_abort(rtxn);
+        rtxn = NULL;
+    }
+
+    uint64_t original_count = d->header_cache.string_count;
+    BOOL header_dirty = FALSE;
+    for(size_t i = 0; i < unique_count; ++i){
+        InternTask* t = unique[i];
+        if(t->id) continue;
+        if(!d->wtxn && !db_begin_write(db_)){
+            d->header_cache.string_count = original_count;
+            goto cleanup;
+        }
+        uint64_t new_id = d->header_cache.string_count + 1;
+        d->header_cache.string_count = new_id;
+        MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
+        MDB_val idval = {.mv_data = t->utf8, .mv_size = t->utf8_len};
+        int rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
+        if(rc){
+            d->header_cache.string_count = original_count;
+            set_mdb_error(d, rc);
+            goto cleanup;
+        }
+        MDB_val revkey = {.mv_data = t->utf8, .mv_size = t->utf8_len};
+        MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
+        rc = mdb_put(d->wtxn, d->dbi_strrev, &revkey, &revid, 0);
+        if(rc){
+            d->header_cache.string_count = original_count;
+            set_mdb_error(d, rc);
+            goto cleanup;
+        }
+        t->id = new_id;
+        string_cache_insert(t->utf8, t->utf8_hash, t->id);
+        header_dirty = TRUE;
+    }
+
+    if(header_dirty){
+        MDB_val mk, mv; const char* H = "header";
+        to_mdb_val(H, strlen(H), &mk);
+        to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
+        int rc = mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
+        if(rc){
+            d->header_cache.string_count = original_count;
+            set_mdb_error(d, rc);
+            goto cleanup;
+        }
+    }
+
+    for(size_t i = 0; i < unique_count; ++i){
+        InternTask* t = unique[i];
+        if(t->id){
+            l1_cache_update(t->wide, t->wide_len, t->wide_hash, t->utf8, t->utf8_len, t->id);
+        }
+    }
+
+    for(size_t i = 0; i < valid_tasks; ++i){
+        InternTask* t = order[i];
+        InternTask* leader = t->leader ? t->leader : t;
+        if(leader->id){
+            out_ids[t->index] = leader->id;
+        } else {
+            out_ids[t->index] = 0;
+        }
+    }
+
 cleanup:
-    if(heap) free(u8);
+    if(order){
+        for(size_t i = 0; i < valid_tasks; ++i){
+            InternTask* t = order[i];
+            if(t->utf8){
+                free(t->utf8);
+                t->utf8 = NULL;
+            }
+        }
+        free(order);
+    }
+    if(unique) free(unique);
+    if(tasks && tasks != stack_tasks) free(tasks);
+}
+
+uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
+    if(!s || !s[0]) return 0;
+    uint64_t result = 0;
+    const wchar_t* array[1] = { s };
+    uint64_t ids[1] = { 0 };
+    db_intern_wstrings_batched(db_, array, 1, ids);
+    result = ids[0];
     return result;
 }
 
