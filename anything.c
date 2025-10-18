@@ -11,6 +11,8 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "query.lib")
+#include <io.h>
+#include <fcntl.h>
 #else
 #include <unistd.h>
 #endif
@@ -214,6 +216,90 @@ static ContentMode get_content_mode(const wchar_t* name){
         return CONTENT_PST;
 
     return CONTENT_NONE;
+}
+
+static FILE* open_text_file_stream(const wchar_t* path){
+#ifdef _WIN32
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if(h == INVALID_HANDLE_VALUE) return NULL;
+    int fd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
+    if(fd == -1){
+        CloseHandle(h);
+        return NULL;
+    }
+    FILE* f = _fdopen(fd, "rb");
+    if(!f){
+        _close(fd);
+        return NULL;
+    }
+    return f;
+#else
+    char path_mb[MAX_LONG_PATH * 3];
+    to_utf8(path, path_mb, sizeof(path_mb));
+    path_mb[sizeof(path_mb) - 1] = '\0';
+    return fopen(path_mb, "rb");
+#endif
+}
+
+static char* read_text_file_sequential(const wchar_t* path, size_t* out_len){
+    if(out_len) *out_len = 0;
+    FILE* f = open_text_file_stream(path);
+    if(!f) return NULL;
+
+    size_t capacity = 8192;
+    if(capacity > MAX_INDEXED_CONTENT) capacity = MAX_INDEXED_CONTENT;
+    char* buffer = (char*)malloc(capacity + 1);
+    if(!buffer){
+        fclose(f);
+        return NULL;
+    }
+
+    size_t total = 0;
+    while(total < MAX_INDEXED_CONTENT){
+        if(capacity - total == 0){
+            size_t new_cap = capacity * 2;
+            if(new_cap < capacity) new_cap = MAX_INDEXED_CONTENT;
+            if(new_cap > MAX_INDEXED_CONTENT) new_cap = MAX_INDEXED_CONTENT;
+            if(new_cap == capacity) break;
+            char* nb = (char*)realloc(buffer, new_cap + 1);
+            if(!nb){
+                free(buffer);
+                fclose(f);
+                return NULL;
+            }
+            buffer = nb;
+            capacity = new_cap;
+        }
+
+        size_t space = capacity - total;
+        size_t to_read = space;
+        size_t remaining_limit = MAX_INDEXED_CONTENT - total;
+        if(to_read > remaining_limit) to_read = remaining_limit;
+
+        size_t n = fread(buffer + total, 1, to_read, f);
+        if(n == 0){
+            if(ferror(f)){
+                free(buffer);
+                fclose(f);
+                return NULL;
+            }
+            break;
+        }
+        total += n;
+        if(n < to_read) break;
+    }
+
+    fclose(f);
+
+    buffer[total] = '\0';
+    if(total == 0){
+        free(buffer);
+        return NULL;
+    }
+
+    if(out_len) *out_len = total;
+    return buffer;
 }
 
 static BOOL needs_thumbnail(const wchar_t* name){
@@ -618,20 +704,10 @@ static uint64_t index_file_content(Db* db, const wchar_t* parent, const wchar_t*
 
     wchar_t* wbuf = NULL;
     if(mode == CONTENT_TEXT){
-        FILE* f = _wfopen(path, L"rb");
-        if(!f) return 0;
-        if(fseek(f,0,SEEK_END)!=0){ fclose(f); return 0; }
-        long size = ftell(f);
-        if(size < 0){ fclose(f); return 0; }
-        if(size > MAX_INDEXED_CONTENT) size = MAX_INDEXED_CONTENT;
-        rewind(f);
-        char* buf = (char*)malloc((size_t)size + 1);
-        if(!buf){ fclose(f); return 0; }
-        size_t n = fread(buf,1,(size_t)size,f);
-        fclose(f);
-        buf[n]=0;
-        for(size_t i=0;i<n;i++){ if(buf[i]==0){ buf[0]=0; break; } }
-        if(buf[0]==0){ free(buf); return 0; }
+        size_t raw_len = 0;
+        char* buf = read_text_file_sequential(path, &raw_len);
+        if(!buf) return 0;
+        if(memchr(buf, '\0', raw_len)){ free(buf); return 0; }
         char* a = StrStrIA(buf, "author:");
         if(a){
             a += 7;
