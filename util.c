@@ -254,19 +254,157 @@ uint64_t crc64(const void* data, size_t len){
     return crc64_update(0, data, len);
 }
 
-uint64_t crc64_file(const wchar_t* path){
-    if(!path) return 0;
+static BOOL cancel_overlapped_io(HANDLE handle, LPOVERLAPPED ov){
+    typedef BOOL (WINAPI *CancelIoExFn)(HANDLE, LPOVERLAPPED);
+    static CancelIoExFn pCancelIoEx = NULL;
+    static BOOL resolved = FALSE;
+    if(!resolved){
+        HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+        if(kernel){
+            pCancelIoEx = (CancelIoExFn)GetProcAddress(kernel, "CancelIoEx");
+        }
+        resolved = TRUE;
+    }
+    if(pCancelIoEx){
+        return pCancelIoEx(handle, ov);
+    }
+    return CancelIo(handle);
+}
+
+enum {
+    CRC64_CHUNK_SIZE = 64 * 1024,
+    CRC64_CANCEL_CHECK_INTERVAL = 16,
+    CRC64_READ_TIMEOUT_MS = 100
+};
+
+uint64_t crc64_file(const wchar_t* path, const struct CancelToken* cancel_token, crc64_progress_fn progress_cb, void* progress_ctx){
+    if(!path || is_cancelled(cancel_token)) return 0;
+
     wchar_t lp[MAX_LONG_PATH];
     make_long_path(path, lp, MAX_LONG_PATH);
-    HANDLE h = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+
+    HANDLE h = CreateFileW(lp, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED, NULL);
     if(h==INVALID_HANDLE_VALUE) return 0;
-    uint8_t buf[64*1024];
-    DWORD rd = 0;
-    uint64_t crc = 0;
-    while(ReadFile(h, buf, sizeof(buf), &rd, NULL) && rd>0){
-        crc = crc64_update(crc, buf, rd);
+
+    HANDLE evt = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if(!evt){
+        CloseHandle(h);
+        return 0;
     }
+
+    LARGE_INTEGER file_size_li;
+    uint64_t total_bytes = 0;
+    if(GetFileSizeEx(h, &file_size_li) && file_size_li.QuadPart > 0){
+        total_bytes = (uint64_t)file_size_li.QuadPart;
+    }
+
+    uint64_t last_reported = UINT64_MAX;
+    if(progress_cb){
+        progress_cb(0, total_bytes, progress_ctx);
+        last_reported = 0;
+    }
+
+    uint8_t buf[CRC64_CHUNK_SIZE];
+    uint64_t crc = 0;
+    uint64_t offset = 0;
+    uint64_t processed = 0;
+    size_t chunk_count = 0;
+    BOOL cancelled = FALSE;
+    BOOL failed = FALSE;
+
+    while(!cancelled && !failed){
+        if(is_cancelled(cancel_token)){
+            cancelled = TRUE;
+            break;
+        }
+
+        OVERLAPPED ov;
+        memset(&ov, 0, sizeof(ov));
+        ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
+        ov.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFF);
+        ov.hEvent = evt;
+
+        DWORD bytes_read = 0;
+        BOOL read_ok = ReadFile(h, buf, (DWORD)sizeof(buf), &bytes_read, &ov);
+        if(!read_ok){
+            DWORD err = GetLastError();
+            if(err == ERROR_HANDLE_EOF){
+                bytes_read = 0;
+            } else if(err == ERROR_IO_PENDING){
+                for(;;){
+                    DWORD wait_res = WaitForSingleObject(evt, CRC64_READ_TIMEOUT_MS);
+                    if(wait_res == WAIT_OBJECT_0){
+                        if(!GetOverlappedResult(h, &ov, &bytes_read, FALSE)){
+                            DWORD ov_err = GetLastError();
+                            if(ov_err == ERROR_HANDLE_EOF){
+                                bytes_read = 0;
+                            } else if(ov_err == ERROR_OPERATION_ABORTED){
+                                cancelled = TRUE;
+                            } else {
+                                failed = TRUE;
+                            }
+                        }
+                        break;
+                    } else if(wait_res == WAIT_TIMEOUT){
+                        if(is_cancelled(cancel_token)){
+                            cancel_overlapped_io(h, &ov);
+                            if(!GetOverlappedResult(h, &ov, &bytes_read, TRUE)){
+                                DWORD cancel_err = GetLastError();
+                                if(cancel_err == ERROR_OPERATION_ABORTED){
+                                    cancelled = TRUE;
+                                } else if(cancel_err == ERROR_HANDLE_EOF){
+                                    bytes_read = 0;
+                                } else if(cancel_err != ERROR_NOT_FOUND){
+                                    failed = TRUE;
+                                }
+                            } else {
+                                cancelled = TRUE;
+                            }
+                            break;
+                        }
+                        continue;
+                    } else {
+                        cancel_overlapped_io(h, &ov);
+                        DWORD ignored = 0;
+                        GetOverlappedResult(h, &ov, &ignored, TRUE);
+                        failed = TRUE;
+                        break;
+                    }
+                }
+            } else {
+                failed = TRUE;
+            }
+        }
+
+        if(cancelled || failed) break;
+        if(bytes_read == 0) break;
+
+        crc = crc64_update(crc, buf, bytes_read);
+        offset += bytes_read;
+        processed += bytes_read;
+        chunk_count++;
+
+        if(progress_cb && processed != last_reported){
+            progress_cb(processed, total_bytes, progress_ctx);
+            last_reported = processed;
+        }
+
+        if((chunk_count % CRC64_CANCEL_CHECK_INTERVAL) == 0 && is_cancelled(cancel_token)){
+            cancelled = TRUE;
+            break;
+        }
+    }
+
+    if(progress_cb && processed != last_reported){
+        progress_cb(processed, total_bytes, progress_ctx);
+    }
+
+    CloseHandle(evt);
     CloseHandle(h);
+
+    if(cancelled || failed){
+        return 0;
+    }
     return crc;
 }
 

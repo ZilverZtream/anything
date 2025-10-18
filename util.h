@@ -35,7 +35,10 @@ void to_wide(const char* u8, wchar_t* w, size_t wcap);
 uint64_t hash64(const void* data, size_t len);
 uint64_t crc64_update(uint64_t crc, const void* data, size_t len);
 uint64_t crc64(const void* data, size_t len);
-uint64_t crc64_file(const wchar_t* path);
+
+struct CancelToken;
+typedef void (*crc64_progress_fn)(uint64_t processed_bytes, uint64_t total_bytes, void* user_data);
+uint64_t crc64_file(const wchar_t* path, const struct CancelToken* cancel_token, crc64_progress_fn progress_cb, void* progress_ctx);
 void sha1(const void* data, size_t len, uint8_t out[20]);
 void compute_drive_signature(const wchar_t* drive, uint8_t sig[32]);
 float bm25_score(int tf, int doc_len, float avg_doc_len, int docs_total, int docs_with_term);

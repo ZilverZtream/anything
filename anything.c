@@ -1087,7 +1087,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                     extract_exif_metadata(ctx->db, fpath, &r);
                     extract_id3_metadata(ctx->db, fpath, &r);
                     if(is_archive_file(wi->name)){ index_archive(ctx->db, fpath); }
-                    r.hash_crc = crc64_file(fpath);
+                    r.hash_crc = crc64_file(fpath, &ctx->cancel, NULL, NULL);
                     buf[in_batch++] = r;
                 }
             }

@@ -99,7 +99,7 @@ static void scan_dir(const wchar_t* dir){
             fe.ctime = ((ULARGE_INTEGER){fd.ftCreationTime.dwLowDateTime, fd.ftCreationTime.dwHighDateTime}).QuadPart;
             fe.mtime = ((ULARGE_INTEGER){fd.ftLastWriteTime.dwLowDateTime, fd.ftLastWriteTime.dwHighDateTime}).QuadPart;
             fe.atime = ((ULARGE_INTEGER){fd.ftLastAccessTime.dwLowDateTime, fd.ftLastAccessTime.dwHighDateTime}).QuadPart;
-            fe.hash  = crc64_file(full);
+            fe.hash  = crc64_file(full, g_host.cancel_token, NULL, NULL);
             add_file(&fe);
         }
     }while(FindNextFileW(h,&fd));
@@ -139,7 +139,7 @@ static void scan_dir(const wchar_t* dir){
             fe.ctime = to_filetime(st.st_ctime);
             fe.mtime = to_filetime(st.st_mtime);
             fe.atime = to_filetime(st.st_atime);
-            fe.hash  = crc64_file(full);
+            fe.hash  = crc64_file(full, g_host.cancel_token, NULL, NULL);
             add_file(&fe);
         }
     }
