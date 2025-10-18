@@ -87,6 +87,8 @@ typedef struct FrnMap {
     FrnEntry* slots;
     size_t cap;
     size_t count;
+    size_t slots_bytes;
+    volatile size_t slots_committed;
     NameArena* arena;
     NameArena* current_arena;
     size_t arena_total_bytes;
@@ -107,6 +109,134 @@ typedef struct FrnMap {
 #define FRN_ARENA_POOL_BATCH 32
 #define FRN_ARENA_ALIGN_CHARS 2
 #define FRN_MMAP_MIN_CHARS (size_t)((64ULL*1024ULL)/sizeof(wchar_t))
+#define FRNMAP_COMMIT_GRANULARITY (size_t)(64ULL*1024ULL)
+
+#ifndef _WIN32
+#include <sys/mman.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#endif
+
+#ifdef _WIN32
+static size_t frnmap_atomic_read_size(volatile size_t* value){
+#if defined(_WIN64)
+    return (size_t)InterlockedCompareExchange64((volatile LONG64*)value, 0, 0);
+#else
+    return (size_t)InterlockedCompareExchange((volatile LONG*)value, 0, 0);
+#endif
+}
+
+static BOOL frnmap_atomic_compare_exchange_size(volatile size_t* value, size_t expected, size_t desired){
+#if defined(_WIN64)
+    return InterlockedCompareExchange64((volatile LONG64*)value, (LONG64)desired, (LONG64)expected) == (LONG64)expected;
+#else
+    return InterlockedCompareExchange((volatile LONG*)value, (LONG)desired, (LONG)expected) == (LONG)expected;
+#endif
+}
+#else
+static size_t frnmap_atomic_read_size(volatile size_t* value){
+    return *value;
+}
+
+static BOOL frnmap_atomic_compare_exchange_size(volatile size_t* value, size_t expected, size_t desired){
+    if(*value == expected){
+        *value = desired;
+        return TRUE;
+    }
+    return FALSE;
+}
+#endif
+
+static void frnmap_release_slots(FrnMap* m){
+    if(!m || !m->slots){
+        return;
+    }
+#ifdef _WIN32
+    VirtualFree(m->slots, 0, MEM_RELEASE);
+#else
+    munmap(m->slots, m->slots_bytes);
+#endif
+    m->slots = NULL;
+    m->slots_bytes = 0;
+    m->slots_committed = 0;
+}
+
+static BOOL frnmap_ensure_slot_committed(FrnMap* m, size_t index){
+#ifdef _WIN32
+    if(!m || !m->slots){
+        return FALSE;
+    }
+    size_t needed_bytes = (index + 1) * sizeof(FrnEntry);
+    if(needed_bytes > m->slots_bytes){
+        needed_bytes = m->slots_bytes;
+    }
+    for(;;){
+        size_t committed = frnmap_atomic_read_size(&m->slots_committed);
+        if(needed_bytes <= committed){
+            return TRUE;
+        }
+        size_t gran = FRNMAP_COMMIT_GRANULARITY;
+        size_t target = (needed_bytes + (gran - 1)) & ~(gran - 1);
+        if(target > m->slots_bytes){
+            target = m->slots_bytes;
+        }
+        if(target <= committed){
+            return TRUE;
+        }
+        size_t to_commit = target - committed;
+        void* addr = (uint8_t*)m->slots + committed;
+        if(!VirtualAlloc(addr, to_commit, MEM_COMMIT, PAGE_READWRITE)){
+            return FALSE;
+        }
+        if(frnmap_atomic_compare_exchange_size(&m->slots_committed, committed, committed + to_commit)){
+            return TRUE;
+        }
+    }
+#else
+    (void)m; (void)index;
+#endif
+    return TRUE;
+}
+
+static BOOL frnmap_allocate_slots(FrnMap* m, size_t slot_count){
+    if(!m){
+        return FALSE;
+    }
+    if(slot_count == 0){
+        m->slots = NULL;
+        m->slots_bytes = 0;
+        m->slots_committed = 0;
+        return TRUE;
+    }
+    size_t bytes = slot_count * sizeof(FrnEntry);
+#ifdef _WIN32
+    FrnEntry* slots = (FrnEntry*)VirtualAlloc(NULL, bytes, MEM_RESERVE, PAGE_READWRITE);
+    if(!slots){
+        return FALSE;
+    }
+    size_t initial_commit = bytes < FRNMAP_COMMIT_GRANULARITY ? bytes : FRNMAP_COMMIT_GRANULARITY;
+    if(initial_commit){
+        if(!VirtualAlloc(slots, initial_commit, MEM_COMMIT, PAGE_READWRITE)){
+            VirtualFree(slots, 0, MEM_RELEASE);
+            return FALSE;
+        }
+    }
+    m->slots = slots;
+    m->slots_bytes = bytes;
+    m->slots_committed = initial_commit;
+#else
+    FrnEntry* slots = (FrnEntry*)mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(slots == MAP_FAILED){
+        m->slots = NULL;
+        return FALSE;
+    }
+    m->slots = slots;
+    m->slots_bytes = bytes;
+    m->slots_committed = bytes;
+#endif
+    return TRUE;
+}
 
 typedef struct NameArenaPoolBlock {
     struct NameArenaPoolBlock* next;
@@ -158,7 +288,14 @@ static void frnmap_release_node(FrnMap* m, NameArena* arena){
 }
 static void frnmap_init(FrnMap* m, size_t cap){
     m->cap = 1; while(m->cap < cap*2) m->cap <<= 1;
-    m->slots = (FrnEntry*)calloc(m->cap, sizeof(FrnEntry));
+    m->slots = NULL;
+    m->slots_bytes = 0;
+    m->slots_committed = 0;
+    if(!frnmap_allocate_slots(m, m->cap)){
+        m->slots = NULL;
+        m->slots_bytes = 0;
+        m->slots_committed = 0;
+    }
     m->count = 0;
     m->arena = NULL;
     m->current_arena = NULL;
@@ -172,7 +309,7 @@ static void frnmap_init(FrnMap* m, size_t cap){
     m->streaming = FALSE;
 }
 static void frnmap_free(FrnMap* m){
-    if(m->slots) free(m->slots);
+    frnmap_release_slots(m);
     NameArena* a = m->arena;
     while(a){
         NameArena* next = a->next;
@@ -192,6 +329,8 @@ static void frnmap_free(FrnMap* m){
         block = next_block;
     }
     m->slots = NULL;
+    m->slots_bytes = 0;
+    m->slots_committed = 0;
     m->cap = 0;
     m->count = 0;
     m->arena = NULL;
@@ -205,14 +344,23 @@ static void frnmap_free(FrnMap* m){
     m->arena_pool_blocks = NULL;
     m->streaming = FALSE;
 }
-static void frnmap_rehash_into(FrnMap* dst, const FrnMap* src){
+static BOOL frnmap_rehash_into(FrnMap* dst, const FrnMap* src){
     for(size_t i=0;i<src->cap;i++){
         if(!src->slots[i].frn) continue;
         FrnEntry e = src->slots[i];
         size_t j = (size_t)(frn_hash(e.frn) & (dst->cap-1));
-        while(dst->slots[j].frn){ j=(j+1)&(dst->cap-1); }
+        if(!frnmap_ensure_slot_committed(dst, j)){
+            return FALSE;
+        }
+        while(dst->slots[j].frn){
+            j = (j+1) & (dst->cap-1);
+            if(!frnmap_ensure_slot_committed(dst, j)){
+                return FALSE;
+            }
+        }
         dst->slots[j] = e;
     }
+    return TRUE;
 }
 static BOOL frnmap_create_mmap_arena(FrnMap* m, size_t cap, NameArena** out){
     size_t aligned = frn_align_chars(cap);
@@ -338,14 +486,24 @@ static wchar_t* frnmap_alloc_name(FrnMap* m, size_t n){
 
 static BOOL frnmap_resize(FrnMap* m){
     size_t newcap = m->cap ? m->cap*2 : 1024;
-    FrnEntry* newslots = (FrnEntry*)calloc(newcap, sizeof(FrnEntry));
-    if(!newslots) return FALSE;
     FrnMap tmp = {0};
-    tmp.slots=newslots; tmp.cap=newcap; tmp.count=m->count;
-    frnmap_rehash_into(&tmp, m);
-    free(m->slots);
+    tmp.cap = newcap;
+    if(!frnmap_allocate_slots(&tmp, newcap)){
+        return FALSE;
+    }
+    tmp.count = m->count;
+    if(!frnmap_rehash_into(&tmp, m)){
+        frnmap_release_slots(&tmp);
+        return FALSE;
+    }
+    frnmap_release_slots(m);
     m->slots = tmp.slots;
-    m->cap = tmp.cap;
+    m->slots_bytes = tmp.slots_bytes;
+    m->slots_committed = tmp.slots_committed;
+    tmp.slots = NULL;
+    tmp.slots_bytes = 0;
+    tmp.slots_committed = 0;
+    m->cap = newcap;
     return TRUE;
 }
 static FrnEntry* frnmap_put(FrnMap* m, uint64_t frn, uint64_t parent, const wchar_t* name, uint32_t attrs){
@@ -358,7 +516,15 @@ static FrnEntry* frnmap_put(FrnMap* m, uint64_t frn, uint64_t parent, const wcha
         }
     }
     size_t i = (size_t)(frn_hash(frn) & (m->cap-1));
-    while(m->slots[i].frn && m->slots[i].frn != frn){ i=(i+1)&(m->cap-1); }
+    if(!frnmap_ensure_slot_committed(m, i)){
+        return NULL;
+    }
+    while(m->slots[i].frn && m->slots[i].frn != frn){
+        i=(i+1)&(m->cap-1);
+        if(!frnmap_ensure_slot_committed(m, i)){
+            return NULL;
+        }
+    }
     BOOL is_new = !m->slots[i].frn;
     size_t name_len = wcslen(name);
     size_t chars_with_null = name_len + 1;
@@ -387,9 +553,15 @@ static FrnEntry* frnmap_get(FrnMap* m, uint64_t frn){
         return NULL;
     }
     size_t i = (size_t)(frn_hash(frn) & (m->cap-1));
+    if(!frnmap_ensure_slot_committed(m, i)){
+        return NULL;
+    }
     while(m->slots[i].frn){
         if(m->slots[i].frn==frn) return &m->slots[i];
         i=(i+1)&(m->cap-1);
+        if(!frnmap_ensure_slot_committed(m, i)){
+            return NULL;
+        }
     }
     return NULL;
 }
@@ -671,7 +843,7 @@ static DWORD WINAPI map_emit_worker(void* p){
     for(;;){
         LONG idx = InterlockedIncrement(&s->next_idx) - 1;
         if(idx >= (LONG)s->map.cap) break;
-        if(!s->map.slots[idx].frn){
+        if(!frnmap_ensure_slot_committed(&s->map, (size_t)idx) || !s->map.slots[idx].frn){
             InterlockedDecrement(&s->pool.work_queue_size);
             continue;
         }
