@@ -147,10 +147,12 @@ struct Result {
     uint64_t rec_id = 0;
     uint64_t name_str_id = 0;
     uint64_t content_str_id = 0;
+    int stage = 0;
 };
 
 struct ProgressiveResult {
     Result result;
+    int stage = 0;
     bool done = false;
 };
 
@@ -324,6 +326,27 @@ struct TieredResults {
         }
     }
 
+    void upsert(Result&& r) {
+        if (r.stage <= 0) {
+            insert(std::move(r));
+            return;
+        }
+        auto merge_into = [&](std::vector<Result>& bucket) -> bool {
+            for (Result& existing : bucket) {
+                if (existing.rec_id == r.rec_id) {
+                    apply_stage_update(existing, r);
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (merge_into(hot_window)) {
+            view_dirty = true;
+            return;
+        }
+        merge_into(cold_storage);
+    }
+
     size_t size() const { return hot_window.size(); }
 
     const std::vector<Result*>& view(const ImGuiTableSortSpecs* specs, bool force_rebuild) {
@@ -386,6 +409,24 @@ private:
         } else {
             min_hot_score = hot_window.back().score;
         }
+    }
+
+    void apply_stage_update(Result& dest, Result& src) {
+        if (src.stage == 0) {
+            if (!src.filename.empty()) dest.filename = std::move(src.filename);
+            if (!src.path.empty()) dest.path = std::move(src.path);
+            dest.size = src.size;
+            dest.modified = src.modified;
+            dest.score = src.score;
+            dest.type = std::move(src.type);
+            dest.name_str_id = src.name_str_id ? src.name_str_id : dest.name_str_id;
+            dest.content_str_id = src.content_str_id ? src.content_str_id : dest.content_str_id;
+        } else if (src.stage >= 2) {
+            if (!src.snippet.empty()) dest.snippet = std::move(src.snippet);
+            if (!src.preview_path.empty()) dest.preview_path = std::move(src.preview_path);
+            if (!src.type.empty()) dest.type = std::move(src.type);
+        }
+        dest.stage = dest.stage < src.stage ? src.stage : dest.stage;
     }
 };
 
@@ -1003,41 +1044,53 @@ static void search_thread(SearchThreadArgs* sta) {
         MDB_val nk = {.mv_data = &r->name_str_id, .mv_size = sizeof(r->name_str_id)};
         if (mdb_get(txn, dbi_strings, &pk, &pv) != 0) continue;
         if (mdb_get(txn, dbi_strings, &nk, &nv) != 0) continue;
-        ProgressiveResult* out = new ProgressiveResult();
-        out->result.path = std::string((char*)pv.mv_data, pv.mv_size);
-        out->result.filename = std::string((char*)nv.mv_data, nv.mv_size);
-        out->result.size = (int64_t)r->file_size;
-        out->result.modified = (time_t)(r->modified_time / 10000000 - 11644473600LL);
-        out->result.score = ranked[i].score;
-        out->result.rec_id = rid;
-        out->result.name_str_id = r->name_str_id;
-        out->result.content_str_id = r->content_str_id;
+        ProgressiveResult* stage0 = new ProgressiveResult();
+        stage0->stage = 0;
+        stage0->result.stage = 0;
+        stage0->result.path = std::string((char*)pv.mv_data, pv.mv_size);
+        stage0->result.filename = std::string((char*)nv.mv_data, nv.mv_size);
+        stage0->result.size = (int64_t)r->file_size;
+        stage0->result.modified = (time_t)(r->modified_time / 10000000 - 11644473600LL);
+        stage0->result.score = ranked[i].score;
+        stage0->result.rec_id = rid;
+        stage0->result.name_str_id = r->name_str_id;
+        stage0->result.content_str_id = r->content_str_id;
+        std::string::size_type dot = stage0->result.filename.rfind('.');
+        if (dot != std::string::npos) {
+            std::string e = to_lower(stage0->result.filename.substr(dot + 1));
+            if (e == "jpg" || e == "png" || e == "gif" || e == "bmp") stage0->result.type = "image";
+            else if (e == "pdf") stage0->result.type = "pdf";
+            else if (e == "md" || e == "markdown") stage0->result.type = "markdown";
+            else if (e == "c" || e == "h" || e == "cpp" || e == "cc" || e == "hpp" || e == "rs" || e == "go" || e == "cs" || e == "vb" || e == "java" || e == "py") stage0->result.type = "code";
+            else stage0->result.type = "text";
+        } else {
+            stage0->result.type = "text";
+        }
+        push_progressive_result(sta->queue, stage0);
+
+        std::string snippet;
+        std::string preview_path;
         if (r->content_str_id) {
             MDB_val ck = {.mv_data = &r->content_str_id, .mv_size = sizeof(r->content_str_id)};
             MDB_val cv;
             if (mdb_get(txn, dbi_strings, &ck, &cv) == 0) {
-                out->result.snippet = std::string((char*)cv.mv_data, cv.mv_size).substr(0, 500);
+                snippet = std::string((char*)cv.mv_data, cv.mv_size).substr(0, 500);
             }
         }
         if (r->preview_str_id) {
             MDB_val pk_img = {.mv_data = &r->preview_str_id, .mv_size = sizeof(r->preview_str_id)};
             MDB_val pvimg;
             if (mdb_get(txn, dbi_strings, &pk_img, &pvimg) == 0) {
-                out->result.preview_path = std::string((char*)pvimg.mv_data, pvimg.mv_size);
+                preview_path = std::string((char*)pvimg.mv_data, pvimg.mv_size);
             }
         }
-        std::string::size_type dot = out->result.filename.rfind('.');
-        if (dot != std::string::npos) {
-            std::string e = to_lower(out->result.filename.substr(dot + 1));
-            if (e == "jpg" || e == "png" || e == "gif" || e == "bmp") out->result.type = "image";
-            else if (e == "pdf") out->result.type = "pdf";
-            else if (e == "md" || e == "markdown") out->result.type = "markdown";
-            else if (e == "c" || e == "h" || e == "cpp" || e == "cc" || e == "hpp" || e == "rs" || e == "go" || e == "cs" || e == "vb" || e == "java" || e == "py") out->result.type = "code";
-            else out->result.type = "text";
-        } else {
-            out->result.type = "text";
-        }
-        push_progressive_result(sta->queue, out);
+        ProgressiveResult* stage2 = new ProgressiveResult();
+        stage2->stage = 2;
+        stage2->result.stage = 2;
+        stage2->result.rec_id = rid;
+        if (!snippet.empty()) stage2->result.snippet = std::move(snippet);
+        if (!preview_path.empty()) stage2->result.preview_path = std::move(preview_path);
+        push_progressive_result(sta->queue, stage2);
     }
     ProgressiveResult* done = new ProgressiveResult();
     done->done = true;
@@ -1174,8 +1227,11 @@ int run_ui(void){
             if (pr->done) {
                 search_done = true;
             } else {
-                filtered.insert(std::move(pr->result));
-                need_sort = true;
+                pr->result.stage = pr->stage;
+                filtered.upsert(std::move(pr->result));
+                if (pr->stage <= 0) {
+                    need_sort = true;
+                }
             }
             processed++;
         }
@@ -1248,7 +1304,7 @@ int run_ui(void){
                                     selected = row;
                                 }
                                 bool hovered = ImGui::IsItemHovered();
-                                if ((hovered || is_selected) && r.texture == 0 && (r.type == "image" || !r.preview_path.empty())) {
+                                if ((hovered || is_selected) && r.stage >= 2 && r.texture == 0 && (r.type == "image" || !r.preview_path.empty())) {
                                     load_result_texture(r);
                                 }
                                 if (ImGui::BeginPopupContextItem()) {
@@ -1260,8 +1316,10 @@ int run_ui(void){
                                     ImGui::EndPopup();
                                 }
                                 ImGui::TableSetColumnIndex(0);
-                                if ((r.type == "image" || !r.preview_path.empty()) && r.texture != 0) {
+                                if (r.stage >= 2 && (r.type == "image" || !r.preview_path.empty()) && r.texture != 0) {
                                     ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(48, 48));
+                                } else {
+                                    ImGui::TextDisabled("...");
                                 }
                                 ImGui::TableSetColumnIndex(2);
                                 ImGui::TextUnformatted(r.path.c_str());
@@ -1325,7 +1383,9 @@ int run_ui(void){
                                 ImGui::EndTabItem();
                             }
                             if (ImGui::BeginTabItem("Preview")) {
-                                if (!r.preview_path.empty()) {
+                                if (r.stage < 2) {
+                                    ImGui::TextDisabled("Loading preview...");
+                                } else if (r.type == "image" || !r.preview_path.empty()) {
                                     if (r.texture == 0) load_result_texture(const_cast<Result&>(r));
                                     if (r.texture != 0) {
                                         float aspect = static_cast<float>(r.height) / static_cast<float>(r.width);
@@ -1334,11 +1394,11 @@ int run_ui(void){
                                     } else {
                                         ImGui::Text("No thumbnail loaded.");
                                     }
-                                } else if (r.type == "text" || r.type == "pdf") {
+                                } else if ((r.type == "text" || r.type == "pdf") && !r.snippet.empty()) {
                                     draw_highlighted(r.snippet, query_str);
-                                } else if (r.type == "markdown") {
+                                } else if (r.type == "markdown" && !r.snippet.empty()) {
                                     render_markdown(r.snippet);
-                                } else if (r.type == "code") {
+                                } else if (r.type == "code" && !r.snippet.empty()) {
                                     std::string full = r.path + "\\" + r.filename;
                                     if (g_code_preview_file != full) {
                                         g_code_preview_file = full;
@@ -1352,14 +1412,12 @@ int run_ui(void){
                                         g_code_editor.SetText(r.snippet);
                                     }
                                     g_code_editor.Render("CodePreview");
-                                } else if (r.type == "image") {
-                                    if (r.texture != 0) {
-                                        float aspect = static_cast<float>(r.height) / static_cast<float>(r.width);
-                                        float preview_width = ImGui::GetContentRegionAvail().x;
-                                        ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(preview_width, preview_width * aspect));
-                                    } else {
-                                        ImGui::Text("No thumbnail loaded.");
-                                    }
+                                } else if (r.type == "image" && r.texture != 0) {
+                                    float aspect = static_cast<float>(r.height) / static_cast<float>(r.width);
+                                    float preview_width = ImGui::GetContentRegionAvail().x;
+                                    ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(preview_width, preview_width * aspect));
+                                } else {
+                                    ImGui::Text("No preview available.");
                                 }
                                 ImGui::EndTabItem();
                             }
