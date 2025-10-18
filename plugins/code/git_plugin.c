@@ -114,6 +114,8 @@ static void process_commit(const wchar_t* repo_path, git_repository* repo, const
     wi->content = wcontent;
     wi->preview = NULL;
     wi->clone_id = 0;
+    wi->hash_crc = 0;
+    wi->hash_ready = FALSE;
     while(!MPMC_Push(g_host.queue, wi)){
         if(is_cancelled(g_host.cancel_token)){
             aligned_free(wi); free(wcontent); git_commit_free(commit); return;

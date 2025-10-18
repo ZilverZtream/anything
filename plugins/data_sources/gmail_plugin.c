@@ -146,6 +146,7 @@ static void process_message(const char* id, const char* token_utf8){
     wi->file_size=0; wi->creation_time=ft; wi->modified_time=ft; wi->access_time=ft;
     wi->attributes=0; wi->stage=INDEX_FULL_CONTENT; wi->op=WI_ADD;
     wi->content=wcontent; wi->preview=NULL; wi->clone_id=0;
+    wi->hash_crc=0; wi->hash_ready=FALSE;
     int tries=0; while(!MPMC_Push(g_host.queue,wi)){
         if(is_cancelled(g_host.cancel_token) || tries++>1000){
             goto cleanup;

@@ -24,7 +24,7 @@ typedef struct GenericScanner {
     volatile LONG next_steal;
 } GenericScanner;
 
-static void emit(MPMCQueue* q, const wchar_t* parent, const WIN32_FIND_DATAW* f){
+static void emit(GenericScanner* scanner, const wchar_t* parent, const WIN32_FIND_DATAW* f){
     if(wcscmp(f->cFileName, L".")==0 || wcscmp(f->cFileName, L"..")==0) return;
     DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
     wi->content = NULL;
@@ -33,14 +33,27 @@ static void emit(MPMCQueue* q, const wchar_t* parent, const WIN32_FIND_DATAW* f)
     wcscpy_s(wi->name, MAX_PATH, f->cFileName);
     wi->attributes = f->dwFileAttributes;
     wi->clone_id = 0;
+    wi->hash_crc = 0;
+    wi->hash_ready = FALSE;
     ULARGE_INTEGER s; s.LowPart=f->nFileSizeLow; s.HighPart=f->nFileSizeHigh; wi->file_size=s.QuadPart;
     wi->creation_time = ((ULARGE_INTEGER){.LowPart=f->ftCreationTime.dwLowDateTime,.HighPart=f->ftCreationTime.dwHighDateTime}).QuadPart;
     wi->modified_time = ((ULARGE_INTEGER){.LowPart=f->ftLastWriteTime.dwLowDateTime,.HighPart=f->ftLastWriteTime.dwHighDateTime}).QuadPart;
     wi->access_time   = ((ULARGE_INTEGER){.LowPart=f->ftLastAccessTime.dwLowDateTime,.HighPart=f->ftLastAccessTime.dwHighDateTime}).QuadPart;
     wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
+    if(!(f->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && scanner && !is_cancelled(scanner->cancel)){
+        wchar_t full_path[MAX_LONG_PATH];
+        if(path_join(full_path, MAX_LONG_PATH, parent, f->cFileName)){
+            BOOL hash_ok = FALSE;
+            uint64_t hash = crc64_file(full_path, scanner->cancel, NULL, NULL, &hash_ok);
+            if(hash_ok){
+                wi->hash_crc = hash;
+                wi->hash_ready = TRUE;
+            }
+        }
+    }
     int tries = 1000;
-    while(!MPMC_Push(q, wi) && --tries){
+    while(!MPMC_Push(scanner->outq, wi) && --tries){
         SwitchToThread();
     }
     if(!tries){
@@ -78,7 +91,7 @@ static void scan_dir(GenericScanner* s, int tidx, const wchar_t* dir){
     if(h==INVALID_HANDLE_VALUE) return;
     do{
         if(is_cancelled(s->cancel)) break;
-        emit(s->outq, dir, &f);
+        emit(s, dir, &f);
         if((f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(f.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)){
             wchar_t sub[MAX_LONG_PATH];
             path_join(sub, MAX_LONG_PATH, dir, f.cFileName);
