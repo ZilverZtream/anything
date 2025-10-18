@@ -1163,6 +1163,24 @@ static ContentResultItem* content_process_item(ContentWorkItem* wi, CancelToken*
     return result;
 }
 
+static BOOL writer_content_result_is_current(WriterCtx* ctx, const ContentResultItem* result){
+    if(!ctx || !result) return FALSE;
+    if(result->base_record.rec_id == 0) return TRUE;
+    if(result->parent_path[0] == L'\0' || result->name[0] == L'\0') return TRUE;
+
+    DbRecord current = {0};
+    if(!db_get_record_by_path(ctx->db, result->parent_path, result->name, &current)){
+        return FALSE;
+    }
+
+    if(current.rec_id != result->base_record.rec_id) return FALSE;
+    if(current.modified_time != result->base_record.modified_time) return FALSE;
+    if(current.file_size != result->base_record.file_size) return FALSE;
+    if(current.creation_time != result->base_record.creation_time) return FALSE;
+
+    return TRUE;
+}
+
 static BOOL writer_apply_content_result(WriterCtx* ctx,
                                         ContentResultItem* result,
                                         DbRecord** buf,
@@ -1174,6 +1192,7 @@ static BOOL writer_apply_content_result(WriterCtx* ctx,
                                         size_t* intern_capacity){
     if(!ctx || !result) return TRUE;
     if(!result->success) return TRUE;
+    if(!writer_content_result_is_current(ctx, result)) return TRUE;
     DbRecord record = result->base_record;
     if(result->content_text){
         if(!writer_add_intern_request(intern_requests, intern_count, intern_capacity, result->content_text, &record.content_str_id, NULL)){
