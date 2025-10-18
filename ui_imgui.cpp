@@ -37,7 +37,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <thread>
-#include <mutex>
+#include <utility>
 #include <memory>
 #include <sstream>
 #include <array>
@@ -146,6 +146,11 @@ struct Result {
     uint64_t rec_id = 0;
     uint64_t name_str_id = 0;
     uint64_t content_str_id = 0;
+};
+
+struct ProgressiveResult {
+    Result result;
+    bool done = false;
 };
 
 struct DuplicateItem {
@@ -820,11 +825,16 @@ struct SearchThreadArgs {
     MDB_env* env;
     std::string query;
     Filters filters;
-    std::vector<Result>* results;
-    bool* done;
-    std::mutex* mutex;
+    MPMCQueue* queue;
     char db_path[MAX_PATH * 3];
 };
+
+static void push_progressive_result(MPMCQueue* queue, ProgressiveResult* item) {
+    if (!queue || !item) return;
+    while (!MPMC_Push(queue, item)) {
+        std::this_thread::yield();
+    }
+}
 
 static void search_thread(SearchThreadArgs* sta) {
     MDB_txn* txn = nullptr;
@@ -895,50 +905,56 @@ static void search_thread(SearchThreadArgs* sta) {
         rankedn++;
     }
     qsort(ranked.data(), rankedn, sizeof(RankedResult), cmp_rank);
-    {
-        std::lock_guard<std::mutex> guard(*sta->mutex);
-        sta->results->clear();
-        for (size_t i = 0; i < rankedn && i < 1000; i++) {
-            uint64_t rid = ranked[i].rec_id;
-            MDB_val rk = {.mv_data = &rid, .mv_size = sizeof(rid)};
-            MDB_val rv;
-            mdb_get(txn, dbi_records, &rk, &rv);
-            DbRecord* r = (DbRecord*)rv.mv_data;
-            MDB_val pv, nv;
-            MDB_val pk = {.mv_data = &r->parent_str_id, .mv_size = sizeof(r->parent_str_id)};
-            MDB_val nk = {.mv_data = &r->name_str_id, .mv_size = sizeof(r->name_str_id)};
-            mdb_get(txn, dbi_strings, &pk, &pv);
-            mdb_get(txn, dbi_strings, &nk, &nv);
-            std::string path = std::string((char*)pv.mv_data, pv.mv_size);
-            std::string filename = std::string((char*)nv.mv_data, nv.mv_size);
-            std::string snippet = "";
-            if (r->content_str_id) {
-                MDB_val ck = {.mv_data = &r->content_str_id, .mv_size = sizeof(r->content_str_id)};
-                MDB_val cv;
-                mdb_get(txn, dbi_strings, &ck, &cv);
-                snippet = std::string((char*)cv.mv_data, cv.mv_size).substr(0, 500);
+    for (size_t i = 0; i < rankedn && i < 1000; i++) {
+        uint64_t rid = ranked[i].rec_id;
+        MDB_val rk = {.mv_data = &rid, .mv_size = sizeof(rid)};
+        MDB_val rv;
+        if (mdb_get(txn, dbi_records, &rk, &rv) != 0) continue;
+        DbRecord* r = (DbRecord*)rv.mv_data;
+        MDB_val pv, nv;
+        MDB_val pk = {.mv_data = &r->parent_str_id, .mv_size = sizeof(r->parent_str_id)};
+        MDB_val nk = {.mv_data = &r->name_str_id, .mv_size = sizeof(r->name_str_id)};
+        if (mdb_get(txn, dbi_strings, &pk, &pv) != 0) continue;
+        if (mdb_get(txn, dbi_strings, &nk, &nv) != 0) continue;
+        ProgressiveResult* out = new ProgressiveResult();
+        out->result.path = std::string((char*)pv.mv_data, pv.mv_size);
+        out->result.filename = std::string((char*)nv.mv_data, nv.mv_size);
+        out->result.size = (int64_t)r->file_size;
+        out->result.modified = (time_t)(r->modified_time / 10000000 - 11644473600LL);
+        out->result.score = ranked[i].score;
+        out->result.rec_id = rid;
+        out->result.name_str_id = r->name_str_id;
+        out->result.content_str_id = r->content_str_id;
+        if (r->content_str_id) {
+            MDB_val ck = {.mv_data = &r->content_str_id, .mv_size = sizeof(r->content_str_id)};
+            MDB_val cv;
+            if (mdb_get(txn, dbi_strings, &ck, &cv) == 0) {
+                out->result.snippet = std::string((char*)cv.mv_data, cv.mv_size).substr(0, 500);
             }
-            std::string preview_img = "";
-            if (r->preview_str_id) {
-                MDB_val pk = {.mv_data = &r->preview_str_id, .mv_size = sizeof(r->preview_str_id)};
-                MDB_val pvimg;
-                if (mdb_get(txn, dbi_strings, &pk, &pvimg) == 0) {
-                    preview_img = std::string((char*)pvimg.mv_data, pvimg.mv_size);
-                }
-            }
-            std::string type = "text";
-            size_t dot = filename.rfind('.');
-            if (dot != std::string::npos) {
-                std::string e = to_lower(filename.substr(dot + 1));
-                if (e == "jpg" || e == "png" || e == "gif" || e == "bmp") type = "image";
-                else if (e == "pdf") type = "pdf";
-                else if (e == "md" || e == "markdown") type = "markdown";
-                else if (e == "c" || e == "h" || e == "cpp" || e == "cc" || e == "hpp" || e == "rs" || e == "go" || e == "cs" || e == "vb" || e == "java" || e == "py") type = "code";
-            }
-            sta->results->push_back({filename, path, snippet, preview_img, (int64_t)r->file_size, (time_t)(r->modified_time / 10000000 - 11644473600LL), type, ranked[i].score});
         }
-        *sta->done = true;
+        if (r->preview_str_id) {
+            MDB_val pk_img = {.mv_data = &r->preview_str_id, .mv_size = sizeof(r->preview_str_id)};
+            MDB_val pvimg;
+            if (mdb_get(txn, dbi_strings, &pk_img, &pvimg) == 0) {
+                out->result.preview_path = std::string((char*)pvimg.mv_data, pvimg.mv_size);
+            }
+        }
+        std::string::size_type dot = out->result.filename.rfind('.');
+        if (dot != std::string::npos) {
+            std::string e = to_lower(out->result.filename.substr(dot + 1));
+            if (e == "jpg" || e == "png" || e == "gif" || e == "bmp") out->result.type = "image";
+            else if (e == "pdf") out->result.type = "pdf";
+            else if (e == "md" || e == "markdown") out->result.type = "markdown";
+            else if (e == "c" || e == "h" || e == "cpp" || e == "cc" || e == "hpp" || e == "rs" || e == "go" || e == "cs" || e == "vb" || e == "java" || e == "py") out->result.type = "code";
+            else out->result.type = "text";
+        } else {
+            out->result.type = "text";
+        }
+        push_progressive_result(sta->queue, out);
     }
+    ProgressiveResult* done = new ProgressiveResult();
+    done->done = true;
+    push_progressive_result(sta->queue, done);
     mdb_txn_abort(txn);
 }
 
@@ -1014,21 +1030,51 @@ int run_ui(void){
     std::thread search_th;
     SearchThreadArgs sta;
     bool search_done = true;
-    std::mutex search_lock;
+    MPMCQueue result_queue;
+    if (!MPMC_Init(&result_queue, 2048)) {
+        fprintf(stderr, "Failed to initialize result queue\n");
+        if (db) db_close(db);
+        mdb_env_close(env);
+        close_bloom();
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
     sta.env = env;
-    sta.results = &filtered;
-    sta.done = &search_done;
-    sta.mutex = &search_lock;
+    sta.queue = &result_queue;
     strcpy(sta.db_path, u8db);
 
     std::vector<Result> all_items; // Dummy if needed
 
     live_updates_init();
 
+    auto clear_filtered_results = [&]() {
+        for (auto& r : filtered) {
+            if (r.texture != 0) {
+                glDeleteTextures(1, &r.texture);
+                r.texture = 0;
+            }
+        }
+        filtered.clear();
+        selected = -1;
+    };
+
+    auto drain_result_queue = [&]() {
+        void* ptr = nullptr;
+        while (MPMC_Pop(&result_queue, &ptr)) {
+            delete static_cast<ProgressiveResult*>(ptr);
+        }
+    };
+
     auto update_results = [&]() {
         if (search_th.joinable()) {
             search_th.join();
         }
+        drain_result_queue();
+        clear_filtered_results();
         search_done = false;
         sta.query = query_str;
         sta.filters = filters;
@@ -1039,6 +1085,19 @@ int run_ui(void){
     static const char* months[] = { "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
 
     while(!glfwWindowShouldClose(window)){
+        int processed = 0;
+        void* item = nullptr;
+        const int MAX_PER_FRAME = 50;
+        while (processed < MAX_PER_FRAME && MPMC_Pop(&result_queue, &item)) {
+            std::unique_ptr<ProgressiveResult> pr(static_cast<ProgressiveResult*>(item));
+            if (pr->done) {
+                search_done = true;
+            } else {
+                filtered.push_back(std::move(pr->result));
+                need_sort = true;
+            }
+            processed++;
+        }
         LiveUpdate lu;
         while(live_updates_poll(&lu)) {
             if(lu.is_progress){
@@ -1322,6 +1381,9 @@ int run_ui(void){
     if (search_th.joinable()) {
         search_th.join();
     }
+
+    drain_result_queue();
+    MPMC_Destroy(&result_queue);
 
     for (auto& r : all_items) {
         if (r.texture != 0) {
