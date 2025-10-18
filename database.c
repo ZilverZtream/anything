@@ -609,7 +609,7 @@ static void build_bloom_hashes_simd(const char* tri, uint32_t* out4){
     _mm_storeu_si128((__m128i*)out4, res);
 }
 static uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom){
-    if(!name_u8 || !bloom) return 0;
+    if(!name_u8 || !name_u8[0] || !bloom) return 0;
     NameBloomContext ctx;
     if(!name_bloom_context_prepare(name_u8, &ctx)) return 0;
     uint32_t tcount = build_bloom_from_context(&ctx, bloom);
@@ -1215,7 +1215,7 @@ static int compare_u32(const void* a, const void* b){
 }
 
 static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id, NameBloomContext* prepared){
-    if(!d || !name_u8) return;
+    if(!d || !name_u8 || !name_u8[0]) return;
     NameBloomContext local;
     NameBloomContext* ctx = prepared;
     BOOL need_release = FALSE;
@@ -1326,6 +1326,16 @@ BOOL db_set_index_state(Db* db_, const IndexState* st){
 }
 
 // ---- Record write ----
+static BOOL record_is_names_only(const DbRecord* r){
+    if(!r) return FALSE;
+    if(r->file_size != 0) return FALSE;
+    if(r->creation_time != 0 || r->modified_time != 0 || r->access_time != 0) return FALSE;
+    if(r->content_str_id || r->author_str_id || r->camera_str_id || r->lens_str_id) return FALSE;
+    if(r->artist_str_id || r->album_str_id || r->title_str_id || r->preview_str_id) return FALSE;
+    if(r->hash_crc != 0) return FALSE;
+    return TRUE;
+}
+
 BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
     DbImpl* d = (DbImpl*)db_;
     if(!d->wtxn){ if(!db_begin_write(db_)) return FALSE; }
@@ -1376,6 +1386,7 @@ retry_batch:
 
     for(; success && processed<count; ++processed){
         const DbRecord* r = &recs[processed];
+        BOOL names_only = record_is_names_only(r);
         header_tmp.record_count++;
         uint64_t id = header_tmp.record_count;
         MDB_val k,v; to_mdb_val(&id, sizeof(id), &k); to_mdb_val((void*)r, sizeof(*r), &v);
@@ -1390,6 +1401,9 @@ retry_batch:
         if(rc && rc!=MDB_KEYEXIST){ success = FALSE; set_mdb_error(d,rc); break; }
         rc = mdb_put(d->wtxn, d->dbi_path_hierarchy, &pk, &pv, MDB_NODUPDATA);
         if(rc && rc!=MDB_KEYEXIST){ success = FALSE; set_mdb_error(d,rc); break; }
+        if(names_only){
+            continue;
+        }
         // size_index (files only)
         if(r->type == DB_REC_FILE){
             MDB_val sk,sv; to_mdb_val(&r->file_size, sizeof(r->file_size), &sk); to_mdb_val(&id, sizeof(id), &sv);
