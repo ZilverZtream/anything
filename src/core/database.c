@@ -166,6 +166,158 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
     }
 }
 
+#define PARENT_CACHE_PARTITIONS 64u
+#define PARENT_CACHE_SLOTS 256u
+
+typedef struct {
+    uint64_t       parent_str_id;
+    size_t         path_len;
+    char*          path_utf8;
+    volatile LONG64 last_access;
+} ParentCacheSlot;
+
+typedef struct {
+    SRWLOCK         lock;
+    ParentCacheSlot slots[PARENT_CACHE_SLOTS];
+} ParentCachePartition;
+
+static ParentCachePartition g_parent_cache[PARENT_CACHE_PARTITIONS];
+static INIT_ONCE g_parent_cache_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK parent_cache_init_once(PINIT_ONCE init_once, PVOID param, PVOID* context){
+    (void)init_once; (void)param; (void)context;
+    for(size_t i=0;i<PARENT_CACHE_PARTITIONS;i++){
+        InitializeSRWLock(&g_parent_cache[i].lock);
+        for(size_t j=0;j<PARENT_CACHE_SLOTS;j++){
+            g_parent_cache[i].slots[j].parent_str_id = 0;
+            g_parent_cache[i].slots[j].path_len = 0;
+            g_parent_cache[i].slots[j].path_utf8 = NULL;
+            g_parent_cache[i].slots[j].last_access = 0;
+        }
+    }
+    return TRUE;
+}
+
+static void parent_cache_ensure_init(void){
+    InitOnceExecuteOnce(&g_parent_cache_once, parent_cache_init_once, NULL, NULL);
+}
+
+static ParentCachePartition* parent_cache_partition(uint64_t parent_str_id){
+    uint64_t hash = hash64(&parent_str_id, sizeof(parent_str_id));
+    size_t index = (size_t)(hash % PARENT_CACHE_PARTITIONS);
+    return &g_parent_cache[index];
+}
+
+BOOL db_parent_cache_copy(uint64_t parent_str_id, char* buffer, size_t buffer_len, size_t* out_len){
+    if(parent_str_id == 0){
+        if(out_len) *out_len = 0;
+        return FALSE;
+    }
+    parent_cache_ensure_init();
+    ParentCachePartition* part = parent_cache_partition(parent_str_id);
+    AcquireSRWLockShared(&part->lock);
+    for(size_t i=0;i<PARENT_CACHE_SLOTS;i++){
+        ParentCacheSlot* slot = &part->slots[i];
+        if(slot->parent_str_id == parent_str_id && slot->path_utf8){
+            size_t required = slot->path_len + 1;
+            if(out_len) *out_len = required;
+            if(!buffer || buffer_len < required){
+                InterlockedExchange64(&slot->last_access, (LONG64)GetTickCount64());
+                ReleaseSRWLockShared(&part->lock);
+                return FALSE;
+            }
+            memcpy(buffer, slot->path_utf8, slot->path_len);
+            buffer[slot->path_len] = 0;
+            InterlockedExchange64(&slot->last_access, (LONG64)GetTickCount64());
+            ReleaseSRWLockShared(&part->lock);
+            return TRUE;
+        }
+    }
+    ReleaseSRWLockShared(&part->lock);
+    if(out_len) *out_len = 0;
+    return FALSE;
+}
+
+void db_parent_cache_put(uint64_t parent_str_id, const char* path_utf8, size_t path_len){
+    if(parent_str_id == 0 || !path_utf8) return;
+    parent_cache_ensure_init();
+    if(path_len == 0) path_len = strlen(path_utf8);
+    ParentCachePartition* part = parent_cache_partition(parent_str_id);
+    AcquireSRWLockExclusive(&part->lock);
+    ParentCacheSlot* target = NULL;
+    ParentCacheSlot* empty = NULL;
+    ParentCacheSlot* victim = NULL;
+    LONG64 oldest = LLONG_MAX;
+    for(size_t i=0;i<PARENT_CACHE_SLOTS;i++){
+        ParentCacheSlot* slot = &part->slots[i];
+        if(slot->parent_str_id == parent_str_id){
+            target = slot;
+            break;
+        }
+        if(slot->parent_str_id == 0){
+            if(!empty) empty = slot;
+            continue;
+        }
+        LONG64 access = slot->last_access;
+        if(access < oldest){
+            oldest = access;
+            victim = slot;
+        }
+    }
+    if(!target){
+        if(empty) target = empty;
+        else if(victim) target = victim;
+        else target = &part->slots[0];
+    }
+    if(target->parent_str_id == parent_str_id && target->path_utf8 &&
+       target->path_len == path_len && memcmp(target->path_utf8, path_utf8, path_len) == 0){
+        target->last_access = (LONG64)GetTickCount64();
+        ReleaseSRWLockExclusive(&part->lock);
+        return;
+    }
+    if(target->parent_str_id != parent_str_id && target->path_utf8){
+        free(target->path_utf8);
+        target->path_utf8 = NULL;
+        target->path_len = 0;
+        target->parent_str_id = 0;
+        target->last_access = 0;
+    }
+    char* dup = (char*)malloc(path_len + 1);
+    if(!dup){
+        ReleaseSRWLockExclusive(&part->lock);
+        return;
+    }
+    memcpy(dup, path_utf8, path_len);
+    dup[path_len] = 0;
+    if(target->path_utf8){
+        free(target->path_utf8);
+    }
+    target->parent_str_id = parent_str_id;
+    target->path_len = path_len;
+    target->path_utf8 = dup;
+    target->last_access = (LONG64)GetTickCount64();
+    ReleaseSRWLockExclusive(&part->lock);
+}
+
+void db_parent_cache_reset(void){
+    parent_cache_ensure_init();
+    for(size_t i=0;i<PARENT_CACHE_PARTITIONS;i++){
+        ParentCachePartition* part = &g_parent_cache[i];
+        AcquireSRWLockExclusive(&part->lock);
+        for(size_t j=0;j<PARENT_CACHE_SLOTS;j++){
+            ParentCacheSlot* slot = &part->slots[j];
+            if(slot->path_utf8){
+                free(slot->path_utf8);
+                slot->path_utf8 = NULL;
+            }
+            slot->parent_str_id = 0;
+            slot->path_len = 0;
+            slot->last_access = 0;
+        }
+        ReleaseSRWLockExclusive(&part->lock);
+    }
+}
+
 #define TLS_FILENAME_CAP 2048u
 
 typedef struct {
