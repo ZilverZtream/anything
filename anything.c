@@ -245,33 +245,70 @@ static BOOL is_archive_file(const wchar_t* name){
 
 static wchar_t* extract_with_filter(const wchar_t* path){
 #ifdef _WIN32
-    if(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED)!=S_OK) return NULL;
-    IFilter* filter=NULL;
+    bool do_uninit = false;
+    HRESULT hr_init = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if(FAILED(hr_init)) return NULL;
+    do_uninit = true;
+
+    IFilter* filter = NULL;
+    wchar_t* out = NULL;
+    size_t cap = 0;
+    size_t len = 0;
+    bool success = false;
+
     HRESULT hr = LoadIFilter(path, NULL, NULL, 0, 0, 0, &filter);
-    if(FAILED(hr)) { CoUninitialize(); return NULL; }
+    if(FAILED(hr)) goto cleanup;
+
     hr = filter->Init(IFILTER_INIT_APPLY_INDEX_ATTRIBUTES, 0, NULL, NULL);
-    if(FAILED(hr)) { filter->Release(); CoUninitialize(); return NULL; }
-    size_t cap=4096, len=0;
-    wchar_t* out = (wchar_t*)malloc(cap*sizeof(wchar_t));
-    if(!out){ filter->Release(); CoUninitialize(); return NULL; }
+    if(FAILED(hr)) goto cleanup;
+
+    cap = 4096;
+    out = (wchar_t*)malloc(cap * sizeof(wchar_t));
+    if(!out) goto cleanup;
+
     for(;;){
-        WCHAR buf[1024]; ULONG cch=1024;
+        WCHAR buf[1024];
+        ULONG cch = (ULONG)(sizeof(buf) / sizeof(buf[0]));
         hr = filter->GetText(&cch, buf);
-        if(hr!=S_OK || cch==0) break;
-        if(len + cch + 1 > cap){
-            cap = (cap + cch + 1)*2;
-            wchar_t* tmp = (wchar_t*)realloc(out, cap*sizeof(wchar_t));
-            if(!tmp){ free(out); out=NULL; break; }
-            out = tmp;
+        if(hr == S_FALSE || hr == FILTER_E_END_OF_CHUNKS ||
+           hr == FILTER_E_NO_MORE_TEXT || hr == FILTER_E_NO_TEXT || cch == 0){
+            break;
         }
-        memcpy(out+len, buf, cch*sizeof(wchar_t));
+        if(FAILED(hr)){
+            free(out);
+            out = NULL;
+            goto cleanup;
+        }
+        if(len + cch + 1 > cap){
+            size_t new_cap = (cap + cch + 1) * 2;
+            wchar_t* tmp = (wchar_t*)realloc(out, new_cap * sizeof(wchar_t));
+            if(!tmp){
+                free(out);
+                out = NULL;
+                goto cleanup;
+            }
+            out = tmp;
+            cap = new_cap;
+        }
+        memcpy(out + len, buf, cch * sizeof(wchar_t));
         len += cch;
     }
     if(out){
-        out[len]=0;
+        out[len] = 0;
+        success = true;
     }
-    filter->Release();
-    CoUninitialize();
+
+cleanup:
+    if(!success && out){
+        free(out);
+        out = NULL;
+    }
+    if(filter){
+        filter->Release();
+    }
+    if(do_uninit){
+        CoUninitialize();
+    }
     return out;
 #elif defined(__APPLE__)
     char utf8[MAX_LONG_PATH];
