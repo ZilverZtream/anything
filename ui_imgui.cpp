@@ -44,23 +44,27 @@
 #include <array>
 #include <mutex>
 #include <cstring>
- extern "C" {
- #include "lmdb.h"
- #include "database.h"
- #include "util.h"
- #include "anything.h"
- }
- #endif
- #include <stdio.h>
+extern "C" {
+#include "lmdb.h"
+#include "database.h"
+#include "util.h"
+#include "anything.h"
+}
+#endif
+#include <stdio.h>
 
- #ifndef MAX_PATH
- #define MAX_PATH 260
- #endif
+#ifndef MAX_PATH
+#define MAX_PATH 260
+#endif
 #ifndef MAX_LONG_PATH
 #define MAX_LONG_PATH 32767
 #endif
 
 #ifdef HAS_IMGUI
+#ifndef MDB_DBI_INVALID
+#define MDB_DBI_INVALID ((MDB_dbi)~(unsigned)0)
+#endif
+
 struct StringMeta {
     uint32_t trigram_count;
     uint8_t  hash_count;
@@ -975,7 +979,7 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
             bool has_inline = string_value_parse(&val, &text_val, &inline_meta);
             const StringMeta* sm = has_inline ? &inline_meta : nullptr;
             StringMeta legacy_meta;
-            if(!sm && dbi_smeta){
+            if(!sm && dbi_smeta != MDB_DBI_INVALID){
                 MDB_val mv;
                 if(mdb_get(txn, dbi_smeta, &key, &mv) == 0 && mv.mv_size >= sizeof(StringMeta)){
                     memcpy(&legacy_meta, mv.mv_data, sizeof(StringMeta));
@@ -1205,7 +1209,11 @@ static void search_thread(SearchThreadArgs* sta) {
     mdb_dbi_open(txn, "size_index", 0, &dbi_size);
     mdb_dbi_open(txn, "date_index", 0, &dbi_date);
     mdb_dbi_open(txn, "extension_index", 0, &dbi_ext);
-    mdb_dbi_open(txn, "string_meta", 0, &dbi_smeta);
+    dbi_smeta = MDB_DBI_INVALID;
+    int rc_smeta = mdb_dbi_open(txn, "string_meta", 0, &dbi_smeta);
+    if(rc_smeta == MDB_NOTFOUND){
+        dbi_smeta = MDB_DBI_INVALID;
+    }
     mdb_dbi_open(txn, "content_index", 0, &dbi_content);
     mdb_dbi_open(txn, "author_index", 0, &dbi_author);
     mdb_dbi_open(txn, "strrev", 0, &dbi_strrev);

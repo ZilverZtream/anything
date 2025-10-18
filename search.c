@@ -26,6 +26,10 @@
 #include <limits.h>
 #endif
 
+#ifndef MDB_DBI_INVALID
+#define MDB_DBI_INVALID ((MDB_dbi)~(unsigned)0)
+#endif
+
 static inline size_t bloom_log2_to_bytes(uint8_t log2){
     if(log2 >= 8 && log2 <= 20){
         return (size_t)1u << log2;
@@ -454,168 +458,6 @@ static void close_bloom(void){
 }
 #endif
 
-static inline size_t bloom_log2_to_bytes(uint8_t log2){
-    if(log2 >= 8 && log2 <= 20){
-        return (size_t)1u << log2;
-    }
-    return 0;
-}
-
-static BOOL string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta_out){
-    if(!value) return FALSE;
-    BOOL present = FALSE;
-    size_t total = value->mv_size;
-    if(total >= sizeof(StringMeta)){
-        const uint8_t* base = (const uint8_t*)value->mv_data;
-        const StringMeta* tail = (const StringMeta*)(base + total - sizeof(StringMeta));
-        if(tail->magic0 == STRING_META_MAGIC0 && tail->magic1 == STRING_META_MAGIC1){
-            present = TRUE;
-            if(meta_out) *meta_out = *tail;
-            total -= sizeof(StringMeta);
-        }
-    }
-    if(meta_out && !present){
-        memset(meta_out, 0, sizeof(*meta_out));
-    }
-    if(text){
-        text->mv_data = value->mv_data;
-        text->mv_size = total;
-    }
-    return present;
-}
-
-static size_t string_meta_bloom_bytes(const StringMeta* sm){
-    if(!sm) return 0;
-    if(sm->magic0 == STRING_META_MAGIC0 && sm->magic1 == STRING_META_MAGIC1){
-        if(sm->bloom_log2){
-            size_t bytes = bloom_log2_to_bytes(sm->bloom_log2);
-            if(bytes) return bytes;
-        }
-    }
-    if(sm->bloom_length == 0) return 0;
-    if(sm->bloom_length == 2048 || sm->bloom_length == 4096 || sm->bloom_length == 8192){
-        return sm->bloom_length;
-    }
-    return 8192;
-}
-
-static uint32_t string_meta_bloom_mask(const StringMeta* sm){
-    size_t bytes = string_meta_bloom_bytes(sm);
-    if(bytes == 0) return 0;
-    size_t bits = bytes * 8;
-    if(bits > UINT32_MAX) bits = UINT32_MAX;
-    return (uint32_t)(bits - 1);
-}
-
-static void bloom_cache_init(void){
-    if(!g_bloom_cache_initialized){
-        InitializeCriticalSection(&g_bloom_cache_mu);
-        g_bloom_cache_initialized = TRUE;
-    }
-}
-
-static void bloom_cache_reset(void){
-    if(!g_bloom_cache_initialized) return;
-    EnterCriticalSection(&g_bloom_cache_mu);
-    for(size_t i=0;i<BLOOM_CACHE_CAP;i++){
-        if(g_bloom_cache[i].data){
-            free(g_bloom_cache[i].data);
-            g_bloom_cache[i].data = NULL;
-        }
-        g_bloom_cache[i].in_use = FALSE;
-        g_bloom_cache[i].stamp = 0;
-        g_bloom_cache[i].bloom_bytes = 0;
-    }
-    g_bloom_cache_count = 0;
-    g_bloom_cache_clock = 0;
-    LeaveCriticalSection(&g_bloom_cache_mu);
-}
-
-static void bloom_cache_shutdown(void){
-    if(!g_bloom_cache_initialized) return;
-    bloom_cache_reset();
-    DeleteCriticalSection(&g_bloom_cache_mu);
-    g_bloom_cache_initialized = FALSE;
-}
-
-static uint8_t* bloom_cache_get(uint64_t string_id, const StringMeta* meta, size_t* out_len){
-    if(!meta || meta->hash_count == 0 || meta->bloom_length == 0) return NULL;
-    size_t bloom_bytes = string_meta_bloom_bytes(meta);
-    if(bloom_bytes == 0) return NULL;
-    bloom_cache_init();
-    EnterCriticalSection(&g_bloom_cache_mu);
-    BloomCacheEntry* slot = NULL;
-    for(size_t i=0;i<g_bloom_cache_count;i++){
-        BloomCacheEntry* e = &g_bloom_cache[i];
-        if(e->in_use && e->string_id == string_id){
-            if(e->bloom_offset == meta->bloom_offset && e->bloom_length == meta->bloom_length && e->bloom_log2 == meta->bloom_log2){
-                e->stamp = ++g_bloom_cache_clock;
-                if(out_len) *out_len = e->bloom_bytes;
-                uint8_t* data = e->data;
-                LeaveCriticalSection(&g_bloom_cache_mu);
-                return data;
-            }
-            slot = e;
-            break;
-        }
-        if(!e->in_use && !slot){
-            slot = e;
-        }
-    }
-    if(!slot){
-        if(g_bloom_cache_count < BLOOM_CACHE_CAP){
-            slot = &g_bloom_cache[g_bloom_cache_count++];
-        } else {
-            size_t victim = 0;
-            uint64_t best_stamp = UINT64_MAX;
-            for(size_t i=0;i<BLOOM_CACHE_CAP;i++){
-                if(!g_bloom_cache[i].in_use){
-                    victim = i;
-                    break;
-                }
-                if(g_bloom_cache[i].stamp < best_stamp){
-                    best_stamp = g_bloom_cache[i].stamp;
-                    victim = i;
-                }
-            }
-            slot = &g_bloom_cache[victim];
-        }
-    }
-    if(slot->data && slot->bloom_bytes != bloom_bytes){
-        uint8_t* resized = (uint8_t*)realloc(slot->data, bloom_bytes);
-        if(!resized){
-            LeaveCriticalSection(&g_bloom_cache_mu);
-            return NULL;
-        }
-        slot->data = resized;
-    } else if(!slot->data){
-        slot->data = (uint8_t*)malloc(bloom_bytes);
-        if(!slot->data){
-            LeaveCriticalSection(&g_bloom_cache_mu);
-            return NULL;
-        }
-    }
-    const uint8_t* encoded = bloom_readonly_base + meta->bloom_offset;
-    if(meta->bloom_length == bloom_bytes){
-        memcpy(slot->data, encoded, bloom_bytes);
-    } else if(!bloom_packbits_decompress(encoded, meta->bloom_length, slot->data, bloom_bytes)){
-        LeaveCriticalSection(&g_bloom_cache_mu);
-        return NULL;
-    }
-    slot->string_id = string_id;
-    slot->bloom_offset = meta->bloom_offset;
-    slot->bloom_length = meta->bloom_length;
-    slot->bloom_log2 = meta->bloom_log2;
-    slot->hash_count = meta->hash_count;
-    slot->bloom_bytes = bloom_bytes;
-    slot->stamp = ++g_bloom_cache_clock;
-    slot->in_use = TRUE;
-    if(out_len) *out_len = bloom_bytes;
-    uint8_t* result = slot->data;
-    LeaveCriticalSection(&g_bloom_cache_mu);
-    return result;
-}
-
 static BOOL string_contains_lower_term(const MDB_val* text, const char* lower_term){
     if(!text || !lower_term) return FALSE;
     size_t len = text->mv_size;
@@ -697,15 +539,20 @@ static int search_names(Query* q, Result* results){
     char u8db[MAX_LONG_PATH*3]; to_utf8(g_db_path, u8db, sizeof(u8db));
     if(mdb_env_open(env,u8db,MDB_RDONLY,0664)!=0){ mdb_env_close(env); return 0; }
     if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ mdb_env_close(env); return 0; }
-    if(mdb_dbi_open(txn,"filename_index",0,&dbi_fname)!=0 ||
-       mdb_dbi_open(txn,"trigram_index",0,&dbi_trigram)!=0 ||
-       mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
-       mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0 ||
-       mdb_dbi_open(txn,"extension_index",0,&dbi_ext)!=0 ||
-       mdb_dbi_open(txn,"size_index",0,&dbi_size)!=0 ||
-       mdb_dbi_open(txn,"mtime_index",0,&dbi_mtime)!=0){
-        mdb_txn_abort(txn); mdb_env_close(env); return 0;
+    int rc = 0;
+    if((rc = mdb_dbi_open(txn,"filename_index",0,&dbi_fname))!=0) goto fail;
+    if((rc = mdb_dbi_open(txn,"trigram_index",0,&dbi_trigram))!=0) goto fail;
+    if((rc = mdb_dbi_open(txn,"strings",0,&dbi_strings))!=0) goto fail;
+    dbi_smeta = MDB_DBI_INVALID;
+    rc = mdb_dbi_open(txn,"string_meta",0,&dbi_smeta);
+    if(rc == MDB_NOTFOUND){
+        dbi_smeta = MDB_DBI_INVALID;
+    } else if(rc != 0){
+        goto fail;
     }
+    if((rc = mdb_dbi_open(txn,"extension_index",0,&dbi_ext))!=0) goto fail;
+    if((rc = mdb_dbi_open(txn,"size_index",0,&dbi_size))!=0) goto fail;
+    if((rc = mdb_dbi_open(txn,"mtime_index",0,&dbi_mtime))!=0) goto fail;
 
     IdVec ids; idvec_init(&ids);
     if(q->name_pattern){
@@ -744,6 +591,10 @@ static int search_names(Query* q, Result* results){
     idvec_free(&ids);
     mdb_txn_abort(txn); mdb_env_close(env);
     return (int)n;
+fail:
+    mdb_txn_abort(txn);
+    mdb_env_close(env);
+    return 0;
 }
 
 // Stage 1: metadata indexes (author/camera/etc.).
@@ -2356,7 +2207,7 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
             BOOL has_inline = string_value_parse(&val, &text_val, &inline_meta);
             const StringMeta* sm = has_inline ? &inline_meta : NULL;
             StringMeta legacy_meta;
-            if(!sm && dbi_smeta){
+            if(!sm && dbi_smeta != MDB_DBI_INVALID){
                 MDB_val mv;
                 if(mdb_get(txn, dbi_smeta, &key, &mv)==0 && mv.mv_size>=sizeof(StringMeta)){
                     memcpy(&legacy_meta, mv.mv_data, sizeof(StringMeta));
@@ -2565,9 +2416,17 @@ int wmain(int argc, wchar_t** argv){
        mdb_dbi_open(txn,"size_index",0,&dbi_size)!=0 ||
        mdb_dbi_open(txn,"mtime_index",0,&dbi_mtime)!=0 ||
        mdb_dbi_open(txn,"date_index",0,&dbi_date)!=0 ||
-       mdb_dbi_open(txn,"extension_index",0,&dbi_ext)!=0 ||
-       mdb_dbi_open(txn,"string_meta",0,&dbi_smeta)!=0 ||
-       mdb_dbi_open(txn,"content_index",0,&dbi_content)!=0 ||
+       mdb_dbi_open(txn,"extension_index",0,&dbi_ext)!=0){
+       output_error(json_output,"dbi_open failed"); mdb_txn_abort(txn); mdb_env_close(env); close_bloom(); free_search_query(&q); tokenlist_free(&tokens); return 1;
+    }
+    dbi_smeta = MDB_DBI_INVALID;
+    int rc_smeta = mdb_dbi_open(txn,"string_meta",0,&dbi_smeta);
+    if(rc_smeta == MDB_NOTFOUND){
+        dbi_smeta = MDB_DBI_INVALID;
+    } else if(rc_smeta != 0){
+       output_error(json_output,"dbi_open failed"); mdb_txn_abort(txn); mdb_env_close(env); close_bloom(); free_search_query(&q); tokenlist_free(&tokens); return 1;
+    }
+    if(mdb_dbi_open(txn,"content_index",0,&dbi_content)!=0 ||
        mdb_dbi_open(txn,"author_index",0,&dbi_author)!=0 ||
        mdb_dbi_open(txn,"camera_index",0,&dbi_camera)!=0 ||
        mdb_dbi_open(txn,"lens_index",0,&dbi_lens)!=0 ||
