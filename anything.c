@@ -44,10 +44,16 @@
 #include <strings.h>
 #include <stdarg.h>
 #include <wctype.h>
+#include <pthread.h>
+#include <time.h>
+#include <errno.h>
 #define Sleep(ms) usleep((ms)*1000)
 #define _stricmp strcasecmp
 #define _strnicmp strncasecmp
 #define _wcsicmp wcscasecmp
+#ifndef INFINITE
+#define INFINITE 0xFFFFFFFFu
+#endif
 static int wcsncasecmp_local(const wchar_t* a, const wchar_t* b, size_t n){
     for(size_t i=0;i<n;i++){
         wchar_t ca = towlower(a[i]);
@@ -800,6 +806,8 @@ BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size){
     ZeroMemory(q->cells, cells_size);
     for(LONG i=0;i<size;i++){ q->cells[i].seq = i; }
     q->head=0; q->tail=0;
+    q->on_push = NULL;
+    q->on_push_ctx = NULL;
     return TRUE;
 }
 void MPMC_Destroy(MPMCQueue* q){
@@ -816,6 +824,9 @@ BOOL MPMC_Push(MPMCQueue* q, void* data){
                 cell->data = data;
                 _ReadWriteBarrier();
                 cell->seq = pos+1;
+                if(q->on_push){
+                    q->on_push(q->on_push_ctx);
+                }
                 return TRUE;
             }
         } else if(seq < pos) {
@@ -848,6 +859,238 @@ BOOL MPMC_Pop(MPMCQueue* q, void** out){
     }
 }
 
+void MPMC_SetOnPush(MPMCQueue* q, void (*cb)(void*), void* ctx){
+    if(!q) return;
+    q->on_push = cb;
+    q->on_push_ctx = ctx;
+}
+
+typedef struct WriterSignal {
+#ifdef _WIN32
+    HANDLE event;
+#else
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    BOOL            signaled;
+    clockid_t       clock_id;
+#endif
+} WriterSignal;
+
+static BOOL writer_signal_init(WriterSignal* sig){
+    if(!sig) return FALSE;
+#ifdef _WIN32
+    sig->event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    return sig->event != NULL;
+#else
+    if(pthread_mutex_init(&sig->mutex, NULL) != 0) return FALSE;
+    pthread_condattr_t attr;
+    pthread_condattr_t* attrp = NULL;
+    sig->clock_id = CLOCK_REALTIME;
+    if(pthread_condattr_init(&attr) == 0){
+        attrp = &attr;
+#ifdef CLOCK_MONOTONIC
+        if(pthread_condattr_setclock(attrp, CLOCK_MONOTONIC) == 0){
+            sig->clock_id = CLOCK_MONOTONIC;
+        }
+#endif
+    }
+    if(pthread_cond_init(&sig->cond, attrp) != 0){
+        if(attrp) pthread_condattr_destroy(attrp);
+        pthread_mutex_destroy(&sig->mutex);
+        return FALSE;
+    }
+    if(attrp) pthread_condattr_destroy(attrp);
+    sig->signaled = FALSE;
+    return TRUE;
+#endif
+}
+
+static void writer_signal_destroy(WriterSignal* sig){
+    if(!sig) return;
+#ifdef _WIN32
+    if(sig->event){
+        CloseHandle(sig->event);
+        sig->event = NULL;
+    }
+#else
+    pthread_cond_destroy(&sig->cond);
+    pthread_mutex_destroy(&sig->mutex);
+    sig->signaled = FALSE;
+#endif
+}
+
+static void writer_signal_notify(WriterSignal* sig){
+    if(!sig) return;
+#ifdef _WIN32
+    SetEvent(sig->event);
+#else
+    pthread_mutex_lock(&sig->mutex);
+    sig->signaled = TRUE;
+    pthread_cond_signal(&sig->cond);
+    pthread_mutex_unlock(&sig->mutex);
+#endif
+}
+
+static BOOL writer_signal_wait(WriterSignal* sig, DWORD timeout_ms, BOOL* timed_out){
+    if(!sig) return FALSE;
+    if(timed_out) *timed_out = FALSE;
+#ifdef _WIN32
+    DWORD res = WaitForSingleObject(sig->event, timeout_ms);
+    if(res == WAIT_OBJECT_0){
+        if(timed_out) *timed_out = FALSE;
+        return TRUE;
+    }
+    if(res == WAIT_TIMEOUT){
+        if(timed_out) *timed_out = TRUE;
+        return TRUE;
+    }
+    return FALSE;
+#else
+    BOOL to = FALSE;
+    pthread_mutex_lock(&sig->mutex);
+    while(!sig->signaled){
+        if(timeout_ms == INFINITE){
+            if(pthread_cond_wait(&sig->cond, &sig->mutex) != 0){
+                pthread_mutex_unlock(&sig->mutex);
+                return FALSE;
+            }
+        } else {
+            struct timespec ts;
+            clockid_t cid = sig->clock_id;
+            if(clock_gettime(cid, &ts) != 0){
+                cid = CLOCK_REALTIME;
+                if(clock_gettime(cid, &ts) != 0){
+                    pthread_mutex_unlock(&sig->mutex);
+                    return FALSE;
+                }
+            }
+            ts.tv_sec += timeout_ms / 1000;
+            ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+            if(ts.tv_nsec >= 1000000000){
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000;
+            }
+            int rc = pthread_cond_timedwait(&sig->cond, &sig->mutex, &ts);
+            if(rc == ETIMEDOUT){
+                to = TRUE;
+                break;
+            }
+            if(rc != 0){
+                pthread_mutex_unlock(&sig->mutex);
+                return FALSE;
+            }
+        }
+    }
+    if(!to && sig->signaled){
+        sig->signaled = FALSE;
+    }
+    pthread_mutex_unlock(&sig->mutex);
+    if(timed_out) *timed_out = to;
+    return TRUE;
+#endif
+}
+
+typedef struct BatchInternRequest {
+    wchar_t*   str;
+    uint64_t*  target;
+} BatchInternRequest;
+
+static wchar_t* dup_wstring_local(const wchar_t* s){
+    if(!s) return NULL;
+#ifdef _WIN32
+    return _wcsdup(s);
+#else
+    return wcsdup(s);
+#endif
+}
+
+static BOOL writer_add_intern_request(BatchInternRequest** reqs, size_t* count, size_t* capacity, wchar_t* str, uint64_t* target){
+    if(!str || !target){
+        if(str) free(str);
+        return TRUE;
+    }
+    if(*count == *capacity){
+        size_t newcap = *capacity ? (*capacity * 2) : 64;
+        BatchInternRequest* tmp = (BatchInternRequest*)realloc(*reqs, sizeof(BatchInternRequest) * newcap);
+        if(!tmp){
+            free(str);
+            return FALSE;
+        }
+        *reqs = tmp;
+        *capacity = newcap;
+    }
+    (*reqs)[*count].str = str;
+    (*reqs)[*count].target = target;
+    (*count)++;
+    return TRUE;
+}
+
+static void writer_release_intern_requests(BatchInternRequest* reqs, size_t count){
+    if(!reqs) return;
+    for(size_t i=0;i<count;i++){
+        if(reqs[i].str){
+            free(reqs[i].str);
+            reqs[i].str = NULL;
+        }
+    }
+}
+
+typedef struct WriterCtx WriterCtx;
+
+static BOOL writer_ensure_record_capacity(DbRecord** buf, size_t* capacity, size_t required){
+    if(!buf || !capacity) return FALSE;
+    if(required <= *capacity) return TRUE;
+    size_t newcap = *capacity ? *capacity : required;
+    while(newcap < required){
+        newcap *= 2;
+    }
+    DbRecord* tmp = (DbRecord*)realloc(*buf, sizeof(DbRecord) * newcap);
+    if(!tmp) return FALSE;
+    *buf = tmp;
+    *capacity = newcap;
+    return TRUE;
+}
+
+static BOOL writer_resolve_intern_requests(WriterCtx* ctx, BatchInternRequest* reqs, size_t count){
+    if(!ctx || !reqs || count==0) return TRUE;
+    const wchar_t** strings = (const wchar_t**)malloc(sizeof(wchar_t*) * count);
+    uint64_t* ids = (uint64_t*)malloc(sizeof(uint64_t) * count);
+    if(!strings || !ids){
+        free(strings);
+        free(ids);
+        writer_release_intern_requests(reqs, count);
+        return FALSE;
+    }
+    for(size_t i=0;i<count;i++){
+        strings[i] = reqs[i].str;
+    }
+    db_intern_wstrings_batched(ctx->db, strings, count, ids);
+    for(size_t i=0;i<count;i++){
+        if(reqs[i].target){
+            *(reqs[i].target) = ids[i];
+        }
+        if(reqs[i].str){
+            free(reqs[i].str);
+            reqs[i].str = NULL;
+        }
+    }
+    free(strings);
+    free(ids);
+    return TRUE;
+}
+
+static BOOL writer_finalize_batch(WriterCtx* ctx, BatchInternRequest* reqs, size_t* count){
+    if(!count) return TRUE;
+    size_t n = *count;
+    if(n == 0) return TRUE;
+    if(!writer_resolve_intern_requests(ctx, reqs, n)){
+        *count = 0;
+        return FALSE;
+    }
+    *count = 0;
+    return TRUE;
+}
+
 // ---- Writer context & thread ----
 typedef struct WriterCtx {
     Db* db;
@@ -862,9 +1105,22 @@ typedef struct WriterCtx {
     size_t backlog_count;
     size_t backlog_capacity;
     DWORD push_timeout_ms;
+    int    min_batch_size;
+    int    max_batch_size;
+    DWORD  idle_wait_ms;
+    size_t consecutive_full_batches;
+    size_t consecutive_idle_waits;
+    WriterSignal data_signal;
 } WriterCtx;
 
 static const size_t MAP_GROWTH_INCREMENT = 1ull * 1024ull * 1024ull * 1024ull; // 1 GB
+
+static void writer_queue_on_push(void* param){
+    WriterCtx* ctx = (WriterCtx*)param;
+    if(!ctx) return;
+    writer_signal_notify(&ctx->data_signal);
+}
+
 static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch){
     for(;;){
         if(db_put_records(ctx->db, buf, in_batch)){
@@ -1005,18 +1261,38 @@ static DWORD WINAPI DbWriterThread(void* p){
     WriterCtx* ctx = (WriterCtx*)p;
     if(ctx->push_timeout_ms == 0) ctx->push_timeout_ms = 50;
     if(!db_begin_write(ctx->db)) return 1;
+    if(ctx->batch_size < ctx->min_batch_size) ctx->batch_size = ctx->min_batch_size;
+    if(ctx->batch_size > ctx->max_batch_size) ctx->batch_size = ctx->max_batch_size;
+
+    size_t buf_capacity = ctx->batch_size > 0 ? (size_t)ctx->batch_size : 1;
+    DbRecord* buf = (DbRecord*)malloc(sizeof(DbRecord) * buf_capacity);
+    if(!buf) return 1;
+
+    BatchInternRequest* intern_requests = NULL;
+    size_t intern_count = 0;
+    size_t intern_capacity = 0;
     size_t in_batch = 0;
     BOOL batch_requires_sync = FALSE;
-    DbRecord* buf = (DbRecord*)malloc(sizeof(DbRecord) * ctx->batch_size);
-    if(!buf) return 1;
-    ZeroMemory(buf, sizeof(DbRecord)*ctx->batch_size);
+    BOOL success = TRUE;
 
     for(;;){
         writer_drain_backlog(ctx);
         void* item = NULL;
         if(!MPMC_Pop(&ctx->queue, &item)){
             if(ctx->done && ctx->backlog_count == 0) break;
-            Sleep(1);
+            BOOL timed_out = FALSE;
+            if(!writer_signal_wait(&ctx->data_signal, ctx->idle_wait_ms, &timed_out)){
+                Sleep(1);
+            } else if(timed_out){
+                if(ctx->consecutive_idle_waits < SIZE_MAX) ctx->consecutive_idle_waits++;
+                ctx->consecutive_full_batches = 0;
+                if(ctx->consecutive_idle_waits >= 5 && ctx->batch_size > ctx->min_batch_size){
+                    ctx->batch_size = ctx->min_batch_size;
+                    ctx->consecutive_idle_waits = 0;
+                }
+            } else {
+                ctx->consecutive_idle_waits = 0;
+            }
             continue;
         }
         if(item == NULL){
@@ -1024,6 +1300,9 @@ static DWORD WINAPI DbWriterThread(void* p){
             ctx->done = TRUE;
             continue;
         }
+
+        ctx->consecutive_idle_waits = 0;
+
         DbWorkItem* wi = (DbWorkItem*)item;
         if(wi->stage == INDEX_NAMES_ONLY || wi->op == WI_DELETE) push_live_update(wi);
         if(wi->op == WI_DELETE){
@@ -1032,12 +1311,32 @@ static DWORD WINAPI DbWriterThread(void* p){
             aligned_free(wi);
             continue;
         }
+
+        if(!writer_ensure_record_capacity(&buf, &buf_capacity, in_batch + 1)){
+            aligned_free(wi);
+            success = FALSE;
+            goto cleanup;
+        }
+
+        DbRecord r = {0};
         if(wi->stage == INDEX_NAMES_ONLY){
-            DbRecord r = {0};
             r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
-            r.parent_str_id = db_intern_wstring(ctx->db, wi->parent_path);
-            r.name_str_id   = db_intern_wstring(ctx->db, wi->name);
-            r.attributes    = wi->attributes;
+            r.attributes = wi->attributes;
+            wchar_t* parent_copy = dup_wstring_local(wi->parent_path);
+            wchar_t* name_copy = dup_wstring_local(wi->name);
+            if(!parent_copy || !name_copy){
+                if(parent_copy) free(parent_copy);
+                if(name_copy) free(name_copy);
+                aligned_free(wi);
+                success = FALSE;
+                goto cleanup;
+            }
+            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, parent_copy, &r.parent_str_id) ||
+               !writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, name_copy, &r.name_str_id)){
+                aligned_free(wi);
+                success = FALSE;
+                goto cleanup;
+            }
             buf[in_batch++] = r;
             DbWorkItem* next = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
             if(next){
@@ -1055,10 +1354,23 @@ static DWORD WINAPI DbWriterThread(void* p){
             aligned_free(wi);
         } else if(wi->stage == INDEX_METADATA_LIGHT){
             batch_requires_sync = TRUE;
-            DbRecord r = {0};
             r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
-            r.parent_str_id = db_intern_wstring(ctx->db, wi->parent_path);
-            r.name_str_id   = db_intern_wstring(ctx->db, wi->name);
+            r.attributes = wi->attributes;
+            wchar_t* parent_copy = dup_wstring_local(wi->parent_path);
+            wchar_t* name_copy = dup_wstring_local(wi->name);
+            if(!parent_copy || !name_copy){
+                if(parent_copy) free(parent_copy);
+                if(name_copy) free(name_copy);
+                aligned_free(wi);
+                success = FALSE;
+                goto cleanup;
+            }
+            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, parent_copy, &r.parent_str_id) ||
+               !writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, name_copy, &r.name_str_id)){
+                aligned_free(wi);
+                success = FALSE;
+                goto cleanup;
+            }
             wchar_t full[MAX_LONG_PATH];
             _snwprintf(full, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
             uint32_t attrs=0; uint64_t sz=0, ct=0, mt=0, at=0;
@@ -1085,60 +1397,98 @@ static DWORD WINAPI DbWriterThread(void* p){
                 }
             }
             aligned_free(wi);
-        } else { // full content stage
+        } else {
             batch_requires_sync = TRUE;
             DbRecord existing;
             if(db_get_record_by_path(ctx->db, wi->parent_path, wi->name, &existing)){
                 if(existing.type == DB_REC_FILE){
-                    DbRecord r = existing;
+                    DbRecord rfull = existing;
                     wchar_t fpath[MAX_LONG_PATH];
                     _snwprintf(fpath, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
                     if(wi->content){
-                        r.content_str_id = db_intern_wstring(ctx->db, wi->content);
-                        free(wi->content);
+                        wchar_t* owned = wi->content;
                         wi->content = NULL;
+                        if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, owned, &rfull.content_str_id)){
+                            aligned_free(wi);
+                            success = FALSE;
+                            goto cleanup;
+                        }
                     } else {
-                        r.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &r.author_str_id, &r.title_str_id);
+                        rfull.content_str_id = index_file_content(ctx->db, wi->parent_path, wi->name, &rfull.author_str_id, &rfull.title_str_id);
                         wi->content = NULL;
                     }
                     if(wi->preview){
-                        r.preview_str_id = db_intern_wstring(ctx->db, wi->preview);
-                        free(wi->preview);
+                        wchar_t* owned = wi->preview;
                         wi->preview = NULL;
+                        if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, owned, &rfull.preview_str_id)){
+                            aligned_free(wi);
+                            success = FALSE;
+                            goto cleanup;
+                        }
                     } else if(needs_thumbnail(wi->name)){
                         wchar_t* thumb = GenerateThumbnail(fpath);
                         if(thumb){
-                            r.preview_str_id = db_intern_wstring(ctx->db, thumb);
-                            free(thumb);
+                            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, thumb, &rfull.preview_str_id)){
+                                success = FALSE;
+                                aligned_free(wi);
+                                goto cleanup;
+                            }
                         }
                         wi->preview = NULL;
                     }
-                    extract_exif_metadata(ctx->db, fpath, &r);
-                    extract_id3_metadata(ctx->db, fpath, &r);
+                    extract_exif_metadata(ctx->db, fpath, &rfull);
+                    extract_id3_metadata(ctx->db, fpath, &rfull);
                     if(is_archive_file(wi->name)){ index_archive(ctx->db, fpath); }
-                    r.hash_crc = crc64_file(fpath, &ctx->cancel, NULL, NULL);
-                    buf[in_batch++] = r;
+                    rfull.hash_crc = crc64_file(fpath, &ctx->cancel, NULL, NULL);
+                    buf[in_batch++] = rfull;
                 }
             }
             aligned_free(wi);
         }
+
         if(in_batch >= (size_t)ctx->batch_size){
-            if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); writer_backlog_free(ctx); return 1; }
-            if(!db_commit_write_ex(ctx->db, batch_requires_sync)) { free(buf); writer_backlog_free(ctx); return 1; }
-            if(!db_begin_write(ctx->db))  { free(buf); writer_backlog_free(ctx); return 1; }
+            if(!writer_finalize_batch(ctx, intern_requests, &intern_count)){
+                success = FALSE;
+                goto cleanup;
+            }
+            if(!put_batch_with_growth(ctx, buf, in_batch)) { success = FALSE; goto cleanup; }
+            if(!db_commit_write_ex(ctx->db, batch_requires_sync)) { success = FALSE; goto cleanup; }
+            if(!db_begin_write(ctx->db))  { success = FALSE; goto cleanup; }
             in_batch = 0;
             batch_requires_sync = FALSE;
+            if(ctx->consecutive_full_batches < SIZE_MAX) ctx->consecutive_full_batches++;
+            ctx->consecutive_idle_waits = 0;
+            if(ctx->consecutive_full_batches >= 3 && ctx->batch_size < ctx->max_batch_size){
+                ctx->batch_size = ctx->max_batch_size;
+                ctx->consecutive_full_batches = 0;
+            }
+            if(!writer_ensure_record_capacity(&buf, &buf_capacity, ctx->batch_size)){
+                success = FALSE;
+                goto cleanup;
+            }
         }
     }
+
     if(in_batch){
-        if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); writer_backlog_free(ctx); return 1; }
-        if(!db_commit_write_ex(ctx->db, batch_requires_sync)) { free(buf); writer_backlog_free(ctx); return 1; }
+        if(!writer_finalize_batch(ctx, intern_requests, &intern_count)){
+            success = FALSE;
+            goto cleanup;
+        }
+        if(!put_batch_with_growth(ctx, buf, in_batch)) { success = FALSE; goto cleanup; }
+        if(!db_commit_write_ex(ctx->db, batch_requires_sync)) { success = FALSE; goto cleanup; }
+        ctx->consecutive_full_batches = 0;
     } else {
+        writer_release_intern_requests(intern_requests, intern_count);
+        intern_count = 0;
         db_commit_write_ex(ctx->db, batch_requires_sync);
     }
+
+cleanup:
+    writer_release_intern_requests(intern_requests, intern_count);
+    free(intern_requests);
     free(buf);
     writer_backlog_free(ctx);
-    return 0;
+    return success ? 0 : 1;
 }
 
 // ---- CLI parsing ----
@@ -1243,6 +1593,20 @@ int wmain(int argc, wchar_t** argv){
     if(!MPMC_Init(&ctx.queue, queue_pow2)){
         fwprintf(stderr, L"MPMC_Init failed\n"); db_close(db); return 1;
     }
+    ctx.min_batch_size = 100;
+    ctx.max_batch_size = 10000;
+    if(ctx.batch_size < ctx.min_batch_size) ctx.batch_size = ctx.min_batch_size;
+    if(ctx.batch_size > ctx.max_batch_size) ctx.batch_size = ctx.max_batch_size;
+    ctx.idle_wait_ms = 25;
+    ctx.consecutive_full_batches = 0;
+    ctx.consecutive_idle_waits = 0;
+    if(!writer_signal_init(&ctx.data_signal)){
+        fwprintf(stderr, L"Failed to initialize writer signal\n");
+        MPMC_Destroy(&ctx.queue);
+        db_close(db);
+        return 1;
+    }
+    MPMC_SetOnPush(&ctx.queue, writer_queue_on_push, &ctx);
     DWORD computed_timeout = (DWORD)(args.threads * 25);
     if(computed_timeout < 50) computed_timeout = 50;
     ctx.push_timeout_ms = computed_timeout;
@@ -1329,6 +1693,7 @@ int wmain(int argc, wchar_t** argv){
             (unsigned long long)header->string_count,
             (unsigned long long)(header->map_size_bytes/1024/1024));
     }
+    writer_signal_destroy(&ctx.data_signal);
     Plugin_UnloadAll();
     db_close(db);
     MPMC_Destroy(&ctx.queue);

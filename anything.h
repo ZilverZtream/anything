@@ -141,12 +141,15 @@ typedef struct MPMCQueue {
     char        pad1[CACHE_LINE_SIZE - sizeof(LONG64)];
     volatile LONG64 tail;
     char        pad2[CACHE_LINE_SIZE - sizeof(LONG64)];
+    void      (*on_push)(void*);
+    void*       on_push_ctx;
 } MPMCQueue;
 
 BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size);
 void MPMC_Destroy(MPMCQueue* q);
 BOOL MPMC_Push(MPMCQueue* q, void* data);
 BOOL MPMC_Pop(MPMCQueue* q, void** out);
+void MPMC_SetOnPush(MPMCQueue* q, void (*cb)(void*), void* ctx);
 
 // ---- Generic scanner (multi-threaded with work stealing) ----
 typedef struct GenericScanner GenericScanner;
