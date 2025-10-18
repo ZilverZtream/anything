@@ -68,9 +68,11 @@ typedef struct NameArena {
     size_t used;
     size_t cap;
     struct NameArena* next;
+    struct NameArena* free_next;
     HANDLE file;
     HANDLE mapping;
     BOOL is_mmap;
+    BOOL is_small;
 } NameArena;
 
 typedef struct FrnEntry {
@@ -80,36 +82,95 @@ typedef struct FrnEntry {
     uint32_t attrs;
 } FrnEntry;
 
+typedef struct NameArenaPoolBlock NameArenaPoolBlock;
+
 typedef struct FrnMap {
     FrnEntry* slots;
     size_t cap;
     size_t count;
     NameArena* arena;
+    NameArena* current_small;
     size_t arena_total_bytes;
     size_t arena_limit_bytes;
     size_t mmap_total_bytes;
     size_t mmap_limit_bytes;
+    size_t small_chunk_chars;
+    NameArena* arena_free_list;
+    NameArenaPoolBlock* arena_pool_blocks;
     BOOL streaming;
 } FrnMap;
 
 #define FRNMAP_STREAMING_SENTINEL ((FrnEntry*)(intptr_t)(-1))
 #define FRN_ARENA_DEFAULT_CHUNK 4096
-#define FRN_ARENA_HEAP_LIMIT_BYTES (size_t)(256ULL*1024ULL*1024ULL)
+#define FRN_ARENA_HEAP_LIMIT_BYTES (size_t)(512ULL*1024ULL*1024ULL)
 #define FRN_ARENA_MMAP_LIMIT_BYTES (size_t)(4ULL*1024ULL*1024ULL*1024ULL)
+#define FRN_SMALL_NAME_THRESHOLD 32
+#define FRN_SMALL_ARENA_CHARS (size_t)(20ULL*256ULL) // tuned for ~20 char average names
+#define FRN_ARENA_POOL_BATCH 32
+#define FRN_ARENA_ALIGN_CHARS 4
+#define FRN_MMAP_MIN_CHARS (size_t)((64ULL*1024ULL)/sizeof(wchar_t))
+
+typedef struct NameArenaPoolBlock {
+    struct NameArenaPoolBlock* next;
+    NameArena arenas[FRN_ARENA_POOL_BATCH];
+} NameArenaPoolBlock;
 
 static uint64_t frn_hash(uint64_t x){
     x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
     return x;
+}
+
+static size_t frn_align_chars(size_t n){
+    size_t align = FRN_ARENA_ALIGN_CHARS;
+    return (n + (align-1)) & ~(align-1);
+}
+
+static BOOL frnmap_grow_pool(FrnMap* m){
+    NameArenaPoolBlock* block = (NameArenaPoolBlock*)calloc(1, sizeof(NameArenaPoolBlock));
+    if(!block){
+        return FALSE;
+    }
+    block->next = m->arena_pool_blocks;
+    m->arena_pool_blocks = block;
+    for(size_t i = 0; i < FRN_ARENA_POOL_BATCH; ++i){
+        block->arenas[i].free_next = m->arena_free_list;
+        m->arena_free_list = &block->arenas[i];
+    }
+    return TRUE;
+}
+
+static NameArena* frnmap_acquire_node(FrnMap* m){
+    if(!m->arena_free_list){
+        if(!frnmap_grow_pool(m)){
+            return NULL;
+        }
+    }
+    NameArena* arena = m->arena_free_list;
+    m->arena_free_list = arena->free_next;
+    memset(arena, 0, sizeof(NameArena));
+    return arena;
+}
+
+static void frnmap_release_node(FrnMap* m, NameArena* arena){
+    if(!arena){
+        return;
+    }
+    arena->free_next = m->arena_free_list;
+    m->arena_free_list = arena;
 }
 static void frnmap_init(FrnMap* m, size_t cap){
     m->cap = 1; while(m->cap < cap*2) m->cap <<= 1;
     m->slots = (FrnEntry*)calloc(m->cap, sizeof(FrnEntry));
     m->count = 0;
     m->arena = NULL;
+    m->current_small = NULL;
     m->arena_total_bytes = 0;
     m->arena_limit_bytes = FRN_ARENA_HEAP_LIMIT_BYTES;
     m->mmap_total_bytes = 0;
     m->mmap_limit_bytes = FRN_ARENA_MMAP_LIMIT_BYTES;
+    m->small_chunk_chars = frn_align_chars(FRN_SMALL_ARENA_CHARS);
+    m->arena_free_list = NULL;
+    m->arena_pool_blocks = NULL;
     m->streaming = FALSE;
 }
 static void frnmap_free(FrnMap* m){
@@ -124,17 +185,26 @@ static void frnmap_free(FrnMap* m){
         } else {
             free(a->base);
         }
-        free(a);
         a = next;
+    }
+    NameArenaPoolBlock* block = m->arena_pool_blocks;
+    while(block){
+        NameArenaPoolBlock* next_block = block->next;
+        free(block);
+        block = next_block;
     }
     m->slots = NULL;
     m->cap = 0;
     m->count = 0;
     m->arena = NULL;
+    m->current_small = NULL;
     m->arena_total_bytes = 0;
     m->mmap_total_bytes = 0;
     m->arena_limit_bytes = FRN_ARENA_HEAP_LIMIT_BYTES;
     m->mmap_limit_bytes = FRN_ARENA_MMAP_LIMIT_BYTES;
+    m->small_chunk_chars = frn_align_chars(FRN_SMALL_ARENA_CHARS);
+    m->arena_free_list = NULL;
+    m->arena_pool_blocks = NULL;
     m->streaming = FALSE;
 }
 static void frnmap_rehash_into(FrnMap* dst, const FrnMap* src){
@@ -147,7 +217,14 @@ static void frnmap_rehash_into(FrnMap* dst, const FrnMap* src){
     }
 }
 static BOOL frnmap_create_mmap_arena(FrnMap* m, size_t cap, NameArena** out){
-    if(m->mmap_total_bytes + cap * sizeof(wchar_t) > m->mmap_limit_bytes){
+    size_t aligned = frn_align_chars(cap);
+    size_t gran = FRN_MMAP_MIN_CHARS;
+    if(aligned < gran){
+        aligned = gran;
+    } else if(aligned % gran){
+        aligned += gran - (aligned % gran);
+    }
+    if(m->mmap_total_bytes + aligned * sizeof(wchar_t) > m->mmap_limit_bytes){
         m->streaming = TRUE;
         return FALSE;
     }
@@ -164,7 +241,7 @@ static BOOL frnmap_create_mmap_arena(FrnMap* m, size_t cap, NameArena** out){
     if(file==INVALID_HANDLE_VALUE){
         return FALSE;
     }
-    ULONGLONG bytes = (ULONGLONG)cap * sizeof(wchar_t);
+    ULONGLONG bytes = (ULONGLONG)aligned * sizeof(wchar_t);
     LARGE_INTEGER size;
     size.QuadPart = (LONGLONG)bytes;
     if(!SetFilePointerEx(file, size, NULL, FILE_BEGIN) || !SetEndOfFile(file)){
@@ -178,13 +255,13 @@ static BOOL frnmap_create_mmap_arena(FrnMap* m, size_t cap, NameArena** out){
         CloseHandle(file);
         return FALSE;
     }
-    wchar_t* base = (wchar_t*)MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)(cap * sizeof(wchar_t)));
+    wchar_t* base = (wchar_t*)MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)(aligned * sizeof(wchar_t)));
     if(!base){
         CloseHandle(mapping);
         CloseHandle(file);
         return FALSE;
     }
-    NameArena* arena = (NameArena*)calloc(1, sizeof(NameArena));
+    NameArena* arena = frnmap_acquire_node(m);
     if(!arena){
         UnmapViewOfFile(base);
         CloseHandle(mapping);
@@ -193,64 +270,85 @@ static BOOL frnmap_create_mmap_arena(FrnMap* m, size_t cap, NameArena** out){
     }
     arena->base = base;
     arena->used = 0;
-    arena->cap = cap;
-    arena->next = NULL;
+    arena->cap = aligned;
     arena->file = file;
     arena->mapping = mapping;
     arena->is_mmap = TRUE;
+    arena->is_small = FALSE;
+    arena->free_next = NULL;
     *out = arena;
-    m->mmap_total_bytes += cap * sizeof(wchar_t);
+    m->mmap_total_bytes += aligned * sizeof(wchar_t);
     return TRUE;
 }
 
-static NameArena* frnmap_push_arena(FrnMap* m, size_t n){
-    size_t cap = n > FRN_ARENA_DEFAULT_CHUNK ? n : FRN_ARENA_DEFAULT_CHUNK;
+static NameArena* frnmap_push_arena(FrnMap* m, size_t n, BOOL is_small){
+    size_t need = frn_align_chars(n);
+    if(is_small){
+        size_t chunk = m->small_chunk_chars;
+        if(chunk < need){
+            chunk = need;
+        }
+        need = frn_align_chars(chunk);
+    }
+    size_t projected_bytes = m->arena_total_bytes + need * sizeof(wchar_t);
+    if(is_small && projected_bytes > m->arena_limit_bytes){
+        m->streaming = TRUE;
+        return NULL;
+    }
     NameArena* arena = NULL;
-    BOOL use_mmap = (m->arena_total_bytes + cap * sizeof(wchar_t) > m->arena_limit_bytes);
+    BOOL use_mmap = (!is_small) && (projected_bytes > m->arena_limit_bytes);
     if(use_mmap){
-        if(!frnmap_create_mmap_arena(m, cap, &arena)){
+        if(!frnmap_create_mmap_arena(m, need, &arena)){
             return NULL;
         }
     } else {
-        arena = (NameArena*)calloc(1, sizeof(NameArena));
+        arena = frnmap_acquire_node(m);
         if(!arena) return NULL;
-        arena->base = (wchar_t*)malloc(cap * sizeof(wchar_t));
+        arena->base = (wchar_t*)malloc(need * sizeof(wchar_t));
         if(!arena->base){
-            free(arena);
+            frnmap_release_node(m, arena);
             return NULL;
         }
         arena->used = 0;
-        arena->cap = cap;
+        arena->cap = need;
         arena->file = NULL;
         arena->mapping = NULL;
         arena->is_mmap = FALSE;
-        m->arena_total_bytes += cap * sizeof(wchar_t);
+        arena->is_small = is_small;
+        arena->free_next = NULL;
+        m->arena_total_bytes += need * sizeof(wchar_t);
     }
+    arena->is_small = is_small;
     arena->next = m->arena;
+    arena->free_next = NULL;
     m->arena = arena;
     return arena;
 }
 
-static wchar_t* frnmap_alloc_name(FrnMap* m, size_t n){
+static wchar_t* frnmap_alloc_name(FrnMap* m, size_t n, BOOL is_small){
     if(m->streaming){
         return NULL;
     }
-    NameArena* current = m->arena;
-    if(!current || current->used + n > current->cap){
-        current = frnmap_push_arena(m, n);
-        if(!current){
-            if(m->streaming){
+    size_t need = frn_align_chars(n);
+    if(is_small){
+        NameArena* arena = m->current_small;
+        if(!arena || arena->used + need > arena->cap){
+            arena = frnmap_push_arena(m, need, TRUE);
+            if(!arena){
                 return NULL;
             }
-            return NULL;
+            m->current_small = arena;
         }
+        wchar_t* ret = arena->base + arena->used;
+        arena->used += need;
+        return ret;
     }
-    if(current->used + n > current->cap){
+    NameArena* arena = frnmap_push_arena(m, need, FALSE);
+    if(!arena){
         return NULL;
     }
-    wchar_t* ret = current->base + current->used;
-    current->used += n;
-    return ret;
+    arena->used = need;
+    return arena->base;
 }
 
 static BOOL frnmap_resize(FrnMap* m){
@@ -277,8 +375,11 @@ static FrnEntry* frnmap_put(FrnMap* m, uint64_t frn, uint64_t parent, const wcha
     size_t i = (size_t)(frn_hash(frn) & (m->cap-1));
     while(m->slots[i].frn && m->slots[i].frn != frn){ i=(i+1)&(m->cap-1); }
     BOOL is_new = !m->slots[i].frn;
-    size_t n = wcslen(name)+1;
-    wchar_t* dst = frnmap_alloc_name(m, n);
+    size_t name_len = wcslen(name);
+    size_t chars_with_null = name_len + 1;
+    size_t padded = frn_align_chars(chars_with_null);
+    BOOL use_small = name_len < FRN_SMALL_NAME_THRESHOLD;
+    wchar_t* dst = frnmap_alloc_name(m, padded, use_small);
     if(!dst){
         if(is_new){
             m->slots[i].frn = 0;
@@ -294,7 +395,7 @@ static FrnEntry* frnmap_put(FrnMap* m, uint64_t frn, uint64_t parent, const wcha
     m->slots[i].frn = frn;
     m->slots[i].parent = parent;
     m->slots[i].attrs = attrs;
-    memcpy(dst, name, n*sizeof(wchar_t));
+    memcpy(dst, name, chars_with_null*sizeof(wchar_t));
     m->slots[i].name = dst;
     return &m->slots[i];
 }
