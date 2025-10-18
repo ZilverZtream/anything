@@ -178,6 +178,19 @@ void live_updates_init(void);
 BOOL live_updates_poll(LiveUpdate* out);
 void live_updates_push_progress(uint64_t processed_count, BOOL done);
 
+typedef struct WorkItemPool {
+    DbWorkItem* items;
+    MPMCQueue   free_queue;
+    size_t      capacity;
+    size_t      queue_size;
+    BOOL        initialized;
+} WorkItemPool;
+
+BOOL work_item_pool_init(size_t capacity);
+void work_item_pool_destroy(void);
+DbWorkItem* acquire_work_item(void);
+void release_work_item(DbWorkItem* item);
+
 // ---- MPMC lock-free queue (Vyukov) ----
 typedef struct MPMCCell {
     volatile LONG64 seq;

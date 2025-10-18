@@ -694,7 +694,7 @@ static BOOL frn_emit_resolved(USNScanner* s, const wchar_t* parent, const wchar_
     if(is_cancelled(s->cancel)){
         return FALSE;
     }
-    DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+    DbWorkItem* wi = acquire_work_item();
     if(!wi){
         return FALSE;
     }
@@ -712,7 +712,7 @@ static BOOL frn_emit_resolved(USNScanner* s, const wchar_t* parent, const wchar_
     wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)){
         if(is_cancelled(s->cancel)){
-            aligned_free(wi);
+            release_work_item(wi);
             return FALSE;
         }
         SwitchToThread();
@@ -855,7 +855,13 @@ static DWORD WINAPI map_emit_worker(void* p){
         }
         wchar_t parent[MAX_LONG_PATH];
         swprintf(parent, MAX_LONG_PATH, L"%c:%s", s->volRoot[0], rel);
-        DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+        DbWorkItem* wi = acquire_work_item();
+        if(!wi){
+            InterlockedDecrement(&s->pool.work_queue_size);
+            adjust_thread_count(&s->pool);
+            if(is_cancelled(s->cancel)) break;
+            continue;
+        }
         wi->content = NULL; wi->preview = NULL;
         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
         wcscpy_s(wi->name, MAX_PATH, e->name);
@@ -1058,7 +1064,10 @@ static DWORD WINAPI tail_thread(void* p){
                     CloseHandle(hPar);
                     if(got>0 && got<MAX_LONG_PATH){
                         if(wcsncmp(parent, L"\\?\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
-                        DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                        DbWorkItem* wi = acquire_work_item();
+                        if(!wi){
+                            continue;
+                        }
                         wi->content = NULL;
                         wi->preview = NULL;
                         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
@@ -1085,7 +1094,10 @@ static DWORD WINAPI tail_thread(void* p){
                         wchar_t parent[MAX_LONG_PATH]; wcscpy_s(parent, MAX_LONG_PATH, full);
                         if(wcsncmp(parent, L"\\?\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
                         wchar_t* p = wcsrchr(parent, L'\'); if(p){ *p=0; }
-                        DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                        DbWorkItem* wi = acquire_work_item();
+                        if(!wi){
+                            continue;
+                        }
                         wi->content = NULL;
                         wi->preview = NULL;
                         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);

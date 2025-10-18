@@ -151,12 +151,115 @@ static int WideCharToMultiByte(unsigned int cp, unsigned int flags, const wchar_
 
 static MPMCQueue g_live_updates;
 static BOOL g_live_inited = FALSE;
+static WorkItemPool g_work_item_pool = {0};
 
 void live_updates_init(void){
     if(!g_live_inited){
         MPMC_Init(&g_live_updates, 1<<12);
         g_live_inited = TRUE;
     }
+}
+
+static void work_item_clear(DbWorkItem* item){
+    if(!item) return;
+    item->parent_path[0] = L'\0';
+    item->name[0] = L'\0';
+    item->file_size = 0;
+    item->creation_time = 0;
+    item->modified_time = 0;
+    item->access_time = 0;
+    item->attributes = 0;
+    item->stage = (IndexingLevel)0;
+    item->op = 0;
+    item->content = NULL;
+    item->preview = NULL;
+    item->clone_id = 0;
+    item->hash_crc = 0;
+    item->hash_ready = FALSE;
+}
+
+BOOL work_item_pool_init(size_t capacity){
+    if(g_work_item_pool.initialized) return TRUE;
+    if(capacity == 0){
+        g_work_item_pool.capacity = 0;
+        g_work_item_pool.queue_size = 0;
+        g_work_item_pool.initialized = FALSE;
+        return TRUE;
+    }
+    g_work_item_pool.items = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem) * capacity, CACHE_LINE_SIZE);
+    if(!g_work_item_pool.items) return FALSE;
+    for(size_t i=0;i<capacity;i++){
+        work_item_clear(&g_work_item_pool.items[i]);
+    }
+    LONG queue_size = 1;
+    while(queue_size < (LONG)capacity) queue_size <<= 1;
+    if(!MPMC_Init(&g_work_item_pool.free_queue, queue_size)){
+        aligned_free(g_work_item_pool.items);
+        g_work_item_pool.items = NULL;
+        return FALSE;
+    }
+    for(size_t i=0;i<capacity;i++){
+        if(!MPMC_Push(&g_work_item_pool.free_queue, &g_work_item_pool.items[i])){
+            MPMC_Destroy(&g_work_item_pool.free_queue);
+            aligned_free(g_work_item_pool.items);
+            g_work_item_pool.items = NULL;
+            return FALSE;
+        }
+    }
+    g_work_item_pool.capacity = capacity;
+    g_work_item_pool.queue_size = (size_t)queue_size;
+    g_work_item_pool.initialized = TRUE;
+    return TRUE;
+}
+
+void work_item_pool_destroy(void){
+    if(!g_work_item_pool.initialized) return;
+    void* ptr = NULL;
+    DbWorkItem* start = g_work_item_pool.items;
+    DbWorkItem* end = start ? start + g_work_item_pool.capacity : start;
+    while(MPMC_Pop(&g_work_item_pool.free_queue, &ptr)){
+        if(ptr && (ptr < (void*)start || ptr >= (void*)end)){
+            DbWorkItem* extra = (DbWorkItem*)ptr;
+            if(extra->content){ free(extra->content); extra->content = NULL; }
+            if(extra->preview){ free(extra->preview); extra->preview = NULL; }
+            aligned_free(extra);
+        }
+    }
+    MPMC_Destroy(&g_work_item_pool.free_queue);
+    if(g_work_item_pool.items){
+        aligned_free(g_work_item_pool.items);
+        g_work_item_pool.items = NULL;
+    }
+    g_work_item_pool.capacity = 0;
+    g_work_item_pool.queue_size = 0;
+    g_work_item_pool.initialized = FALSE;
+}
+
+DbWorkItem* acquire_work_item(void){
+    void* item_ptr = NULL;
+    if(g_work_item_pool.initialized && MPMC_Pop(&g_work_item_pool.free_queue, &item_ptr)){
+        DbWorkItem* item = (DbWorkItem*)item_ptr;
+        work_item_clear(item);
+        return item;
+    }
+    DbWorkItem* fallback = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+    if(fallback){
+        work_item_clear(fallback);
+    }
+    return fallback;
+}
+
+void release_work_item(DbWorkItem* item){
+    if(!item) return;
+    if(item->content){ free(item->content); item->content = NULL; }
+    if(item->preview){ free(item->preview); item->preview = NULL; }
+    work_item_clear(item);
+    if(g_work_item_pool.initialized){
+        if(MPMC_Push(&g_work_item_pool.free_queue, item)){
+            return;
+        }
+    }
+    aligned_free(item);
 }
 
 BOOL live_updates_poll(LiveUpdate* out){
@@ -1699,7 +1802,7 @@ static void writer_backlog_free(WriterCtx* ctx){
         for(size_t i=0;i<ctx->backlog_count;i++){
             size_t idx = (ctx->backlog_head + i) % ctx->backlog_capacity;
             DbWorkItem* wi = ctx->backlog[idx];
-            if(wi) aligned_free(wi);
+            if(wi) release_work_item(wi);
         }
     }
     free(ctx->backlog);
@@ -2022,12 +2125,12 @@ static DWORD WINAPI DbWriterThread(void* p){
         if(wi->op == WI_DELETE){
             db_delete_path(ctx->db, wi->parent_path, wi->name);
             batch_requires_sync = TRUE;
-            aligned_free(wi);
+            release_work_item(wi);
             continue;
         }
 
         if(!writer_ensure_record_capacity(&buf, &buf_capacity, in_batch + 1)){
-            aligned_free(wi);
+            release_work_item(wi);
             success = FALSE;
             goto cleanup;
         }
@@ -2041,20 +2144,19 @@ static DWORD WINAPI DbWriterThread(void* p){
             if(!parent_copy || !name_copy){
                 if(parent_copy) free(parent_copy);
                 if(name_copy) free(name_copy);
-                aligned_free(wi);
+                release_work_item(wi);
                 success = FALSE;
                 goto cleanup;
             }
             if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, parent_copy, &r.parent_str_id, NULL) ||
                !writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, name_copy, &r.name_str_id, &r.normalized_name_str_id)){
-                aligned_free(wi);
+                release_work_item(wi);
                 success = FALSE;
                 goto cleanup;
             }
             buf[in_batch++] = r;
-            DbWorkItem* next = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+            DbWorkItem* next = acquire_work_item();
             if(next){
-                next->content = NULL; next->preview = NULL;
                 wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
                 wcscpy_s(next->name, MAX_PATH, wi->name);
                 next->file_size = next->creation_time = next->modified_time = next->access_time = 0;
@@ -2064,10 +2166,10 @@ static DWORD WINAPI DbWriterThread(void* p){
                 next->hash_ready = wi->hash_ready;
                 next->stage = INDEX_METADATA_LIGHT; next->op = WI_ADD;
                 if(!writer_enqueue(ctx, next, "metadata-light")){
-                    aligned_free(next);
+                    release_work_item(next);
                 }
             }
-            aligned_free(wi);
+            release_work_item(wi);
         } else if(wi->stage == INDEX_METADATA_LIGHT){
             batch_requires_sync = TRUE;
             r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
@@ -2077,13 +2179,13 @@ static DWORD WINAPI DbWriterThread(void* p){
             if(!parent_copy || !name_copy){
                 if(parent_copy) free(parent_copy);
                 if(name_copy) free(name_copy);
-                aligned_free(wi);
+                release_work_item(wi);
                 success = FALSE;
                 goto cleanup;
             }
             if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, parent_copy, &r.parent_str_id, NULL) ||
                !writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, name_copy, &r.name_str_id, &r.normalized_name_str_id)){
-                aligned_free(wi);
+                release_work_item(wi);
                 success = FALSE;
                 goto cleanup;
             }
@@ -2098,9 +2200,8 @@ static DWORD WINAPI DbWriterThread(void* p){
             r.access_time   = at;
             buf[in_batch++] = r;
             if(!(attrs & FILE_ATTRIBUTE_DIRECTORY)){
-                DbWorkItem* next = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+                DbWorkItem* next = acquire_work_item();
                 if(next){
-                    next->content = NULL; next->preview = NULL;
                     wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
                     wcscpy_s(next->name, MAX_PATH, wi->name);
                     next->file_size = sz; next->creation_time=ct; next->modified_time=mt; next->access_time=at;
@@ -2110,11 +2211,11 @@ static DWORD WINAPI DbWriterThread(void* p){
                     next->hash_ready = wi->hash_ready;
                     next->stage = INDEX_FULL_CONTENT; next->op = WI_ADD;
                     if(!writer_enqueue(ctx, next, "full-content")){
-                        aligned_free(next);
+                        release_work_item(next);
                     }
                 }
             }
-            aligned_free(wi);
+            release_work_item(wi);
         } else {
             batch_requires_sync = TRUE;
             DbRecord existing;
@@ -2136,7 +2237,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                         }
                     }
                     if(offloaded){
-                        aligned_free(wi);
+                        release_work_item(wi);
                         continue;
                     }
                     ContentWorkItem stack_item;
@@ -2160,14 +2261,14 @@ static DWORD WINAPI DbWriterThread(void* p){
                                                                    &batch_requires_sync, &intern_requests, &intern_count, &intern_capacity);
                         content_result_free(immediate);
                         if(!applied){
-                            aligned_free(wi);
+                            release_work_item(wi);
                             success = FALSE;
                             goto cleanup;
                         }
                     }
                 }
             }
-            aligned_free(wi);
+            release_work_item(wi);
         }
 
         if(in_batch >= (size_t)ctx->batch_size){
@@ -2325,6 +2426,13 @@ int wmain(int argc, wchar_t** argv){
         return 1;
     }
 
+    size_t pool_bytes = dynamic_work_mem();
+    size_t pool_capacity = pool_bytes / sizeof(DbWorkItem);
+    if(pool_capacity == 0) pool_capacity = 1;
+    if(!work_item_pool_init(pool_capacity)){
+        fwprintf(stderr, L"Warning: failed to initialize DbWorkItem pool (%zu items)\n", pool_capacity);
+    }
+
     WriterCtx ctx = {0};
     ctx.db = db; ctx.batch_size = args.batch; ctx.done=FALSE; ctx.cancel.signaled = FALSE;
     ctx.content_pool = NULL;
@@ -2341,7 +2449,10 @@ int wmain(int argc, wchar_t** argv){
     while(queue_pow2 < (LONG)desired_queue && queue_pow2 < (1<<24)) queue_pow2 <<= 1;
     if(queue_pow2 < (LONG)desired_queue) queue_pow2 = (1<<24);
     if(!MPMC_Init(&ctx.queue, queue_pow2)){
-        fwprintf(stderr, L"MPMC_Init failed\n"); db_close(db); return 1;
+        fwprintf(stderr, L"MPMC_Init failed\n");
+        work_item_pool_destroy();
+        db_close(db);
+        return 1;
     }
     ctx.min_batch_size = 100;
     ctx.max_batch_size = 10000;
@@ -2353,6 +2464,7 @@ int wmain(int argc, wchar_t** argv){
     if(!writer_signal_init(&ctx.data_signal)){
         fwprintf(stderr, L"Failed to initialize writer signal\n");
         MPMC_Destroy(&ctx.queue);
+        work_item_pool_destroy();
         db_close(db);
         return 1;
     }
@@ -2447,5 +2559,6 @@ int wmain(int argc, wchar_t** argv){
     Plugin_UnloadAll();
     db_close(db);
     MPMC_Destroy(&ctx.queue);
+    work_item_pool_destroy();
     return 0;
 }
