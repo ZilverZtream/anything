@@ -2027,6 +2027,7 @@ static DWORD WINAPI filter_worker_thread(void* p){
         return 0;
     }
     size_t processed = 0;
+    size_t path_filter_len = a->q->path_filter ? strlen(a->q->path_filter) : 0;
     for(size_t i=a->start;i<a->end;i++){
         if(processed && (processed % FILTER_TXN_RENEW_BATCH)==0){
             mdb_txn_reset(txn);
@@ -2044,18 +2045,35 @@ static DWORD WINAPI filter_worker_thread(void* p){
         if(day < a->q->date_min_day || day > a->q->date_max_day) continue;
         MDB_val pk={.mv_data=&r->parent_str_id,.mv_size=sizeof(r->parent_str_id)}, pv;
         MDB_val nk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, nv;
-        if(mdb_get(txn, dbi_strings, &pk, &pv)!=0) continue;
-        if(mdb_get(txn, dbi_strings, &nk, &nv)!=0) continue;
-        MDB_val parent_val; StringMeta parent_meta;
+        char* parent = NULL;
+        char* name = NULL;
+        size_t parent_needed = 0;
+        db_parent_cache_copy(r->parent_str_id, NULL, 0, &parent_needed);
+        if(parent_needed > 0){
+            parent = (char*)_malloca(parent_needed);
+            if(parent && !db_parent_cache_copy(r->parent_str_id, parent, parent_needed, NULL)){
+                _freea(parent);
+                parent = NULL;
+            }
+        }
+        if(!parent){
+            MDB_val parent_val;
+            if(mdb_get(txn, dbi_strings, &pk, &pv)!=0) goto next_record;
+            string_value_parse(&pv, &parent_val, NULL);
+            parent = (char*)_malloca(parent_val.mv_size + 1);
+            if(!parent) goto next_record;
+            memcpy(parent, parent_val.mv_data, parent_val.mv_size);
+            parent[parent_val.mv_size] = 0;
+            db_parent_cache_put(r->parent_str_id, parent, parent_val.mv_size);
+        }
+        if(mdb_get(txn, dbi_strings, &nk, &nv)!=0) goto next_record;
         MDB_val name_val; StringMeta name_meta;
-        string_value_parse(&pv, &parent_val, &parent_meta);
         string_value_parse(&nv, &name_val, &name_meta);
-        char* parent = (char*)_malloca(parent_val.mv_size + 1);
-        char* name = (char*)_malloca(name_val.mv_size + 1);
-        if(!parent || !name){ if(parent) _freea(parent); if(name) _freea(name); continue; }
-        memcpy(parent, parent_val.mv_data, parent_val.mv_size); parent[parent_val.mv_size]=0;
-        memcpy(name, name_val.mv_data, name_val.mv_size); name[name_val.mv_size]=0;
-        if(a->q->path_filter){ if(strncmp(parent,a->q->path_filter,strlen(a->q->path_filter))!=0) continue; }
+        name = (char*)_malloca(name_val.mv_size + 1);
+        if(!name) goto next_record;
+        memcpy(name, name_val.mv_data, name_val.mv_size);
+        name[name_val.mv_size] = 0;
+        if(a->q->path_filter){ if(strncmp(parent, a->q->path_filter, path_filter_len)!=0) goto next_record; }
         if(a->q->name_pattern){
             char norm[512];
             normalize_filename_utf8(name, norm, sizeof(norm));
@@ -2064,16 +2082,17 @@ static DWORD WINAPI filter_worker_thread(void* p){
             int maxd = (int)((strlen(pat)+4)/5);
             BOOL ok = fuzzy_match(norm, pat, maxd);
             free(pat);
-            if(!ok) continue;
+            if(!ok) goto next_record;
         }
         float score = calculate_relevance(txn, dbi_strings, r, parent, name, a->q, a->total_docs, a->docs_with_term);
-        _freea(parent);
-        _freea(name);
         if(a->outn < a->outcap){
             a->out[a->outn].rec_id = rid;
             a->out[a->outn].score = score;
             a->outn++;
         }
+next_record:
+        if(name){ _freea(name); name = NULL; }
+        if(parent){ _freea(parent); parent = NULL; }
     }
 done:
     if(txn) mdb_txn_abort(txn);

@@ -94,6 +94,10 @@ BOOL db_put_records(Db* db, const DbRecord* recs, size_t count);
 BOOL db_delete_path(Db* db, const wchar_t* parent, const wchar_t* name);
 BOOL db_get_record_by_path(Db* db, const wchar_t* parent, const wchar_t* name, DbRecord* out);
 
+BOOL db_parent_cache_copy(uint64_t parent_str_id, char* buffer, size_t buffer_len, size_t* out_len);
+void db_parent_cache_put(uint64_t parent_str_id, const char* path_utf8, size_t path_len);
+void db_parent_cache_reset(void);
+
 #ifdef __cplusplus
 }
 #endif
