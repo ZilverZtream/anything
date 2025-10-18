@@ -88,6 +88,15 @@ cl /std:c++17 /EHsc ui_imgui.cpp imgui*.cpp glfw3.lib opengl32.lib lmdb.lib shlw
 
 Without these libraries the `run_ui` function prints a message and exits so command-line tools remain usable.
 
+### Windows Direct2D Virtual List Renderer
+
+For native Win32 interfaces that previously relied on GDI to draw large result sets, the new `direct2d_renderer` module exposes a
+hardware-accelerated rendering path backed by Direct2D and DirectWrite. Feed it a `VirtualListView` structure and it will batch all
+visible rows into a single text layout, issuing just one GPU draw call per frame. The implementation keeps scroll offsets, selection
+highlighting and row height spacing entirely on the GPU, eliminating the CPU-bound bottlenecks that appear once the result list
+exceeds a few thousand entries. Integrate it with an existing message loop by creating a renderer with `direct2d_renderer_create`,
+forwarding `WM_SIZE` messages to `direct2d_renderer_resize`, and calling `direct2d_renderer_paint` from your paint handler.
+
 ## Memory and Buffer Optimizations
 - Configurable `g_sort_buffer_size` (default 256MB) controls how much data is sorted in memory before spilling to temporary files.
 - Sort buffers pack variable-length values using length prefixes and include incremental 64-bit hashing helpers for composite sort keys.
