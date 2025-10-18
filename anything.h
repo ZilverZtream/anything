@@ -114,6 +114,52 @@ typedef struct DbWorkItem {
 #define WI_ADD    0
 #define WI_DELETE 1
 
+typedef struct ContentWorkItem {
+    uint64_t   rec_id;
+    DbRecord   base_record;
+    wchar_t    parent_path[MAX_LONG_PATH];
+    wchar_t    name[MAX_PATH];
+    wchar_t*   initial_content;
+    wchar_t*   initial_preview;
+    uint64_t   clone_id;
+    uint32_t   attributes;
+} ContentWorkItem;
+
+typedef struct ContentResultItem {
+    uint64_t   rec_id;
+    DbRecord   base_record;
+    wchar_t    parent_path[MAX_LONG_PATH];
+    wchar_t    name[MAX_PATH];
+    wchar_t*   content_text;
+    wchar_t*   preview_text;
+    wchar_t*   author_text;
+    wchar_t*   title_text;
+    wchar_t*   camera_text;
+    wchar_t*   lens_text;
+    wchar_t*   artist_text;
+    wchar_t*   album_text;
+    uint64_t   hash_crc;
+    BOOL       has_hash;
+    BOOL       success;
+    BOOL       needs_archive_index;
+} ContentResultItem;
+
+typedef struct ContentThreadPool {
+    MPMCQueue work_queue;
+    MPMCQueue result_queue;
+    volatile LONG64 pending;
+    CancelToken* cancel_token;
+    BOOL shutting_down;
+    int thread_count;
+#ifdef _WIN32
+    HANDLE threads[MAX_THREADS];
+#else
+    pthread_t threads[MAX_THREADS];
+#endif
+    void* worker_contexts[MAX_THREADS];
+    wchar_t db_path[MAX_PATH];
+} ContentThreadPool;
+
 typedef struct LiveUpdate {
     wchar_t  parent_path[MAX_LONG_PATH];
     wchar_t  name[MAX_PATH];
