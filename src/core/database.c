@@ -204,14 +204,45 @@ static void name_bloom_context_init(NameBloomContext* ctx){
     ctx->bloom_mask = 0;
 }
 
+#if defined(__AVX2__)
+static size_t fill_trigram_values_avx2(const char* text, size_t len, uint32_t* out){
+    size_t tri_count = (len > 2) ? (len - 2) : 0;
+    size_t i = 0;
+    if(tri_count < 8) return 0;
+
+    size_t avx_limit = tri_count & ~7ull;
+    for(; i < avx_limit; i += 8){
+        __m128i b0_bytes = _mm_loadl_epi64((const __m128i*)(text + i));
+        __m128i b1_bytes = _mm_loadl_epi64((const __m128i*)(text + i + 1));
+        __m128i b2_bytes = _mm_loadl_epi64((const __m128i*)(text + i + 2));
+
+        __m256i b0 = _mm256_cvtepu8_epi32(b0_bytes);
+        __m256i b1 = _mm256_cvtepu8_epi32(b1_bytes);
+        __m256i b2 = _mm256_cvtepu8_epi32(b2_bytes);
+
+        __m256i t = _mm256_or_si256(_mm256_slli_epi32(b0, 16),
+                        _mm256_or_si256(_mm256_slli_epi32(b1, 8), b2));
+        _mm256_storeu_si256((__m256i*)(out + i), t);
+    }
+
+    return i;
+}
+#endif
+
 static size_t fill_trigram_values(const char* text, size_t len, uint32_t* out){
     if(len < 3 || !text || !out) return 0;
     size_t tri_count = len - 2;
-#if defined(__SSE4_1__)
     size_t i = 0;
-    if(tri_count >= 4){
-        size_t simd_limit = tri_count & ~3ull;
-        for(; i < simd_limit; i += 4){
+#if defined(__AVX2__)
+    if(tri_count >= 8 && is_avx2_supported()){
+        i = fill_trigram_values_avx2(text, len, out);
+    }
+#endif
+#if defined(__SSE4_1__)
+    if(i < tri_count){
+        size_t simd_limit = (tri_count - i) & ~3ull;
+        size_t simd_end = i + simd_limit;
+        for(; i < simd_end; i += 4){
             __m128i bytes = _mm_loadu_si128((const __m128i*)(text + i));
             __m128i b0 = _mm_cvtepu8_epi32(bytes);
             __m128i b1 = _mm_cvtepu8_epi32(_mm_srli_si128(bytes,1));
@@ -227,7 +258,7 @@ static size_t fill_trigram_values(const char* text, size_t len, uint32_t* out){
                  (uint32_t)(uint8_t)text[i+2];
     }
 #else
-    for(size_t i=0;i<tri_count;i++){
+    for(; i < tri_count; ++i){
         out[i] = ((uint32_t)(uint8_t)text[i] << 16) |
                  ((uint32_t)(uint8_t)text[i+1] << 8) |
                  (uint32_t)(uint8_t)text[i+2];
