@@ -1259,26 +1259,93 @@ typedef struct FilterArgs {
     RankedResult* out;
     size_t outn;
     size_t outcap;
-    char db_path[MAX_LONG_PATH*3];
+    MDB_env* env;
+    MDB_dbi dbi_strings;
+    MDB_dbi dbi_records;
     size_t total_docs;
     size_t docs_with_term;
 } FilterArgs;
+
+#define FILTER_TXN_RENEW_BATCH 256
+
+#ifdef _WIN32
+static INIT_ONCE g_filter_txn_sem_once = INIT_ONCE_STATIC_INIT;
+static HANDLE g_filter_txn_sem = NULL;
+
+static BOOL CALLBACK filter_txn_sem_init_once(PINIT_ONCE init_once, PVOID param, PVOID* context){
+    (void)init_once; (void)param; (void)context;
+    int max = g_config.max_search_workers;
+    if(max < 1) max = 1;
+    g_filter_txn_sem = CreateSemaphoreW(NULL, max, max, NULL);
+    return g_filter_txn_sem != NULL;
+}
+
+static void filter_txn_sem_acquire(void){
+    InitOnceExecuteOnce(&g_filter_txn_sem_once, filter_txn_sem_init_once, NULL, NULL);
+    if(g_filter_txn_sem){
+        WaitForSingleObject(g_filter_txn_sem, INFINITE);
+    }
+}
+
+static void filter_txn_sem_release(void){
+    if(g_filter_txn_sem){
+        ReleaseSemaphore(g_filter_txn_sem, 1, NULL);
+    }
+}
+#else
+static pthread_once_t g_filter_txn_sem_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_filter_txn_sem_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_filter_txn_sem_cond = PTHREAD_COND_INITIALIZER;
+static int g_filter_txn_sem_count = 0;
+static int g_filter_txn_sem_max = 0;
+
+static void filter_txn_sem_init(void){
+    g_filter_txn_sem_count = g_config.max_search_workers;
+    if(g_filter_txn_sem_count < 1) g_filter_txn_sem_count = 1;
+    g_filter_txn_sem_max = g_filter_txn_sem_count;
+}
+
+static void filter_txn_sem_acquire(void){
+    pthread_once(&g_filter_txn_sem_once, filter_txn_sem_init);
+    pthread_mutex_lock(&g_filter_txn_sem_mutex);
+    while(g_filter_txn_sem_count == 0){
+        pthread_cond_wait(&g_filter_txn_sem_cond, &g_filter_txn_sem_mutex);
+    }
+    g_filter_txn_sem_count--;
+    pthread_mutex_unlock(&g_filter_txn_sem_mutex);
+}
+
+static void filter_txn_sem_release(void){
+    pthread_mutex_lock(&g_filter_txn_sem_mutex);
+    if(g_filter_txn_sem_count < g_filter_txn_sem_max){
+        g_filter_txn_sem_count++;
+        pthread_cond_signal(&g_filter_txn_sem_cond);
+    }
+    pthread_mutex_unlock(&g_filter_txn_sem_mutex);
+}
+#endif
 
 static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbRecord* r, const char* parent_utf8, const char* name_utf8, const SearchQuery* q, size_t total_docs, size_t docs_with_term);
 
 static DWORD WINAPI filter_worker_thread(void* p){
     FilterArgs* a=(FilterArgs*)p;
-    MDB_env* env=NULL; MDB_txn* txn=NULL;
-    MDB_dbi dbi_strings, dbi_records;
-    if(mdb_env_create(&env)!=0) return 0;
-    mdb_env_set_maxdbs(env,64);
-    if(mdb_env_open(env, a->db_path, MDB_RDONLY, 0664)!=0){ mdb_env_close(env); return 0; }
-    if(mdb_txn_begin(env,NULL,MDB_RDONLY,&txn)!=0){ mdb_env_close(env); return 0; }
-    if(mdb_dbi_open(txn,"strings",0,&dbi_strings)!=0 ||
-       mdb_dbi_open(txn,"records",0,&dbi_records)!=0){
-        mdb_txn_abort(txn); mdb_env_close(env); return 0;
+    MDB_txn* txn=NULL;
+    MDB_dbi dbi_strings = a->dbi_strings;
+    MDB_dbi dbi_records = a->dbi_records;
+    filter_txn_sem_acquire();
+    if(mdb_txn_begin(a->env,NULL,MDB_RDONLY,&txn)!=0){
+        filter_txn_sem_release();
+        return 0;
     }
+    size_t processed = 0;
     for(size_t i=a->start;i<a->end;i++){
+        if(processed && (processed % FILTER_TXN_RENEW_BATCH)==0){
+            mdb_txn_reset(txn);
+            if(mdb_txn_renew(txn)!=0){
+                goto done;
+            }
+        }
+        processed++;
         uint64_t rid = a->ids[i];
         MDB_val rk={.mv_data=&rid,.mv_size=sizeof(rid)}, rv;
         if(mdb_get(txn, dbi_records, &rk, &rv)!=0 || rv.mv_size<sizeof(DbRecord)) continue;
@@ -1310,7 +1377,9 @@ static DWORD WINAPI filter_worker_thread(void* p){
             a->outn++;
         }
     }
-    mdb_txn_abort(txn); mdb_env_close(env);
+done:
+    if(txn) mdb_txn_abort(txn);
+    filter_txn_sem_release();
     return 0;
 }
 
@@ -2073,7 +2142,9 @@ int wmain(int argc, wchar_t** argv){
         fa[ti].outn = 0;
         fa[ti].total_docs = total_docs;
         fa[ti].docs_with_term = docs_with_term;
-        to_utf8(dbPath, fa[ti].db_path, sizeof(fa[ti].db_path));
+        fa[ti].env = env;
+        fa[ti].dbi_strings = dbi_strings;
+        fa[ti].dbi_records = dbi_records;
         uintptr_t h = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))filter_worker_thread,&fa[ti],0,NULL);
         th[ti] = (HANDLE)h;
     }
