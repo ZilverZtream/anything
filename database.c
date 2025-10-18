@@ -553,6 +553,14 @@ static void extract_trigrams(const char* text, uint32_t** out_tris, size_t* out_
     *out_count = need;
 }
 
+static int compare_u32(const void* a, const void* b){
+    uint32_t ua = *(const uint32_t*)a;
+    uint32_t ub = *(const uint32_t*)b;
+    if(ua < ub) return -1;
+    if(ua > ub) return 1;
+    return 0;
+}
+
 static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     size_t len = strlen(name_u8);
     if(len < 3) return;
@@ -565,15 +573,16 @@ static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
 
     uint32_t* tris; size_t tri_n;
     extract_trigrams(tmp, &tris, &tri_n);
+    if(!tris || tri_n == 0){
+        if(heap) free(tmp);
+        return;
+    }
 
-    // Deduplicate trigrams to avoid duplicate index entries
-    uint32_t seen[256]; UINT seen_n=0;
+    qsort(tris, tri_n, sizeof(uint32_t), compare_u32);
+
     for(size_t i=0;i<tri_n;i++){
         uint32_t key = tris[i];
-        BOOL dup=FALSE;
-        for(UINT j=0;j<seen_n;j++){ if(seen[j]==key){ dup=TRUE; break; } }
-        if(dup) continue;
-        if(seen_n<256) seen[seen_n++]=key;
+        if(i > 0 && key == tris[i-1]) continue;
 
         MDB_val k={.mv_data=&key,.mv_size=3}, v={.mv_data=&name_id,.mv_size=sizeof(name_id)};
         int rc = mdb_put(d->wtxn, d->dbi_trigram_index, &k, &v, MDB_NODUPDATA);
@@ -594,14 +603,16 @@ static void remove_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
 
     uint32_t* tris; size_t tri_n;
     extract_trigrams(tmp, &tris, &tri_n);
+    if(!tris || tri_n == 0){
+        if(heap) free(tmp);
+        return;
+    }
 
-    uint32_t seen[256]; UINT seen_n=0;
+    qsort(tris, tri_n, sizeof(uint32_t), compare_u32);
+
     for(size_t i=0;i<tri_n;i++){
         uint32_t key = tris[i];
-        BOOL dup=FALSE;
-        for(UINT j=0;j<seen_n;j++){ if(seen[j]==key){ dup=TRUE; break; } }
-        if(dup) continue;
-        if(seen_n<256) seen[seen_n++]=key;
+        if(i > 0 && key == tris[i-1]) continue;
         MDB_val k={.mv_data=&key,.mv_size=3}, v={.mv_data=&name_id,.mv_size=sizeof(name_id)};
         int rc = mdb_del(d->wtxn, d->dbi_trigram_index, &k, &v);
         if(rc && rc!=MDB_NOTFOUND){ set_mdb_error(d, rc); }
