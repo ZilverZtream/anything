@@ -380,9 +380,34 @@ float bm25_score(int tf, int doc_len, float avg_doc_len, int docs_total, int doc
 }
 
 int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen){
+    enum { MAX_TOTAL = 65536, STACK_COLS = 256 };
+
+    size_t actual_alen = 0;
+    size_t actual_blen = 0;
+
+    if(a){
+        actual_alen = strlen(a);
+        if(actual_alen != alen) alen = actual_alen;
+    } else {
+        alen = 0;
+    }
+
+    if(b){
+        actual_blen = strlen(b);
+        if(actual_blen != blen) blen = actual_blen;
+    } else {
+        blen = 0;
+    }
+
     if(!a) return (int)blen;
     if(!b) return (int)alen;
-    if(alen > 1024 || blen > 1024){
+
+    if(alen > SIZE_MAX - blen){
+        return (int)(alen > blen ? alen : blen);
+    }
+
+    size_t total = alen + blen;
+    if(total > (size_t)MAX_TOTAL){
         return (int)(alen > blen ? alen : blen);
     }
 
@@ -393,11 +418,10 @@ int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen)
 
     size_t cols = blen + 1;
     size_t buf_size = cols * sizeof(int);
-    int stack_col[1025];
-    BOOL heap = buf_size > sizeof(stack_col);
+    int stack_col[STACK_COLS];
+    BOOL heap = cols > STACK_COLS;
     int* col = heap ? (int*)malloc(buf_size) : stack_col;
     if(!col){
-        if(heap) free(col);
         return (int)(alen>blen?alen:blen);
     }
 
