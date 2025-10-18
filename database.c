@@ -2194,21 +2194,32 @@ BOOL db_delete_path(Db* db_, const wchar_t* parent, const wchar_t* name){
     uint64_t norm_id = norm_ids[0] ? norm_ids[0] : name_id;
     if(!parent_id || !name_id) return TRUE;
     MDB_cursor* cur;
-    MDB_val key={.mv_data=&norm_id,.mv_size=sizeof(norm_id)}, val;
+    MDB_val key, val;
     int rc = mdb_cursor_open(d->wtxn, d->dbi_fname_index, &cur);
     if(rc){ set_mdb_error(d, rc); return FALSE; }
-    rc = mdb_cursor_get(cur, &key, &val, MDB_SET);
-    while(rc==0){
-        uint64_t id = *(uint64_t*)val.mv_data;
-        MDB_val rk,rv; to_mdb_val(&id,sizeof(id),&rk);
-        if(mdb_get(d->wtxn, d->dbi_records, &rk, &rv)==0){
-            DbRecord r; memcpy(&r, rv.mv_data, sizeof(r));
-            if(r.parent_str_id == parent_id && r.name_str_id == name_id){
-                db_delete_record(d, id, &r);
-                break;
+    uint64_t lookup_ids[2] = { norm_id, name_id };
+    size_t lookup_count = (norm_id != name_id) ? 2 : 1;
+    BOOL deleted = FALSE;
+    for(size_t i = 0; i < lookup_count && !deleted; ++i){
+        key.mv_data = &lookup_ids[i];
+        key.mv_size = sizeof(uint64_t);
+        rc = mdb_cursor_get(cur, &key, &val, MDB_SET);
+        while(rc==0){
+            uint64_t id = *(uint64_t*)val.mv_data;
+            MDB_val rk,rv; to_mdb_val(&id,sizeof(id),&rk);
+            if(mdb_get(d->wtxn, d->dbi_records, &rk, &rv)==0){
+                DbRecord r; memcpy(&r, rv.mv_data, sizeof(r));
+                if(r.parent_str_id == parent_id && r.name_str_id == name_id){
+                    db_delete_record(d, id, &r);
+                    deleted = TRUE;
+                    break;
+                }
             }
+            rc = mdb_cursor_get(cur, &key, &val, MDB_NEXT_DUP);
         }
-        rc = mdb_cursor_get(cur, &key, &val, MDB_NEXT_DUP);
+        if(rc && rc != MDB_NOTFOUND){
+            break;
+        }
     }
     mdb_cursor_close(cur);
     return TRUE;
@@ -2232,23 +2243,32 @@ BOOL db_get_record_by_path(Db* db_, const wchar_t* parent, const wchar_t* name, 
     uint64_t norm_id = norm_ids[0] ? norm_ids[0] : name_id;
     if(!parent_id || !name_id){ if(own_txn) mdb_txn_abort(txn); return FALSE; }
     MDB_cursor* cur;
-    MDB_val key={.mv_data=&norm_id,.mv_size=sizeof(norm_id)}, val;
+    MDB_val key, val;
     int rc = mdb_cursor_open(txn, d->dbi_fname_index, &cur);
     if(rc){ if(own_txn) mdb_txn_abort(txn); return FALSE; }
-    rc = mdb_cursor_get(cur, &key, &val, MDB_SET);
     BOOL found = FALSE;
-    while(rc==0){
-        uint64_t id = *(uint64_t*)val.mv_data;
-        MDB_val rk,rv; to_mdb_val(&id,sizeof(id),&rk);
-        if(mdb_get(txn, d->dbi_records, &rk, &rv)==0){
-            DbRecord* r=(DbRecord*)rv.mv_data;
-            if(r->parent_str_id == parent_id && r->name_str_id == name_id){
-                if(out) *out = *r;
-                found = TRUE;
-                break;
+    uint64_t lookup_ids[2] = { norm_id, name_id };
+    size_t lookup_count = (norm_id != name_id) ? 2 : 1;
+    for(size_t i = 0; i < lookup_count && !found; ++i){
+        key.mv_data = &lookup_ids[i];
+        key.mv_size = sizeof(uint64_t);
+        rc = mdb_cursor_get(cur, &key, &val, MDB_SET);
+        while(rc==0){
+            uint64_t id = *(uint64_t*)val.mv_data;
+            MDB_val rk,rv; to_mdb_val(&id,sizeof(id),&rk);
+            if(mdb_get(txn, d->dbi_records, &rk, &rv)==0){
+                DbRecord* r=(DbRecord*)rv.mv_data;
+                if(r->parent_str_id == parent_id && r->name_str_id == name_id){
+                    if(out) *out = *r;
+                    found = TRUE;
+                    break;
+                }
             }
+            rc = mdb_cursor_get(cur, &key, &val, MDB_NEXT_DUP);
         }
-        rc = mdb_cursor_get(cur, &key, &val, MDB_NEXT_DUP);
+        if(rc && rc != MDB_NOTFOUND){
+            break;
+        }
     }
     mdb_cursor_close(cur);
     if(own_txn) mdb_txn_abort(txn);
