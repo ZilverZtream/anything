@@ -121,6 +121,11 @@ BOOL index_archive(Db* db, const wchar_t* archive_path){
         rec.type = DB_REC_FILE;
         rec.parent_str_id = parent_id;
         rec.name_str_id = db_intern_wstring(db, wname);
+        char norm_utf8[MAX_LONG_PATH*3];
+        normalize_filename_utf8(canon, norm_utf8, sizeof(norm_utf8));
+        wchar_t wnorm[MAX_LONG_PATH];
+        to_wide(norm_utf8, wnorm, MAX_LONG_PATH);
+        rec.normalized_name_str_id = db_intern_wstring(db, wnorm);
         db_put_records(db, &rec, 1);
         archive_read_data_skip(a);
     }

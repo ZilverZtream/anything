@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include "util.h"
 #ifdef _WIN32
 #define strcasecmp _stricmp
 #else
@@ -183,8 +184,13 @@ static int dir_iter_cb(ext2_ino_t dir, int entry, struct ext2_dir_entry* de,
 
     DbRecord rec = {0};
     rec.type = S_ISDIR(inode.i_mode) ? DB_REC_DIR : DB_REC_FILE;
-    rec.parent_str_id = db_intern_wstring(ictx->ctx->db, ictx->parent);
+   rec.parent_str_id = db_intern_wstring(ictx->ctx->db, ictx->parent);
     rec.name_str_id   = db_intern_wstring(ictx->ctx->db, wname);
+    char norm_utf8[256];
+    normalize_filename_utf8(name, norm_utf8, sizeof(norm_utf8));
+    wchar_t wnorm[256];
+    mbstowcs(wnorm, norm_utf8, 256);
+    rec.normalized_name_str_id = db_intern_wstring(ictx->ctx->db, wnorm);
     rec.file_size = ((uint64_t)inode.i_size_high << 32) | inode.i_size;
     rec.creation_time = unix_time_to_filetime(inode.i_ctime);
     rec.modified_time = unix_time_to_filetime(inode.i_mtime);
