@@ -831,6 +831,12 @@ typedef struct WriterCtx {
     MPMCQueue queue;
     CancelToken cancel;
     size_t grow_attempts;
+    DbWorkItem** backlog;
+    size_t backlog_head;
+    size_t backlog_tail;
+    size_t backlog_count;
+    size_t backlog_capacity;
+    DWORD push_timeout_ms;
 } WriterCtx;
 
 static const size_t MAP_GROWTH_INCREMENT = 1ull * 1024ull * 1024ull * 1024ull; // 1 GB
@@ -867,8 +873,112 @@ static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch
     }
 }
 
+static BOOL writer_backlog_push(WriterCtx* ctx, DbWorkItem* wi){
+    if(!ctx) return FALSE;
+    if(ctx->backlog_count == ctx->backlog_capacity){
+        size_t newcap = ctx->backlog_capacity ? ctx->backlog_capacity * 2 : 64;
+        DbWorkItem** items = (DbWorkItem**)malloc(sizeof(DbWorkItem*) * newcap);
+        if(!items) return FALSE;
+        if(ctx->backlog_count){
+            for(size_t i=0;i<ctx->backlog_count;i++){
+                size_t idx = (ctx->backlog_head + i) % ctx->backlog_capacity;
+                items[i] = ctx->backlog[idx];
+            }
+            ctx->backlog_head = 0;
+            ctx->backlog_tail = ctx->backlog_count;
+        } else {
+            ctx->backlog_head = 0;
+            ctx->backlog_tail = 0;
+        }
+        free(ctx->backlog);
+        ctx->backlog = items;
+        ctx->backlog_capacity = newcap;
+    }
+    ctx->backlog[ctx->backlog_tail] = wi;
+    ctx->backlog_tail = (ctx->backlog_tail + 1) % ctx->backlog_capacity;
+    ctx->backlog_count++;
+    return TRUE;
+}
+
+static DbWorkItem* writer_backlog_peek(const WriterCtx* ctx){
+    if(!ctx || ctx->backlog_count == 0) return NULL;
+    return ctx->backlog[ctx->backlog_head];
+}
+
+static void writer_backlog_pop(WriterCtx* ctx){
+    if(!ctx || ctx->backlog_count == 0) return;
+    ctx->backlog_head = (ctx->backlog_head + 1) % ctx->backlog_capacity;
+    ctx->backlog_count--;
+}
+
+static void writer_backlog_free(WriterCtx* ctx){
+    if(!ctx) return;
+    if(ctx->backlog_count){
+        for(size_t i=0;i<ctx->backlog_count;i++){
+            size_t idx = (ctx->backlog_head + i) % ctx->backlog_capacity;
+            DbWorkItem* wi = ctx->backlog[idx];
+            if(wi) aligned_free(wi);
+        }
+    }
+    free(ctx->backlog);
+    ctx->backlog = NULL;
+    ctx->backlog_capacity = 0;
+    ctx->backlog_count = 0;
+    ctx->backlog_head = 0;
+    ctx->backlog_tail = 0;
+}
+
+static BOOL push_with_backoff(MPMCQueue* q, void* data, DWORD timeout_ms, const char* owner){
+    if(!q) return FALSE;
+    ULONGLONG start = GetTickCount64();
+    int tries = 0;
+    for(;;){
+        if(MPMC_Push(q, data)) return TRUE;
+        tries++;
+        if(tries > 1000){
+            fprintf(stderr, "%s: queue saturated, pausing producer to relieve pressure\n", owner ? owner : "queue");
+            Sleep(10);
+            tries = 0;
+        } else {
+            SwitchToThread();
+        }
+        if(timeout_ms != INFINITE){
+            ULONGLONG elapsed = GetTickCount64() - start;
+            if(elapsed >= timeout_ms) return FALSE;
+        }
+    }
+}
+
+static BOOL writer_enqueue(WriterCtx* ctx, DbWorkItem* wi, const char* stage){
+    if(!ctx || !wi) return FALSE;
+    if(push_with_backoff(&ctx->queue, wi, ctx->push_timeout_ms, stage)){
+        return TRUE;
+    }
+    if(writer_backlog_push(ctx, wi)){
+        fprintf(stderr, "DbWriterThread: queue full while enqueuing %s work; deferring\n", stage ? stage : "unknown");
+        return TRUE;
+    }
+    fprintf(stderr, "DbWriterThread: failed to enqueue %s work due to memory pressure\n", stage ? stage : "unknown");
+    return FALSE;
+}
+
+static void writer_drain_backlog(WriterCtx* ctx){
+    if(!ctx || ctx->backlog_count == 0) return;
+    size_t attempts = ctx->backlog_count;
+    while(attempts-- && ctx->backlog_count){
+        DbWorkItem* wi = writer_backlog_peek(ctx);
+        if(!wi) { writer_backlog_pop(ctx); continue; }
+        if(push_with_backoff(&ctx->queue, wi, ctx->push_timeout_ms, "DbWriterThread backlog")){
+            writer_backlog_pop(ctx);
+        } else {
+            break;
+        }
+    }
+}
+
 static DWORD WINAPI DbWriterThread(void* p){
     WriterCtx* ctx = (WriterCtx*)p;
+    if(ctx->push_timeout_ms == 0) ctx->push_timeout_ms = 50;
     if(!db_begin_write(ctx->db)) return 1;
     size_t in_batch = 0;
     DbRecord* buf = (DbRecord*)malloc(sizeof(DbRecord) * ctx->batch_size);
@@ -876,13 +986,18 @@ static DWORD WINAPI DbWriterThread(void* p){
     ZeroMemory(buf, sizeof(DbRecord)*ctx->batch_size);
 
     for(;;){
+        writer_drain_backlog(ctx);
         void* item = NULL;
         if(!MPMC_Pop(&ctx->queue, &item)){
-            if(ctx->done) break;
+            if(ctx->done && ctx->backlog_count == 0) break;
             Sleep(1);
             continue;
         }
-        if(item == NULL) break; // sentinel
+        if(item == NULL){
+            if(ctx->backlog_count == 0) break;
+            ctx->done = TRUE;
+            continue;
+        }
         DbWorkItem* wi = (DbWorkItem*)item;
         if(wi->stage == INDEX_NAMES_ONLY || wi->op == WI_DELETE) push_live_update(wi);
         if(wi->op == WI_DELETE){
@@ -906,7 +1021,9 @@ static DWORD WINAPI DbWriterThread(void* p){
                 next->attributes = wi->attributes;
                 next->clone_id = 0;
                 next->stage = INDEX_METADATA_LIGHT; next->op = WI_ADD;
-                while(!MPMC_Push(&ctx->queue, next)) Sleep(0);
+                if(!writer_enqueue(ctx, next, "metadata-light")){
+                    aligned_free(next);
+                }
             }
             aligned_free(wi);
         } else if(wi->stage == INDEX_METADATA_LIGHT){
@@ -934,7 +1051,9 @@ static DWORD WINAPI DbWriterThread(void* p){
                     next->attributes = attrs;
                     next->clone_id = 0;
                     next->stage = INDEX_FULL_CONTENT; next->op = WI_ADD;
-                    while(!MPMC_Push(&ctx->queue, next)) Sleep(0);
+                    if(!writer_enqueue(ctx, next, "full-content")){
+                        aligned_free(next);
+                    }
                 }
             }
             aligned_free(wi);
@@ -975,19 +1094,20 @@ static DWORD WINAPI DbWriterThread(void* p){
             aligned_free(wi);
         }
         if(in_batch >= (size_t)ctx->batch_size){
-            if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); return 1; }
-            if(!db_commit_write(ctx->db)) { free(buf); return 1; }
-            if(!db_begin_write(ctx->db))  { free(buf); return 1; }
+            if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); writer_backlog_free(ctx); return 1; }
+            if(!db_commit_write(ctx->db)) { free(buf); writer_backlog_free(ctx); return 1; }
+            if(!db_begin_write(ctx->db))  { free(buf); writer_backlog_free(ctx); return 1; }
             in_batch = 0;
         }
     }
     if(in_batch){
-        if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); return 1; }
-        if(!db_commit_write(ctx->db)) { free(buf); return 1; }
+        if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); writer_backlog_free(ctx); return 1; }
+        if(!db_commit_write(ctx->db)) { free(buf); writer_backlog_free(ctx); return 1; }
     } else {
         db_commit_write(ctx->db);
     }
     free(buf);
+    writer_backlog_free(ctx);
     return 0;
 }
 
@@ -1083,9 +1203,19 @@ int wmain(int argc, wchar_t** argv){
 
     WriterCtx ctx = {0};
     ctx.db = db; ctx.batch_size = args.batch; ctx.done=FALSE; ctx.cancel.signaled = FALSE;
-    if(!MPMC_Init(&ctx.queue, 1<<18)){
+    size_t desired_queue = (size_t)args.threads * (size_t)args.batch;
+    size_t min_queue = (size_t)args.threads * 4096;
+    if(desired_queue < min_queue) desired_queue = min_queue;
+    if(desired_queue < (size_t)(1u<<16)) desired_queue = (size_t)(1u<<16);
+    LONG queue_pow2 = 1;
+    while(queue_pow2 < (LONG)desired_queue && queue_pow2 < (1<<24)) queue_pow2 <<= 1;
+    if(queue_pow2 < (LONG)desired_queue) queue_pow2 = (1<<24);
+    if(!MPMC_Init(&ctx.queue, queue_pow2)){
         fwprintf(stderr, L"MPMC_Init failed\n"); db_close(db); return 1;
     }
+    DWORD computed_timeout = (DWORD)(args.threads * 25);
+    if(computed_timeout < 50) computed_timeout = 50;
+    ctx.push_timeout_ms = computed_timeout;
     PluginHost ph = { &ctx.queue, &ctx.cancel };
     Plugin_LoadAll(L"plugins", &ph);
     uintptr_t wh = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))DbWriterThread,&ctx,0,NULL);
@@ -1149,7 +1279,7 @@ int wmain(int argc, wchar_t** argv){
     }
 
     ctx.done = TRUE;
-    MPMC_Push(&ctx.queue, NULL); // sentinel
+    push_with_backoff(&ctx.queue, NULL, INFINITE, "main thread sentinel");
     WaitForSingleObject(writer, INFINITE);
     CloseHandle(writer);
 
