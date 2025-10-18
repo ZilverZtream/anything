@@ -37,6 +37,7 @@
 #include <stdbool.h>
 #include <zip.h>
 #include <libpst/libpst.h>
+#include <ctype.h>
 #ifndef _WIN32
 #include <strings.h>
 #include <stdarg.h>
@@ -345,6 +346,36 @@ cleanup:
 #endif
 }
 
+static void intern_email_header_value(Db* db, const char* value, uint64_t* out){
+    if(!db || !value || !out) return;
+    int needed = MultiByteToWideChar(CP_UTF8, 0, value, -1, NULL, 0);
+    if(needed <= 0) return;
+    wchar_t* wtmp = (wchar_t*)malloc((size_t)needed * sizeof(wchar_t));
+    if(!wtmp) return;
+    if(MultiByteToWideChar(CP_UTF8, 0, value, -1, wtmp, needed) > 0){
+        *out = db_intern_wstring(db, wtmp);
+    }
+    free(wtmp);
+}
+
+static char* copy_email_header_value(const char* line, size_t len, size_t prefix){
+    if(len <= prefix) return NULL;
+    const char* start = line + prefix;
+    size_t value_len = len - prefix;
+    while(value_len > 0 && isspace((unsigned char)*start)){
+        start++;
+        value_len--;
+    }
+    while(value_len > 0 && isspace((unsigned char)start[value_len - 1])){
+        value_len--;
+    }
+    char* tmp = (char*)malloc(value_len + 1);
+    if(!tmp) return NULL;
+    memcpy(tmp, start, value_len);
+    tmp[value_len] = '\0';
+    return tmp;
+}
+
 static wchar_t* extract_email_content(Db* db, const wchar_t* path, uint64_t* author_out, uint64_t* title_out){
     *author_out = 0;
     *title_out = 0;
@@ -375,11 +406,21 @@ static wchar_t* extract_email_content(Db* db, const wchar_t* path, uint64_t* aut
             if(!next || next > header_end) break;
             size_t len = (size_t)(next - line);
             if(_strnicmp(line, "From:",5)==0){
-                char tmp[256]; if(len>255) len=255; memcpy(tmp,line+5,len-5); tmp[len-5]=0;
-                wchar_t wtmp[256]; to_wide(tmp,wtmp,256); *author_out = db_intern_wstring(db,wtmp);
+                if(len > 5 && line + 5 <= header_end){
+                    char* tmp = copy_email_header_value(line, len, 5);
+                    if(tmp){
+                        intern_email_header_value(db, tmp, author_out);
+                        free(tmp);
+                    }
+                }
             } else if(_strnicmp(line, "Subject:",8)==0){
-                char tmp[256]; if(len>255) len=255; memcpy(tmp,line+8,len-8); tmp[len-8]=0;
-                wchar_t wtmp[256]; to_wide(tmp,wtmp,256); *title_out = db_intern_wstring(db,wtmp);
+                if(len > 8 && line + 8 <= header_end){
+                    char* tmp = copy_email_header_value(line, len, 8);
+                    if(tmp){
+                        intern_email_header_value(db, tmp, title_out);
+                        free(tmp);
+                    }
+                }
             }
             line = next + sep;
         }
