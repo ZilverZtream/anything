@@ -882,7 +882,7 @@ BOOL db_begin_write(Db* db_){
     if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     return rc==0;
 }
-BOOL db_commit_write(Db* db_){
+BOOL db_commit_write_ex(Db* db_, BOOL force_sync){
     DbImpl* d = (DbImpl*)db_;
     if(!d->wtxn) return TRUE;
     if(d->dirty){
@@ -897,10 +897,13 @@ BOOL db_commit_write(Db* db_){
     d->wtxn = NULL;
     if(rc==0){
         d->header_cache.map_size_bytes = db_current_mapsize(db_);
-        mdb_env_sync(d->env, 1);
+        mdb_env_sync(d->env, force_sync ? 1 : 0);
         d->dirty = FALSE;
     }
     return rc==0;
+}
+BOOL db_commit_write(Db* db_){
+    return db_commit_write_ex(db_, TRUE);
 }
 void db_abort_write(Db* db_){
     DbImpl* d = (DbImpl*)db_;

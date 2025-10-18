@@ -78,6 +78,7 @@ size_t db_last_write_progress(Db* db);
 BOOL db_ensure_loaded(Db* db, IndexLoadState state);
 
 BOOL db_begin_write(Db* db);
+BOOL db_commit_write_ex(Db* db, BOOL force_sync);
 BOOL db_commit_write(Db* db);
 void db_abort_write(Db* db);
 
