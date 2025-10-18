@@ -627,6 +627,19 @@ typedef struct {
 } SortChunk;
 #endif
 
+static void chunk_init(SortChunk* chunk){
+    if(!chunk) return;
+#ifdef _WIN32
+    chunk->h = INVALID_HANDLE_VALUE;
+#else
+    chunk->fd = -1;
+#endif
+    chunk->remaining = 0;
+    chunk->item = NULL;
+    chunk->loaded = FALSE;
+    chunk->path[0] = 0;
+}
+
 static void heap_push(size_t* heap, size_t* heap_size, size_t idx,
                       SortChunk* chunks,
                       int (*cmp)(const void*, const void*)){
@@ -727,6 +740,32 @@ static void chunk_close(int fd, const char* path){
 }
 #endif
 
+static void chunk_cleanup(SortChunk* chunk, size_t item_size){
+    if(!chunk) return;
+#ifdef _WIN32
+    if(chunk->item){
+        VirtualFree(chunk->item, 0, MEM_RELEASE);
+        chunk->item = NULL;
+    }
+    if(chunk->h != INVALID_HANDLE_VALUE){
+        chunk_close(chunk->h, chunk->path);
+        chunk->h = INVALID_HANDLE_VALUE;
+    }
+#else
+    if(chunk->item){
+        munmap(chunk->item, item_size);
+        chunk->item = NULL;
+    }
+    if(chunk->fd >= 0){
+        chunk_close(chunk->fd, chunk->path);
+        chunk->fd = -1;
+    }
+#endif
+    chunk->path[0] = 0;
+    chunk->remaining = 0;
+    chunk->loaded = FALSE;
+}
+
 BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
                    int (*cmp)(const void*, const void*)){
     if(!base || !cmp || size==0) return FALSE;
@@ -754,61 +793,71 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
     while(offset < n){
         size_t m = n - offset; if(m > max_items) m = max_items;
         qsort((uint8_t*)base + offset*size, m, size, cmp);
+
+        SortChunk chunk;
+        chunk_init(&chunk);
+        chunk.remaining = m;
 #ifdef _WIN32
         wchar_t file[MAX_LONG_PATH];
-        HANDLE h = tempfile_create(file, tmpdir);
-        if(h==INVALID_HANDLE_VALUE) goto fail;
-        if(!chunk_write(h, (uint8_t*)base + offset*size, m*size)){
-            chunk_close(h, file); goto fail;
+        chunk.h = tempfile_create(file, tmpdir);
+        if(chunk.h==INVALID_HANDLE_VALUE) goto fail;
+        wcscpy_s(chunk.path, MAX_LONG_PATH, file);
+        if(!chunk_write(chunk.h, (uint8_t*)base + offset*size, m*size)){
+            chunk_cleanup(&chunk, size);
+            goto fail;
         }
-        SetFilePointer(h,0,NULL,FILE_BEGIN);
+        SetFilePointer(chunk.h,0,NULL,FILE_BEGIN);
+        chunk.item=(uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        if(!chunk.item){
+            chunk_cleanup(&chunk, size);
+            goto fail;
+        }
 #else
         char file[PATH_MAX];
-        int fd = tempfile_create(file, tmpdir);
-        if(fd<0) goto fail;
-        if(!chunk_write(fd, (uint8_t*)base + offset*size, m*size)){
-            chunk_close(fd, file); goto fail;
+        chunk.fd = tempfile_create(file, tmpdir);
+        if(chunk.fd<0){
+            chunk_cleanup(&chunk, size);
+            goto fail;
         }
-        lseek(fd,0,SEEK_SET);
+        if(unlink(file)!=0){
+            strncpy(chunk.path, file, PATH_MAX-1);
+            chunk.path[PATH_MAX-1] = 0;
+        }
+        if(!chunk_write(chunk.fd, (uint8_t*)base + offset*size, m*size)){
+            chunk_cleanup(&chunk, size);
+            goto fail;
+        }
+        lseek(chunk.fd,0,SEEK_SET);
+        chunk.item=(uint8_t*)mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if(chunk.item==MAP_FAILED){
+            chunk.item = NULL;
+            chunk_cleanup(&chunk, size);
+            goto fail;
+        }
 #endif
         SortChunk* tmp=(SortChunk*)realloc(chunks, (chunks_n+1)*sizeof(SortChunk));
         if(!tmp){
-#ifdef _WIN32
-            chunk_close(h, file);
-#else
-            chunk_close(fd, file);
-#endif
+            chunk_cleanup(&chunk, size);
             goto fail;
         }
         chunks=tmp;
-#ifdef _WIN32
-        chunks[chunks_n].h=h;
-        wcscpy_s(chunks[chunks_n].path, MAX_LONG_PATH, file);
-#else
-        chunks[chunks_n].fd=fd;
-        strncpy(chunks[chunks_n].path, file, PATH_MAX-1);
-        chunks[chunks_n].path[PATH_MAX-1]=0;
-#endif
-        chunks[chunks_n].remaining=m;
-#ifdef _WIN32
-        chunks[chunks_n].item=(uint8_t*)VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-        if(!chunks[chunks_n].item){ chunk_close(chunks[chunks_n].h, chunks[chunks_n].path); goto fail; }
-#else
-        chunks[chunks_n].item=(uint8_t*)mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-        if(chunks[chunks_n].item==MAP_FAILED){ chunk_close(chunks[chunks_n].fd, chunks[chunks_n].path); chunks[chunks_n].item=NULL; goto fail; }
-#endif
+        chunks[chunks_n] = chunk;
         chunks[chunks_n].loaded=FALSE;
         chunks_n++;
         offset += m;
     }
 
     for(size_t i=0;i<chunks_n;i++){
+        if(chunks[i].remaining>0
 #ifdef _WIN32
-        if(chunks[i].remaining>0 && chunk_read(chunks[i].h, chunks[i].item, size)){
+           && chunk_read(chunks[i].h, chunks[i].item, size)
 #else
-        if(chunks[i].remaining>0 && chunk_read(chunks[i].fd, chunks[i].item, size)){
+           && chunk_read(chunks[i].fd, chunks[i].item, size)
 #endif
+        ){
             chunks[i].remaining--; chunks[i].loaded=TRUE;
+        } else {
+            chunk_cleanup(&chunks[i], size);
         }
     }
 
@@ -825,44 +874,26 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
         memcpy((uint8_t*)base + out_idx*size, chunks[best].item, size);
         out_idx++;
         if(chunks[best].remaining>0){
+            if(
 #ifdef _WIN32
-            if(chunk_read(chunks[best].h, chunks[best].item, size)){
+               chunk_read(chunks[best].h, chunks[best].item, size)
 #else
-            if(chunk_read(chunks[best].fd, chunks[best].item, size)){
+               chunk_read(chunks[best].fd, chunks[best].item, size)
 #endif
+            ){
                 chunks[best].remaining--; chunks[best].loaded=TRUE;
                 heap_push(heap, &heap_sz, best, chunks, cmp);
             } else {
-                chunks[best].loaded=FALSE;
-#ifdef _WIN32
-                chunk_close(chunks[best].h, chunks[best].path);
-                chunks[best].h = INVALID_HANDLE_VALUE;
-#else
-                chunk_close(chunks[best].fd, chunks[best].path);
-                chunks[best].fd = -1;
-#endif
+                chunk_cleanup(&chunks[best], size);
             }
         } else {
-            chunks[best].loaded=FALSE;
-#ifdef _WIN32
-            chunk_close(chunks[best].h, chunks[best].path);
-            chunks[best].h = INVALID_HANDLE_VALUE;
-#else
-            chunk_close(chunks[best].fd, chunks[best].path);
-            chunks[best].fd = -1;
-#endif
+            chunk_cleanup(&chunks[best], size);
         }
     }
     free(heap);
 
     for(size_t i=0;i<chunks_n;i++){
-#ifdef _WIN32
-        if(chunks[i].item) VirtualFree(chunks[i].item,0,MEM_RELEASE);
-        if(chunks[i].h!=INVALID_HANDLE_VALUE) chunk_close(chunks[i].h, chunks[i].path);
-#else
-        if(chunks[i].item) munmap(chunks[i].item, size);
-        if(chunks[i].fd>=0) chunk_close(chunks[i].fd, chunks[i].path);
-#endif
+        chunk_cleanup(&chunks[i], size);
     }
     free(chunks);
     return TRUE;
@@ -870,13 +901,7 @@ fail:
     if(heap) free(heap);
     if(chunks){
         for(size_t i=0;i<chunks_n;i++){
-#ifdef _WIN32
-            if(chunks[i].item) VirtualFree(chunks[i].item,0,MEM_RELEASE);
-            if(chunks[i].h!=INVALID_HANDLE_VALUE) chunk_close(chunks[i].h, chunks[i].path);
-#else
-            if(chunks[i].item) munmap(chunks[i].item, size);
-            if(chunks[i].fd>=0) chunk_close(chunks[i].fd, chunks[i].path);
-#endif
+            chunk_cleanup(&chunks[i], size);
         }
     }
     free(chunks);
