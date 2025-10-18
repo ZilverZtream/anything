@@ -1341,6 +1341,7 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, c
             MDB_val v;
             if(mdb_get(rtxn, d->dbi_strrev, &k, &v) == 0){
                 t->id = *(uint64_t*)v.mv_data;
+                string_cache_insert(t->utf8, t->utf8_hash, t->id);
             }
         }
     }
