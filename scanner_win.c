@@ -4,6 +4,8 @@
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <gdiplus.h>
+#include <synchapi.h>
+#include <objbase.h>
 #include "scanner.h"
 #pragma comment(lib, "gdiplus.lib")
 
@@ -64,6 +66,61 @@ void FileScanner_Free(FileScanner* s){
     free(s);
 }
 
+static INIT_ONCE g_comInitOnce = INIT_ONCE_STATIC_INIT;
+static DWORD g_comTlsIndex = TLS_OUT_OF_INDEXES;
+static CRITICAL_SECTION g_comInitLock;
+
+static BOOL CALLBACK init_com_runtime(PINIT_ONCE initOnce, PVOID parameter, PVOID* context){
+    (void)initOnce; (void)parameter; (void)context;
+    InitializeCriticalSection(&g_comInitLock);
+    g_comTlsIndex = TlsAlloc();
+    return g_comTlsIndex != TLS_OUT_OF_INDEXES;
+}
+
+static BOOL ensure_thread_com_initialized(void){
+    if(!InitOnceExecuteOnce(&g_comInitOnce, init_com_runtime, NULL, NULL)){
+        return FALSE;
+    }
+
+    if(TlsGetValue(g_comTlsIndex)){
+        return TRUE;
+    }
+
+    EnterCriticalSection(&g_comInitLock);
+
+    if(TlsGetValue(g_comTlsIndex)){
+        LeaveCriticalSection(&g_comInitLock);
+        return TRUE;
+    }
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if(hr == RPC_E_CHANGED_MODE){
+        LeaveCriticalSection(&g_comInitLock);
+        return FALSE;
+    }
+    if(FAILED(hr)){
+        LeaveCriticalSection(&g_comInitLock);
+        return FALSE;
+    }
+
+    BOOL release_on_exit = (hr == S_FALSE);
+
+    if(!TlsSetValue(g_comTlsIndex, (LPVOID)1)){
+        if(hr == S_OK || hr == S_FALSE){
+            CoUninitialize();
+        }
+        LeaveCriticalSection(&g_comInitLock);
+        return FALSE;
+    }
+
+    if(release_on_exit){
+        CoUninitialize();
+    }
+
+    LeaveCriticalSection(&g_comInitLock);
+    return TRUE;
+}
+
 static BOOL save_hbitmap_png(HBITMAP hbmp, const wchar_t* path){
     Gdiplus::GdiplusStartupInput input;
     ULONG_PTR token;
@@ -84,44 +141,32 @@ static BOOL save_hbitmap_png(HBITMAP hbmp, const wchar_t* path){
 }
 
 wchar_t* GenerateThumbnail(const wchar_t* path){
-    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    BOOL do_uninit = FALSE;
-    if(hr == RPC_E_CHANGED_MODE){
-        // COM already initialized with a different concurrency model; proceed
-        do_uninit = FALSE;
-    } else if(SUCCEEDED(hr)){
-        do_uninit = TRUE;
-    } else {
+    if(!ensure_thread_com_initialized()){
         return NULL;
     }
     IShellItemImageFactory* factory = NULL;
     if(FAILED(SHCreateItemFromParsingName(path, NULL, &IID_IShellItemImageFactory, (void**)&factory))){
-        if(do_uninit) CoUninitialize();
         return NULL;
     }
     SIZE sz = {256,256};
     HBITMAP hbmp;
-    hr = factory->lpVtbl->GetImage(factory, sz, SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT, &hbmp);
+    HRESULT hr = factory->lpVtbl->GetImage(factory, sz, SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT, &hbmp);
     factory->lpVtbl->Release(factory);
     if(FAILED(hr)){
-        if(do_uninit) CoUninitialize();
         return NULL;
     }
     wchar_t tmp[MAX_PATH];
     if(!GetTempFileNameW(L"", L"ath", 0, tmp)){
         DeleteObject(hbmp);
-        if(do_uninit) CoUninitialize();
         return NULL;
     }
     DeleteFileW(tmp);
     wcscat_s(tmp, MAX_PATH, L".png");
     if(!save_hbitmap_png(hbmp, tmp)){
         DeleteObject(hbmp);
-        if(do_uninit) CoUninitialize();
         return NULL;
     }
     DeleteObject(hbmp);
-    if(do_uninit) CoUninitialize();
     return _wcsdup(tmp);
 }
 #endif
