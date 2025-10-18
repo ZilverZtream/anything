@@ -1006,6 +1006,7 @@ static DWORD WINAPI DbWriterThread(void* p){
     if(ctx->push_timeout_ms == 0) ctx->push_timeout_ms = 50;
     if(!db_begin_write(ctx->db)) return 1;
     size_t in_batch = 0;
+    BOOL batch_requires_sync = FALSE;
     DbRecord* buf = (DbRecord*)malloc(sizeof(DbRecord) * ctx->batch_size);
     if(!buf) return 1;
     ZeroMemory(buf, sizeof(DbRecord)*ctx->batch_size);
@@ -1027,6 +1028,7 @@ static DWORD WINAPI DbWriterThread(void* p){
         if(wi->stage == INDEX_NAMES_ONLY || wi->op == WI_DELETE) push_live_update(wi);
         if(wi->op == WI_DELETE){
             db_delete_path(ctx->db, wi->parent_path, wi->name);
+            batch_requires_sync = TRUE;
             aligned_free(wi);
             continue;
         }
@@ -1052,6 +1054,7 @@ static DWORD WINAPI DbWriterThread(void* p){
             }
             aligned_free(wi);
         } else if(wi->stage == INDEX_METADATA_LIGHT){
+            batch_requires_sync = TRUE;
             DbRecord r = {0};
             r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
             r.parent_str_id = db_intern_wstring(ctx->db, wi->parent_path);
@@ -1083,6 +1086,7 @@ static DWORD WINAPI DbWriterThread(void* p){
             }
             aligned_free(wi);
         } else { // full content stage
+            batch_requires_sync = TRUE;
             DbRecord existing;
             if(db_get_record_by_path(ctx->db, wi->parent_path, wi->name, &existing)){
                 if(existing.type == DB_REC_FILE){
@@ -1120,16 +1124,17 @@ static DWORD WINAPI DbWriterThread(void* p){
         }
         if(in_batch >= (size_t)ctx->batch_size){
             if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); writer_backlog_free(ctx); return 1; }
-            if(!db_commit_write(ctx->db)) { free(buf); writer_backlog_free(ctx); return 1; }
+            if(!db_commit_write_ex(ctx->db, batch_requires_sync)) { free(buf); writer_backlog_free(ctx); return 1; }
             if(!db_begin_write(ctx->db))  { free(buf); writer_backlog_free(ctx); return 1; }
             in_batch = 0;
+            batch_requires_sync = FALSE;
         }
     }
     if(in_batch){
         if(!put_batch_with_growth(ctx, buf, in_batch)) { free(buf); writer_backlog_free(ctx); return 1; }
-        if(!db_commit_write(ctx->db)) { free(buf); writer_backlog_free(ctx); return 1; }
+        if(!db_commit_write_ex(ctx->db, batch_requires_sync)) { free(buf); writer_backlog_free(ctx); return 1; }
     } else {
-        db_commit_write(ctx->db);
+        db_commit_write_ex(ctx->db, batch_requires_sync);
     }
     free(buf);
     writer_backlog_free(ctx);
