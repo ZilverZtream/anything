@@ -109,6 +109,8 @@ typedef struct DbWorkItem {
     wchar_t* content; // optional extracted text
     wchar_t* preview; // optional preview text or thumbnail path
     uint64_t clone_id; // APFS clone identifier (0 if not clone)
+    uint64_t hash_crc;
+    BOOL     hash_ready;
 } DbWorkItem;
 
 #define WI_ADD    0
@@ -123,6 +125,8 @@ typedef struct ContentWorkItem {
     wchar_t*   initial_preview;
     uint64_t   clone_id;
     uint32_t   attributes;
+    uint64_t   precomputed_hash;
+    BOOL       hash_ready;
 } ContentWorkItem;
 
 typedef struct ContentResultItem {

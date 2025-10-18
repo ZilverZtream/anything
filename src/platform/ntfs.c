@@ -534,6 +534,8 @@ static BOOL frn_emit_resolved(USNScanner* s, const wchar_t* parent, const wchar_
     wi->creation_time = wi->modified_time = wi->access_time = 0;
     wi->attributes = attrs;
     wi->clone_id = 0;
+    wi->hash_crc = 0;
+    wi->hash_ready = FALSE;
     wi->stage = INDEX_NAMES_ONLY;
     wi->op = WI_ADD;
     while(!MPMC_Push(s->outq, wi)){
@@ -689,6 +691,8 @@ static DWORD WINAPI map_emit_worker(void* p){
         wi->creation_time = wi->modified_time = wi->access_time = 0;
         wi->attributes = e->attrs;
         wi->clone_id = 0;
+        wi->hash_crc = 0;
+        wi->hash_ready = FALSE;
         wi->stage = INDEX_NAMES_ONLY;
         wi->op = WI_ADD;
         while(!MPMC_Push(s->outq, wi)) { SwitchToThread(); }
@@ -890,6 +894,8 @@ static DWORD WINAPI tail_thread(void* p){
                         wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
                         wi->attributes = 0;
                         wi->clone_id = 0;
+                        wi->hash_crc = 0;
+                        wi->hash_ready = FALSE;
                         wi->stage = INDEX_NAMES_ONLY;
                         wi->op = WI_DELETE;
                         while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }
@@ -918,6 +924,16 @@ static DWORD WINAPI tail_thread(void* p){
                         wi->attributes = attrs?attrs: r->FileAttributes;
                         wi->file_size = sz; wi->creation_time=ct; wi->modified_time=mt; wi->access_time=at;
                         wi->clone_id = 0;
+                        wi->hash_crc = 0;
+                        wi->hash_ready = FALSE;
+                        if(!(wi->attributes & FILE_ATTRIBUTE_DIRECTORY)){
+                            BOOL hash_ok = FALSE;
+                            uint64_t hash = crc64_file(fn, t->cancel, NULL, NULL, &hash_ok);
+                            if(hash_ok){
+                                wi->hash_crc = hash;
+                                wi->hash_ready = TRUE;
+                            }
+                        }
                         wi->stage = INDEX_METADATA_LIGHT;
                         wi->op = WI_ADD;
                         while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }

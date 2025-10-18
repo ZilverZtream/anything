@@ -244,6 +244,8 @@ static void scan(void){
         wi->access_time   = ((ULARGE_INTEGER){fd.ftLastAccessTime.dwLowDateTime, fd.ftLastAccessTime.dwHighDateTime}).QuadPart;
         wi->attributes = fd.dwFileAttributes;
         wi->clone_id = 0;
+        wi->hash_crc = 0;
+        wi->hash_ready = FALSE;
         wi->stage = INDEX_FULL_CONTENT;
         wi->op = WI_ADD;
         int tries = 0;
@@ -295,6 +297,8 @@ static void scan(void){
         wi->access_time   = to_filetime(st.st_atime);
         wi->attributes = 0;
         wi->clone_id = 0;
+        wi->hash_crc = 0;
+        wi->hash_ready = FALSE;
         wi->stage = INDEX_FULL_CONTENT;
         wi->op = WI_ADD;
         int tries = 0;

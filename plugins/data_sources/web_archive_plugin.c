@@ -208,6 +208,7 @@ static void push_page(const char* url,const char* title,const char* text){
     wcscpy_s(wi->parent_path,MAX_LONG_PATH,wurl); wcscpy_s(wi->name,MAX_PATH,wtitle);
     wi->file_size=0; wi->creation_time=0; wi->modified_time=0; wi->access_time=0; wi->attributes=0;
     wi->stage=INDEX_FULL_CONTENT; wi->op=WI_ADD; wi->preview=NULL; wi->clone_id=0;
+    wi->hash_crc=0; wi->hash_ready=FALSE;
     wchar_t* wcontent=NULL;
     if(text){ size_t wlen=mbstowcs(NULL,text,0); if(wlen!=(size_t)-1){ wcontent=(wchar_t*)malloc((wlen+1)*sizeof(wchar_t)); if(wcontent) mbstowcs(wcontent,text,wlen+1); } }
     wi->content=wcontent;

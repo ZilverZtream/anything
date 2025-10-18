@@ -277,7 +277,12 @@ enum {
     CRC64_READ_TIMEOUT_MS = 100
 };
 
-uint64_t crc64_file(const wchar_t* path, const struct CancelToken* cancel_token, crc64_progress_fn progress_cb, void* progress_ctx){
+uint64_t crc64_file(const wchar_t* path,
+                    const struct CancelToken* cancel_token,
+                    crc64_progress_fn progress_cb,
+                    void* progress_ctx,
+                    BOOL* out_success){
+    if(out_success) *out_success = FALSE;
     if(!path || is_cancelled(cancel_token)) return 0;
 
     wchar_t lp[MAX_LONG_PATH];
@@ -405,6 +410,7 @@ uint64_t crc64_file(const wchar_t* path, const struct CancelToken* cancel_token,
     if(cancelled || failed){
         return 0;
     }
+    if(out_success) *out_success = TRUE;
     return crc;
 }
 

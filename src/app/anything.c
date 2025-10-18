@@ -1080,6 +1080,8 @@ static ContentWorkItem* content_work_item_from_dbwork(DbWorkItem* wi, const DbRe
     wi->preview = NULL;
     cwi->clone_id = wi->clone_id;
     cwi->attributes = wi->attributes;
+    cwi->precomputed_hash = wi->hash_crc;
+    cwi->hash_ready = wi->hash_ready;
     return cwi;
 }
 
@@ -1153,9 +1155,18 @@ static ContentResultItem* content_process_item(ContentWorkItem* wi, CancelToken*
 
     result->needs_archive_index = is_archive_file(wi->name);
 
-    if(!is_cancelled(cancel)){
-        result->hash_crc = crc64_file(full, cancel, NULL, NULL);
+    if(wi->hash_ready){
+        result->hash_crc = wi->precomputed_hash;
         result->has_hash = TRUE;
+    } else if(!is_cancelled(cancel)){
+        BOOL hash_ok = FALSE;
+        uint64_t hash = crc64_file(full, cancel, NULL, NULL, &hash_ok);
+        if(hash_ok){
+            result->hash_crc = hash;
+            result->has_hash = TRUE;
+        } else if(is_cancelled(cancel)){
+            result->success = FALSE;
+        }
     } else {
         result->success = FALSE;
     }
@@ -2049,6 +2060,8 @@ static DWORD WINAPI DbWriterThread(void* p){
                 next->file_size = next->creation_time = next->modified_time = next->access_time = 0;
                 next->attributes = wi->attributes;
                 next->clone_id = 0;
+                next->hash_crc = wi->hash_crc;
+                next->hash_ready = wi->hash_ready;
                 next->stage = INDEX_METADATA_LIGHT; next->op = WI_ADD;
                 if(!writer_enqueue(ctx, next, "metadata-light")){
                     aligned_free(next);
@@ -2093,6 +2106,8 @@ static DWORD WINAPI DbWriterThread(void* p){
                     next->file_size = sz; next->creation_time=ct; next->modified_time=mt; next->access_time=at;
                     next->attributes = attrs;
                     next->clone_id = 0;
+                    next->hash_crc = wi->hash_crc;
+                    next->hash_ready = wi->hash_ready;
                     next->stage = INDEX_FULL_CONTENT; next->op = WI_ADD;
                     if(!writer_enqueue(ctx, next, "full-content")){
                         aligned_free(next);
@@ -2134,6 +2149,8 @@ static DWORD WINAPI DbWriterThread(void* p){
                     stack_item.initial_preview = wi->preview;
                     stack_item.clone_id = wi->clone_id;
                     stack_item.attributes = wi->attributes;
+                    stack_item.precomputed_hash = wi->hash_crc;
+                    stack_item.hash_ready = wi->hash_ready;
                     wi->content = NULL;
                     wi->preview = NULL;
                     ContentResultItem* immediate = content_process_item(&stack_item, &ctx->cancel);

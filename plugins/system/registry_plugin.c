@@ -30,6 +30,8 @@ static void push_item(const wchar_t* parent, const wchar_t* name, const wchar_t*
     wi->attributes = 0;
     wi->stage = content ? INDEX_FULL_CONTENT : INDEX_NAMES_ONLY;
     wi->op = WI_ADD;
+    wi->hash_crc = 0;
+    wi->hash_ready = FALSE;
     if(content){
         size_t len = wcslen(content) + 1;
         wi->content = (wchar_t*)malloc(sizeof(wchar_t) * len);

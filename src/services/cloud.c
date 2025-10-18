@@ -281,6 +281,8 @@ static void enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_u
     wi->access_time = mtime;
     wi->attributes = is_dir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
     wi->clone_id = 0;
+    wi->hash_crc = 0;
+    wi->hash_ready = FALSE;
     wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
 #ifdef _WIN32

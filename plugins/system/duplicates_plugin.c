@@ -99,8 +99,11 @@ static void scan_dir(const wchar_t* dir){
             fe.ctime = ((ULARGE_INTEGER){fd.ftCreationTime.dwLowDateTime, fd.ftCreationTime.dwHighDateTime}).QuadPart;
             fe.mtime = ((ULARGE_INTEGER){fd.ftLastWriteTime.dwLowDateTime, fd.ftLastWriteTime.dwHighDateTime}).QuadPart;
             fe.atime = ((ULARGE_INTEGER){fd.ftLastAccessTime.dwLowDateTime, fd.ftLastAccessTime.dwHighDateTime}).QuadPart;
-            fe.hash  = crc64_file(full, g_host.cancel_token, NULL, NULL);
-            add_file(&fe);
+            BOOL hash_ok = FALSE;
+            fe.hash  = crc64_file(full, g_host.cancel_token, NULL, NULL, &hash_ok);
+            if(hash_ok){
+                add_file(&fe);
+            }
         }
     }while(FindNextFileW(h,&fd));
     FindClose(h);
@@ -139,8 +142,11 @@ static void scan_dir(const wchar_t* dir){
             fe.ctime = to_filetime(st.st_ctime);
             fe.mtime = to_filetime(st.st_mtime);
             fe.atime = to_filetime(st.st_atime);
-            fe.hash  = crc64_file(full, g_host.cancel_token, NULL, NULL);
-            add_file(&fe);
+            BOOL hash_ok = FALSE;
+            fe.hash  = crc64_file(full, g_host.cancel_token, NULL, NULL, &hash_ok);
+            if(hash_ok){
+                add_file(&fe);
+            }
         }
     }
     closedir(d);
@@ -187,6 +193,8 @@ static void emit_duplicates(void){
                 wi->op            = WI_ADD;
                 wi->content = NULL;
                 wi->preview = NULL;
+                wi->hash_crc      = g_files[k].hash;
+                wi->hash_ready    = TRUE;
                 while(!MPMC_Push(g_host.queue, wi)){
                     if(is_cancelled(g_host.cancel_token)){
                         aligned_free(wi);
