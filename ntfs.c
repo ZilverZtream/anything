@@ -68,6 +68,9 @@ typedef struct NameArena {
     size_t used;
     size_t cap;
     struct NameArena* next;
+    HANDLE file;
+    HANDLE mapping;
+    BOOL is_mmap;
 } NameArena;
 
 typedef struct FrnEntry {
@@ -82,7 +85,17 @@ typedef struct FrnMap {
     size_t cap;
     size_t count;
     NameArena* arena;
+    size_t arena_total_bytes;
+    size_t arena_limit_bytes;
+    size_t mmap_total_bytes;
+    size_t mmap_limit_bytes;
+    BOOL streaming;
 } FrnMap;
+
+#define FRNMAP_STREAMING_SENTINEL ((FrnEntry*)(intptr_t)(-1))
+#define FRN_ARENA_DEFAULT_CHUNK 4096
+#define FRN_ARENA_HEAP_LIMIT_BYTES (size_t)(256ULL*1024ULL*1024ULL)
+#define FRN_ARENA_MMAP_LIMIT_BYTES (size_t)(4ULL*1024ULL*1024ULL*1024ULL)
 
 static uint64_t frn_hash(uint64_t x){
     x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
@@ -93,13 +106,24 @@ static void frnmap_init(FrnMap* m, size_t cap){
     m->slots = (FrnEntry*)calloc(m->cap, sizeof(FrnEntry));
     m->count = 0;
     m->arena = NULL;
+    m->arena_total_bytes = 0;
+    m->arena_limit_bytes = FRN_ARENA_HEAP_LIMIT_BYTES;
+    m->mmap_total_bytes = 0;
+    m->mmap_limit_bytes = FRN_ARENA_MMAP_LIMIT_BYTES;
+    m->streaming = FALSE;
 }
 static void frnmap_free(FrnMap* m){
     if(m->slots) free(m->slots);
     NameArena* a = m->arena;
     while(a){
         NameArena* next = a->next;
-        free(a->base);
+        if(a->is_mmap){
+            if(a->base) UnmapViewOfFile(a->base);
+            if(a->mapping) CloseHandle(a->mapping);
+            if(a->file && a->file!=INVALID_HANDLE_VALUE) CloseHandle(a->file);
+        } else {
+            free(a->base);
+        }
         free(a);
         a = next;
     }
@@ -107,6 +131,11 @@ static void frnmap_free(FrnMap* m){
     m->cap = 0;
     m->count = 0;
     m->arena = NULL;
+    m->arena_total_bytes = 0;
+    m->mmap_total_bytes = 0;
+    m->arena_limit_bytes = FRN_ARENA_HEAP_LIMIT_BYTES;
+    m->mmap_limit_bytes = FRN_ARENA_MMAP_LIMIT_BYTES;
+    m->streaming = FALSE;
 }
 static void frnmap_rehash_into(FrnMap* dst, const FrnMap* src){
     for(size_t i=0;i<src->cap;i++){
@@ -117,20 +146,110 @@ static void frnmap_rehash_into(FrnMap* dst, const FrnMap* src){
         dst->slots[j] = e;
     }
 }
-static wchar_t* arena_alloc(NameArena** arena, size_t n){
-    if(!*arena || (*arena)->used + n > (*arena)->cap){
-        size_t cap = n > 4096 ? n : 4096;
-        NameArena* a = (NameArena*)malloc(sizeof(NameArena));
-        if(!a) return NULL;
-        a->base = (wchar_t*)malloc(cap * sizeof(wchar_t));
-        if(!a->base){ free(a); return NULL; }
-        a->used = 0;
-        a->cap = cap;
-        a->next = *arena;
-        *arena = a;
+static BOOL frnmap_create_mmap_arena(FrnMap* m, size_t cap, NameArena** out){
+    if(m->mmap_total_bytes + cap * sizeof(wchar_t) > m->mmap_limit_bytes){
+        m->streaming = TRUE;
+        return FALSE;
     }
-    wchar_t* ret = (*arena)->base + (*arena)->used;
-    (*arena)->used += n;
+    wchar_t tempPath[MAX_PATH];
+    wchar_t tempFile[MAX_PATH];
+    if(!GetTempPathW(MAX_PATH, tempPath)){
+        return FALSE;
+    }
+    if(!GetTempFileNameW(tempPath, L"afr", 0, tempFile)){
+        return FALSE;
+    }
+    HANDLE file = CreateFileW(tempFile, GENERIC_READ|GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if(file==INVALID_HANDLE_VALUE){
+        return FALSE;
+    }
+    ULONGLONG bytes = (ULONGLONG)cap * sizeof(wchar_t);
+    LARGE_INTEGER size;
+    size.QuadPart = (LONGLONG)bytes;
+    if(!SetFilePointerEx(file, size, NULL, FILE_BEGIN) || !SetEndOfFile(file)){
+        CloseHandle(file);
+        return FALSE;
+    }
+    DWORD sizeHigh = (DWORD)(bytes >> 32);
+    DWORD sizeLow = (DWORD)(bytes & 0xFFFFFFFFUL);
+    HANDLE mapping = CreateFileMappingW(file, NULL, PAGE_READWRITE, sizeHigh, sizeLow, NULL);
+    if(!mapping){
+        CloseHandle(file);
+        return FALSE;
+    }
+    wchar_t* base = (wchar_t*)MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)(cap * sizeof(wchar_t)));
+    if(!base){
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return FALSE;
+    }
+    NameArena* arena = (NameArena*)calloc(1, sizeof(NameArena));
+    if(!arena){
+        UnmapViewOfFile(base);
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return FALSE;
+    }
+    arena->base = base;
+    arena->used = 0;
+    arena->cap = cap;
+    arena->next = NULL;
+    arena->file = file;
+    arena->mapping = mapping;
+    arena->is_mmap = TRUE;
+    *out = arena;
+    m->mmap_total_bytes += cap * sizeof(wchar_t);
+    return TRUE;
+}
+
+static NameArena* frnmap_push_arena(FrnMap* m, size_t n){
+    size_t cap = n > FRN_ARENA_DEFAULT_CHUNK ? n : FRN_ARENA_DEFAULT_CHUNK;
+    NameArena* arena = NULL;
+    BOOL use_mmap = (m->arena_total_bytes + cap * sizeof(wchar_t) > m->arena_limit_bytes);
+    if(use_mmap){
+        if(!frnmap_create_mmap_arena(m, cap, &arena)){
+            return NULL;
+        }
+    } else {
+        arena = (NameArena*)calloc(1, sizeof(NameArena));
+        if(!arena) return NULL;
+        arena->base = (wchar_t*)malloc(cap * sizeof(wchar_t));
+        if(!arena->base){
+            free(arena);
+            return NULL;
+        }
+        arena->used = 0;
+        arena->cap = cap;
+        arena->file = NULL;
+        arena->mapping = NULL;
+        arena->is_mmap = FALSE;
+        m->arena_total_bytes += cap * sizeof(wchar_t);
+    }
+    arena->next = m->arena;
+    m->arena = arena;
+    return arena;
+}
+
+static wchar_t* frnmap_alloc_name(FrnMap* m, size_t n){
+    if(m->streaming){
+        return NULL;
+    }
+    NameArena* current = m->arena;
+    if(!current || current->used + n > current->cap){
+        current = frnmap_push_arena(m, n);
+        if(!current){
+            if(m->streaming){
+                return NULL;
+            }
+            return NULL;
+        }
+    }
+    if(current->used + n > current->cap){
+        return NULL;
+    }
+    wchar_t* ret = current->base + current->used;
+    current->used += n;
     return ret;
 }
 
@@ -147,14 +266,34 @@ static BOOL frnmap_resize(FrnMap* m){
     return TRUE;
 }
 static FrnEntry* frnmap_put(FrnMap* m, uint64_t frn, uint64_t parent, const wchar_t* name, uint32_t attrs){
-    if(m->count*2 >= m->cap){ if(!frnmap_resize(m)) { frnmap_free(m); return NULL; } }
+    if(m->streaming){
+        return FRNMAP_STREAMING_SENTINEL;
+    }
+    if(m->count*2 >= m->cap){
+        if(!frnmap_resize(m)){
+            return NULL;
+        }
+    }
     size_t i = (size_t)(frn_hash(frn) & (m->cap-1));
     while(m->slots[i].frn && m->slots[i].frn != frn){ i=(i+1)&(m->cap-1); }
-    if(!m->slots[i].frn){ m->count++; }
-    m->slots[i].frn = frn; m->slots[i].parent = parent; m->slots[i].attrs=attrs;
+    BOOL is_new = !m->slots[i].frn;
     size_t n = wcslen(name)+1;
-    wchar_t* dst = arena_alloc(&m->arena, n);
-    if(!dst){ frnmap_free(m); return NULL; }
+    wchar_t* dst = frnmap_alloc_name(m, n);
+    if(!dst){
+        if(is_new){
+            m->slots[i].frn = 0;
+        }
+        if(m->streaming){
+            return FRNMAP_STREAMING_SENTINEL;
+        }
+        return NULL;
+    }
+    if(is_new){
+        m->count++;
+    }
+    m->slots[i].frn = frn;
+    m->slots[i].parent = parent;
+    m->slots[i].attrs = attrs;
     memcpy(dst, name, n*sizeof(wchar_t));
     m->slots[i].name = dst;
     return &m->slots[i];
@@ -179,6 +318,7 @@ typedef struct USNScanner {
     volatile LONG next_idx;
     int max_threads;
     HANDLE thread;
+    BOOL streaming_mode;
 } USNScanner;
 
 static BOOL volume_from_root(const wchar_t* root, wchar_t* volprefix, size_t cch){
@@ -226,6 +366,74 @@ static BOOL frn_build_path(FrnMap* fm, uint64_t frn, wchar_t* full, size_t cch){
     // Strip the last segment into parent and name: caller does this separately; here we return full path root + temp
     wcscpy_s(full, cch, L"");
     return wcscpy_s(full, cch, temp)==0;
+}
+
+static BOOL frn_resolve_parent_path(USNScanner* s, uint64_t parent_frn, wchar_t* parent, size_t cch){
+    if(parent_frn == 0){
+        return swprintf(parent, cch, L"%c:\\", s->volRoot[0])>0;
+    }
+    FrnEntry* e = frnmap_get(&s->map, parent_frn);
+    if(e){
+        wchar_t rel[MAX_LONG_PATH];
+        if(!frn_build_path(&s->map, parent_frn, rel, MAX_LONG_PATH)){
+            return FALSE;
+        }
+        return swprintf(parent, cch, L"%c:%s", s->volRoot[0], rel)>0;
+    }
+    FILE_ID_DESCRIPTOR pfid = {0};
+    pfid.dwSize = sizeof(pfid);
+    pfid.Type = FileIdType;
+    pfid.FileId.QuadPart = parent_frn;
+    HANDLE hPar = OpenFileById(s->hVol, &pfid, FILE_READ_ATTRIBUTES,
+                               FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, 0);
+    if(hPar == INVALID_HANDLE_VALUE){
+        return FALSE;
+    }
+    BOOL ok = FALSE;
+    wchar_t parent_full[MAX_LONG_PATH];
+    DWORD got = GetFinalPathNameByHandleW(hPar, parent_full, MAX_LONG_PATH, FILE_NAME_NORMALIZED);
+    CloseHandle(hPar);
+    if(got>0 && got<MAX_LONG_PATH){
+        if(wcsncmp(parent_full, L"\\?\", 4)==0){
+            memmove(parent_full, parent_full+4, (wcslen(parent_full)-3)*sizeof(wchar_t));
+        }
+        ok = wcscpy_s(parent, cch, parent_full)==0;
+    }
+    return ok;
+}
+
+static BOOL frn_emit_direct(USNScanner* s, const USN_RECORD_V2* r){
+    if(is_cancelled(s->cancel)){
+        return FALSE;
+    }
+    wchar_t parent[MAX_LONG_PATH];
+    if(!frn_resolve_parent_path(s, r->ParentFileReferenceNumber, parent, MAX_LONG_PATH)){
+        return FALSE;
+    }
+    wchar_t name[MAX_PATH];
+    wcsncpy_s(name, MAX_PATH, (const wchar_t*)((BYTE*)r + r->FileNameOffset), r->FileNameLength/2);
+    DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
+    if(!wi){
+        return FALSE;
+    }
+    wi->content = NULL;
+    wi->preview = NULL;
+    wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
+    wcscpy_s(wi->name, MAX_PATH, name);
+    wi->file_size = 0;
+    wi->creation_time = wi->modified_time = wi->access_time = 0;
+    wi->attributes = r->FileAttributes;
+    wi->clone_id = 0;
+    wi->stage = INDEX_NAMES_ONLY;
+    wi->op = WI_ADD;
+    while(!MPMC_Push(s->outq, wi)){
+        if(is_cancelled(s->cancel)){
+            aligned_free(wi);
+            return FALSE;
+        }
+        SwitchToThread();
+    }
+    return TRUE;
 }
 
 static DWORD WINAPI map_emit_worker(void* p){
@@ -286,20 +494,31 @@ static DWORD WINAPI usn_thread(void* p){
             if(r->RecordLength < sizeof(USN_RECORD_V2)) break;
             wchar_t name[MAX_PATH];
             wcsncpy_s(name, MAX_PATH, (const wchar_t*)((BYTE*)r + r->FileNameOffset), r->FileNameLength/2);
-            if(!frnmap_put(&s->map, r->FileReferenceNumber, r->ParentFileReferenceNumber, name, r->FileAttributes)){
-                VirtualFree(buf,0,MEM_RELEASE);
-                return 1;
+            if(s->streaming_mode || s->map.streaming){
+                s->streaming_mode = TRUE;
+                frn_emit_direct(s, r);
+            } else {
+                FrnEntry* fe = frnmap_put(&s->map, r->FileReferenceNumber, r->ParentFileReferenceNumber, name, r->FileAttributes);
+                if(fe == FRNMAP_STREAMING_SENTINEL){
+                    s->streaming_mode = TRUE;
+                    frn_emit_direct(s, r);
+                } else if(!fe){
+                    VirtualFree(buf,0,MEM_RELEASE);
+                    return 1;
+                }
             }
             pRec += r->RecordLength;
         }
         med.StartFileReferenceNumber = *(USN*)buf;
     }
     // Second pass: emit work items using adaptive thread pool
-    s->next_idx = -1;
-    s->pool.work_queue_size = (LONG)s->map.cap;
-    pool_init(&s->pool, 1, s->max_threads, map_emit_worker, s);
-    WaitForMultipleObjects(s->pool.current_threads, s->pool.threads, TRUE, INFINITE);
-    pool_destroy(&s->pool);
+    if(s->map.cap && s->map.slots){
+        s->next_idx = -1;
+        s->pool.work_queue_size = (LONG)s->map.cap;
+        pool_init(&s->pool, 1, s->max_threads, map_emit_worker, s);
+        WaitForMultipleObjects(s->pool.current_threads, s->pool.threads, TRUE, INFINITE);
+        pool_destroy(&s->pool);
+    }
     VirtualFree(buf,0,MEM_RELEASE);
     return 0;
 }
