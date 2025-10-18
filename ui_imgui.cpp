@@ -1090,42 +1090,46 @@ int run_ui(void){
                             sort_specs->SpecsDirty = false;
                             need_sort = false;
                         }
-                        for (size_t i = 0; i < filtered.size(); ++i) {
-                            Result& r = filtered[i];
-                            ImGui::TableNextRow();
-                            ImGui::TableSetColumnIndex(1);
-                            ImGui::PushID((int)i);
-                            bool is_selected = (selected == (int)i);
-                            if (ImGui::Selectable(r.filename.c_str(), is_selected, ImGuiSelectableFlags_SpanAllColumns)) {
-                                selected = (int)i;
+                        ImGuiListClipper clipper;
+                        clipper.Begin(static_cast<int>(filtered.size()));
+                        while (clipper.Step()) {
+                            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                                Result& r = filtered[static_cast<size_t>(row)];
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::PushID(row);
+                                bool is_selected = (selected == row);
+                                if (ImGui::Selectable(r.filename.c_str(), is_selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                                    selected = row;
+                                }
+                                bool hovered = ImGui::IsItemHovered();
+                                if ((hovered || is_selected) && r.texture == 0 && (r.type == "image" || !r.preview_path.empty())) {
+                                    load_result_texture(r);
+                                }
+                                if (ImGui::BeginPopupContextItem()) {
+                                    std::string full = r.path + "\\" + r.filename;
+                                    if (ImGui::MenuItem("Open")) open_file_os(full);
+                                    if (ImGui::MenuItem("Open Folder")) open_folder_os(r.path);
+                                    if (ImGui::MenuItem("Copy Path")) ImGui::SetClipboardText(full.c_str());
+                                    if (ImGui::MenuItem("Delete")) { delete_path_os(full); need_update = true; }
+                                    ImGui::EndPopup();
+                                }
+                                ImGui::TableSetColumnIndex(0);
+                                if ((r.type == "image" || !r.preview_path.empty()) && r.texture != 0) {
+                                    ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(48, 48));
+                                }
+                                ImGui::TableSetColumnIndex(2);
+                                ImGui::TextUnformatted(r.path.c_str());
+                                ImGui::TableSetColumnIndex(3);
+                                ImGui::Text("%lld", (long long)r.size);
+                                ImGui::TableSetColumnIndex(4);
+                                char dstr[64];
+                                std::strftime(dstr, sizeof(dstr), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
+                                ImGui::Text("%s", dstr);
+                                ImGui::TableSetColumnIndex(5);
+                                ImGui::Text("%.1f", r.score);
+                                ImGui::PopID();
                             }
-                            bool hovered = ImGui::IsItemHovered();
-                            if ((hovered || is_selected) && r.texture == 0 && (r.type == "image" || !r.preview_path.empty())) {
-                                load_result_texture(r);
-                            }
-                            if (ImGui::BeginPopupContextItem()) {
-                                std::string full = r.path + "\\" + r.filename;
-                                if (ImGui::MenuItem("Open")) open_file_os(full);
-                                if (ImGui::MenuItem("Open Folder")) open_folder_os(r.path);
-                                if (ImGui::MenuItem("Copy Path")) ImGui::SetClipboardText(full.c_str());
-                                if (ImGui::MenuItem("Delete")) { delete_path_os(full); need_update = true; }
-                                ImGui::EndPopup();
-                            }
-                            ImGui::TableSetColumnIndex(0);
-                            if ((r.type == "image" || !r.preview_path.empty()) && r.texture != 0) {
-                                ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(48, 48));
-                            }
-                            ImGui::TableSetColumnIndex(2);
-                            ImGui::TextUnformatted(r.path.c_str());
-                            ImGui::TableSetColumnIndex(3);
-                            ImGui::Text("%lld", (long long)r.size);
-                            ImGui::TableSetColumnIndex(4);
-                            char dstr[64];
-                            std::strftime(dstr, sizeof(dstr), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
-                            ImGui::Text("%s", dstr);
-                            ImGui::TableSetColumnIndex(5);
-                            ImGui::Text("%.1f", r.score);
-                            ImGui::PopID();
                         }
                         ImGui::EndTable();
                     }
