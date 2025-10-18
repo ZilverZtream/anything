@@ -31,6 +31,7 @@
 #include <cctype>
 #include <ctime>
 #include <cmath>
+#include <limits>
 #include <limits.h>
 #include <inttypes.h>
 #include <ctype.h>
@@ -285,6 +286,109 @@ static void render_markdown(const std::string& text) {
 
 enum ResultColumn { COL_NAME, COL_PATH, COL_SIZE, COL_MOD, COL_SCORE };
 
+struct TieredResults {
+    std::vector<Result> hot_window;
+    std::vector<Result> cold_storage;
+    std::vector<Result*> view_cache;
+    size_t hot_limit = 1000;
+    float min_hot_score = -std::numeric_limits<float>::infinity();
+    int last_sort_column = COL_SCORE;
+    ImGuiSortDirection last_sort_dir = ImGuiSortDirection_Descending;
+    bool view_dirty = true;
+
+    void clear() {
+        release_bucket(hot_window);
+        release_bucket(cold_storage);
+        hot_window.clear();
+        cold_storage.clear();
+        view_cache.clear();
+        min_hot_score = -std::numeric_limits<float>::infinity();
+        view_dirty = true;
+    }
+
+    void insert(Result&& r) {
+        if (hot_window.size() < hot_limit || r.score > min_hot_score) {
+            auto it = std::lower_bound(hot_window.begin(), hot_window.end(), r.score,
+                [](const Result& existing, float score) { return existing.score > score; });
+            hot_window.insert(it, std::move(r));
+            if (hot_window.size() > hot_limit) {
+                Result demoted = std::move(hot_window.back());
+                hot_window.pop_back();
+                release_texture(demoted);
+                cold_storage.push_back(std::move(demoted));
+            }
+            update_min_score();
+            view_dirty = true;
+        } else {
+            cold_storage.push_back(std::move(r));
+        }
+    }
+
+    size_t size() const { return hot_window.size(); }
+
+    const std::vector<Result*>& view(const ImGuiTableSortSpecs* specs, bool force_rebuild) {
+        int desired_col = COL_SCORE;
+        ImGuiSortDirection desired_dir = ImGuiSortDirection_Descending;
+        if (specs && specs->SpecsCount > 0) {
+            desired_col = specs->Specs[0].ColumnUserID;
+            desired_dir = specs->Specs[0].SortDirection;
+            if (desired_dir == ImGuiSortDirection_None) {
+                desired_dir = ImGuiSortDirection_Ascending;
+            }
+        }
+        if (force_rebuild || view_dirty || desired_col != last_sort_column || desired_dir != last_sort_dir) {
+            view_cache.clear();
+            view_cache.reserve(hot_window.size());
+            for (Result& r : hot_window) {
+                view_cache.push_back(&r);
+            }
+            if (desired_col == COL_SCORE) {
+                if (desired_dir == ImGuiSortDirection_Ascending) {
+                    std::reverse(view_cache.begin(), view_cache.end());
+                }
+            } else {
+                auto cmp = [desired_col, desired_dir](const Result* a, const Result* b) {
+                    bool asc = (desired_dir == ImGuiSortDirection_Ascending);
+                    switch (desired_col) {
+                        case COL_NAME: return asc ? a->filename < b->filename : a->filename > b->filename;
+                        case COL_PATH: return asc ? a->path < b->path : a->path > b->path;
+                        case COL_SIZE: return asc ? a->size < b->size : a->size > b->size;
+                        case COL_MOD:  return asc ? a->modified < b->modified : a->modified > b->modified;
+                        case COL_SCORE: default: return asc ? a->score < b->score : a->score > b->score;
+                    }
+                };
+                std::stable_sort(view_cache.begin(), view_cache.end(), cmp);
+            }
+            last_sort_column = desired_col;
+            last_sort_dir = desired_dir;
+            view_dirty = false;
+        }
+        return view_cache;
+    }
+
+private:
+    void release_texture(Result& r) {
+        if (r.texture != 0) {
+            glDeleteTextures(1, &r.texture);
+            r.texture = 0;
+        }
+    }
+
+    void release_bucket(std::vector<Result>& bucket) {
+        for (Result& r : bucket) {
+            release_texture(r);
+        }
+    }
+
+    void update_min_score() {
+        if (hot_window.empty() || hot_window.size() < hot_limit) {
+            min_hot_score = -std::numeric_limits<float>::infinity();
+        } else {
+            min_hot_score = hot_window.back().score;
+        }
+    }
+};
+
 static void open_file_os(const std::string& p){
 #ifdef _WIN32
     ShellExecuteA(NULL, "open", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
@@ -352,23 +456,6 @@ static void load_result_texture(Result& r) {
     glTexImage2D(GL_TEXTURE_2D, 0, fmt, r.width, r.height, 0, fmt, GL_UNSIGNED_BYTE, data);
     glBindTexture(GL_TEXTURE_2D, 0);
     stbi_image_free(data);
-}
-
-static void apply_sort(std::vector<Result>& items, const ImGuiTableSortSpecs* specs){
-    if(!specs || specs->SpecsCount==0) return;
-    const ImGuiTableColumnSortSpecs& spec = specs->Specs[0];
-    int col = spec.ColumnUserID;
-    bool asc = spec.SortDirection == ImGuiSortDirection_Ascending;
-    auto cmp = [col,asc](const Result& a, const Result& b){
-        switch(col){
-        case COL_NAME: return asc ? a.filename < b.filename : a.filename > b.filename;
-        case COL_PATH: return asc ? a.path < b.path : a.path > b.path;
-        case COL_SIZE: return asc ? a.size < b.size : a.size > b.size;
-        case COL_MOD:  return asc ? a.modified < b.modified : a.modified > b.modified;
-        case COL_SCORE: default: return asc ? a.score < b.score : a.score > b.score;
-        }
-    };
-    std::stable_sort(items.begin(), items.end(), cmp);
 }
 
 struct IdVec {
@@ -996,7 +1083,7 @@ int run_ui(void){
         if(argv) LocalFree(argv);
     }
 #endif
-    std::vector<Result> filtered;
+    TieredResults filtered;
     int selected = -1;
     bool show_advanced = false;
     Filters filters;
@@ -1052,12 +1139,6 @@ int run_ui(void){
     live_updates_init();
 
     auto clear_filtered_results = [&]() {
-        for (auto& r : filtered) {
-            if (r.texture != 0) {
-                glDeleteTextures(1, &r.texture);
-                r.texture = 0;
-            }
-        }
         filtered.clear();
         selected = -1;
     };
@@ -1093,7 +1174,7 @@ int run_ui(void){
             if (pr->done) {
                 search_done = true;
             } else {
-                filtered.push_back(std::move(pr->result));
+                filtered.insert(std::move(pr->result));
                 need_sort = true;
             }
             processed++;
@@ -1134,6 +1215,8 @@ int run_ui(void){
                     ImGui::BeginChild("ResultsList", ImVec2(0, 0), false, ImGuiWindowFlags_None);
                     results_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
                     ImGuiTableFlags tflags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_NoSavedSettings;
+                    const std::vector<Result*>* current_view = nullptr;
+                    size_t current_view_size = filtered.size();
                     if (ImGui::BeginTable("ResultsTable", 6, tflags)) {
                         ImGui::TableSetupScrollFreeze(0,1);
                         ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthFixed, 60.0f);
@@ -1144,16 +1227,19 @@ int run_ui(void){
                         ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_SCORE);
                         ImGui::TableHeadersRow();
                         ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
-                        if (sort_specs && (sort_specs->SpecsDirty || need_sort)) {
-                            apply_sort(filtered, sort_specs);
+                        bool force_rebuild = need_sort || (sort_specs && sort_specs->SpecsDirty);
+                        const std::vector<Result*>& visible = filtered.view(sort_specs, force_rebuild);
+                        current_view = &visible;
+                        current_view_size = visible.size();
+                        if (sort_specs) {
                             sort_specs->SpecsDirty = false;
-                            need_sort = false;
                         }
+                        need_sort = false;
                         ImGuiListClipper clipper;
-                        clipper.Begin(static_cast<int>(filtered.size()));
+                        clipper.Begin(static_cast<int>(visible.size()));
                         while (clipper.Step()) {
                             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
-                                Result& r = filtered[static_cast<size_t>(row)];
+                                Result& r = *visible[static_cast<size_t>(row)];
                                 ImGui::TableNextRow();
                                 ImGui::TableSetColumnIndex(1);
                                 ImGui::PushID(row);
@@ -1194,12 +1280,19 @@ int run_ui(void){
                     }
                     ImGui::EndChild();
 
+                    if (!current_view) {
+                        const std::vector<Result*>& fallback = filtered.view(nullptr, false);
+                        current_view = &fallback;
+                        current_view_size = fallback.size();
+                    }
+
                     if (results_focused) {
                         ImGuiIO& io = ImGui::GetIO();
                         if (ImGui::IsKeyPressed(ImGuiKey_UpArrow) && selected > 0) selected--;
-                        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && selected + 1 < (int)filtered.size()) selected++;
-                        if (selected >= 0 && selected < (int)filtered.size()) {
-                            const Result& r = filtered[selected];
+                        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && selected + 1 < (int)current_view_size) selected++;
+                        if (selected >= (int)current_view_size) selected = (int)current_view_size - 1;
+                        if (selected >= 0 && selected < (int)current_view_size && current_view) {
+                            const Result& r = *(*current_view)[selected];
                             std::string full = r.path + "\\" + r.filename;
                             if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
                                 open_file_os(full);
@@ -1220,8 +1313,8 @@ int run_ui(void){
 
                     ImGui::TableNextColumn();
                     ImGui::BeginChild("QuickViewPane", ImVec2(0, 0), false, ImGuiWindowFlags_None);
-                    if (selected >= 0 && selected < static_cast<int>(filtered.size())) {
-                        const Result& r = filtered[selected];
+                    if (selected >= 0 && selected < static_cast<int>(current_view_size) && current_view) {
+                        const Result& r = *(*current_view)[selected];
                         if (ImGui::BeginTabBar("QuickViewTabs")) {
                             if (ImGui::BeginTabItem("Info")) {
                                 ImGui::Text("Path: %s", r.path.c_str());
@@ -1391,12 +1484,7 @@ int run_ui(void){
             r.texture = 0;
         }
     }
-    for (auto& r : filtered) {
-        if (r.texture != 0) {
-            glDeleteTextures(1, &r.texture);
-            r.texture = 0;
-        }
-    }
+    filtered.clear();
 
     db_close(db);
     mdb_env_close(env);
