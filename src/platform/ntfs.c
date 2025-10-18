@@ -187,9 +187,18 @@ static BOOL frnmap_ensure_slot_committed(FrnMap* m, size_t index){
         size_t to_commit = target - committed;
         void* addr = (uint8_t*)m->slots + committed;
         if(!VirtualAlloc(addr, to_commit, MEM_COMMIT, PAGE_READWRITE)){
-            return FALSE;
-        }
-        if(frnmap_atomic_compare_exchange_size(&m->slots_committed, committed, committed + to_commit)){
+            DWORD err = GetLastError();
+            if(err != ERROR_INVALID_ADDRESS){
+                return FALSE;
+            }
+            size_t observed = frnmap_atomic_read_size(&m->slots_committed);
+            if(observed >= target){
+                return TRUE;
+            }
+            if(frnmap_atomic_compare_exchange_size(&m->slots_committed, committed, target)){
+                return TRUE;
+            }
+        }else if(frnmap_atomic_compare_exchange_size(&m->slots_committed, committed, committed + to_commit)){
             return TRUE;
         }
     }
