@@ -321,10 +321,11 @@ struct TieredResults {
             view_dirty = true;
         } else {
             cold_storage.push_back(std::move(r));
+            view_dirty = true;
         }
     }
 
-    size_t size() const { return hot_window.size(); }
+    size_t size() const { return hot_window.size() + cold_storage.size(); }
 
     const std::vector<Result*>& view(const ImGuiTableSortSpecs* specs, bool force_rebuild) {
         int desired_col = COL_SCORE;
@@ -338,14 +339,19 @@ struct TieredResults {
         }
         if (force_rebuild || view_dirty || desired_col != last_sort_column || desired_dir != last_sort_dir) {
             view_cache.clear();
-            view_cache.reserve(hot_window.size());
+            view_cache.reserve(hot_window.size() + cold_storage.size());
             for (Result& r : hot_window) {
                 view_cache.push_back(&r);
             }
+            for (Result& r : cold_storage) {
+                view_cache.push_back(&r);
+            }
             if (desired_col == COL_SCORE) {
-                if (desired_dir == ImGuiSortDirection_Ascending) {
-                    std::reverse(view_cache.begin(), view_cache.end());
-                }
+                auto cmp = [desired_dir](const Result* a, const Result* b) {
+                    bool asc = (desired_dir == ImGuiSortDirection_Ascending);
+                    return asc ? a->score < b->score : a->score > b->score;
+                };
+                std::stable_sort(view_cache.begin(), view_cache.end(), cmp);
             } else {
                 auto cmp = [desired_col, desired_dir](const Result* a, const Result* b) {
                     bool asc = (desired_dir == ImGuiSortDirection_Ascending);
