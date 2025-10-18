@@ -456,12 +456,51 @@ static int trigram_cmp(const void* a, const void* b){
 
 BOOL fuzzy_match(const char* text, const char* pattern, int max_dist){
     if(!text || !pattern || max_dist < 0) return FALSE;
+    static const size_t MAX_CHECKS = 4096;
+    size_t total_checks = 0;
     size_t n = strlen(text), m = strlen(pattern);
     if(m == 0) return TRUE;
     if(n > 1024 || m > 1024 || max_dist > 1024) return FALSE; // Cap to prevent abuse
+
+    unsigned short freq_pattern[256] = {0};
+    unsigned short freq_text[256] = {0};
+    for(size_t i = 0; i < m; ++i){ freq_pattern[(unsigned char)pattern[i]]++; }
+    for(size_t i = 0; i < n; ++i){ freq_text[(unsigned char)text[i]]++; }
+    size_t deficit = 0;
+    for(size_t i = 0; i < 256; ++i){
+        if(freq_pattern[i] > freq_text[i]){
+            deficit += (size_t)(freq_pattern[i] - freq_text[i]);
+            if(deficit > (size_t)max_dist) return FALSE;
+        }
+    }
+
     if(n <= m){
         if((int)(m - n) > max_dist) return FALSE;
+        if(++total_checks > MAX_CHECKS) return FALSE;
         return levenshtein_distance(text, n, pattern, m) <= max_dist;
+    }
+
+    if(m < 3){
+        if(m == 1){
+            if(memchr(text, pattern[0], n)) return TRUE;
+            if(max_dist >= 1 && n > 0) return TRUE;
+            return FALSE;
+        }
+
+        size_t shift[256];
+        size_t def = m + 1;
+        for(size_t i = 0; i < 256; ++i) shift[i] = def;
+        for(size_t j = 0; j < m; ++j) shift[(unsigned char)pattern[j]] = m - j;
+
+        for(size_t i = 0; i <= n - m;){
+            size_t win = m + (size_t)max_dist;
+            if(i + win > n) win = n - i;
+            if(++total_checks > MAX_CHECKS) return FALSE;
+            if(levenshtein_distance(text + i, win, pattern, m) <= max_dist) return TRUE;
+            if(i + m >= n) break;
+            i += shift[(unsigned char)text[i + m]];
+        }
+        return FALSE;
     }
 
     /*
@@ -511,6 +550,7 @@ BOOL fuzzy_match(const char* text, const char* pattern, int max_dist){
             any = TRUE;
             size_t win = m + (size_t)max_dist;
             if(i + win > n) win = n - i;
+            if(++total_checks > MAX_CHECKS){ free(cand); return FALSE; }
             int d = levenshtein_distance(text + i, win, pattern, m);
             if(d <= max_dist){ free(cand); return TRUE; }
         }
@@ -522,6 +562,7 @@ BOOL fuzzy_match(const char* text, const char* pattern, int max_dist){
     for(size_t i = 0; i <= n - m; i++){
         size_t win = m + (size_t)max_dist;
         if(i + win > n) win = n - i;
+        if(++total_checks > MAX_CHECKS) return FALSE;
         int d = levenshtein_distance(text + i, win, pattern, m);
         if(d <= max_dist) return TRUE;
         if(i > 0 && abs((int)(text[i] - pattern[0])) > max_dist) i += m / 2;
