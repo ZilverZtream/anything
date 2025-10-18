@@ -192,8 +192,19 @@ static BOOL frn_build_path(FrnMap* fm, uint64_t frn, wchar_t* full, size_t cch){
     wchar_t seg[512];
     size_t pos = 0;
     uint64_t cur = frn;
-    int guard=0;
-    while(cur && guard++ < 4096){
+    size_t guard = 0;
+    uint64_t visited[4096];
+    size_t visited_count = 0;
+    while(cur && guard < 4096){
+        for(size_t i = 0; i < visited_count; ++i){
+            if(visited[i] == cur){
+                return FALSE;
+            }
+        }
+        if(visited_count >= sizeof(visited)/sizeof(visited[0])){
+            return FALSE;
+        }
+        visited[visited_count++] = cur;
         FrnEntry* e = frnmap_get(fm, cur);
         if(!e) break;
         // prepend segment
@@ -204,6 +215,10 @@ static BOOL frn_build_path(FrnMap* fm, uint64_t frn, wchar_t* full, size_t cch){
         memcpy(temp, seg, sl*sizeof(wchar_t));
         pos += sl;
         cur = e->parent;
+        guard++;
+    }
+    if(cur){
+        return FALSE;
     }
     // temp begins with \Dir\Sub\Name
     if(wcslen(temp)==0) return FALSE;
