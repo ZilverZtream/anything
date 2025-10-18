@@ -1,104 +1,138 @@
-# Anything Project
+**Anything***: Instant Desktop Search for Everything
 
-**Anything** is a high-performance file system indexer and search engine.
-It scans drives (via NTFS USN journal, generic directory walking, or native Linux/macOS watchers), stores file metadata in an LMDB database, and allows fast full-text search using trigram indices and filters.
+Anything is a high-performance desktop search engine designed to find not only your files by name but also the content within them—instantly. Built with a focus on speed, efficiency, and extensibility, it combines the filename-finding velocity of tools like Voidtools Everything with the deep content indexing capabilities of a personal knowledge base.
 
-## Features
-- Multi-threaded file system scanning (NTFS, generic, and POSIX inotify/FSEvents).
-- Lock-free MPMC queue for fast inter-thread communication.
-- Efficient LMDB storage with multiple indices:
-  - Filename
-  - Parent path
-  - File size
-  - Modified date
-  - Extension
-  - Path hierarchy
-  - Trigram-based full-text search
-  - Full Boolean query syntax (AND/OR/NOT with grouping)
-  - Full content extraction for text and common document formats (TXT, source code, PDF, DOCX, etc.), plus native parsing for email (.eml), Outlook archives (.pst) and ebook (.epub) files
-  - Native parsers for email, Outlook archives and ebook formats extract sender, subject, author and title without relying on system IFilters
-  - Optional content snippets and rich metadata extraction (author, photo EXIF camera/lens, music ID3 artist/album, document title) with bundled cross-platform parsers
-  - Archive content indexing (tar, cpio, zip, ar, iso, cab, rar, 7z, xar, lha, and compressed formats like gz/bz2/xz/Z/lzma/lz4/zst) via libarchive.
-- Pluggable scanners for cloud drives (OneDrive/Google Drive/pCloud/Dropbox).
-- Native WSL filesystem indexing without wsl.exe overhead.
-- Experimental macOS virtualization disk indexing for Docker, Parallels and VMware images.
-- Incremental content indexing avoids re-scanning unchanged files.
-- Hybrid indexing levels for name-only, metadata-light, or full content extraction.
-- Extensible plugin system so third parties can add new scanners.
-- Optional code-aware indexing plugin that parses source code (C/C++/Rust/Go/C#/VB.NET/Java/Python) and indexes function, class, and variable definitions for queries like `function:render_widget`.
-- Bloom filters for quick name filtering.
-- Fuzzy filename and content search using Levenshtein distance.
-- Optional Windows taskbar search integration (enable in the Settings tab to register an `anything:` URL protocol and launch searches from the taskbar).
-- Switchable dark and light themes in the graphical interface.
-- Command-line tools:
-  - `anything.exe index` — build or update the database
-  - `search.exe` — query the database with filters (size, date, path, extension, content, author, camera, lens, artist, album, title, regex, etc.). Add `--json` to emit results and errors as structured JSON. Administrative flags `--start-indexer` and `--pause-indexer` control the indexing service.
+It achieves this through a highly optimized, multi-stage indexing pipeline, a sophisticated query engine, and a fluid, GPU-accelerated user interface.
 
-### Enterprise Features (paywalled)
-The source tree contains placeholders for several enterprise-only capabilities.
-Define the `ENTERPRISE` macro at build time to enable the stubs:
+✨ **Key Features**
+Instant File & Folder Search: Utilizes the NTFS USN Journal on Windows for real-time file change detection, providing instantaneous name-based search results. For other filesystems, it employs a highly parallel, work-stealing directory scanner.
 
-- Network share indexing
-- Permission-aware search results
-- Audit logging of search queries
-- Active Directory based authentication
-- Centralized deployment helpers
+Full-Text Content Search: The core of "Anything". It indexes the text content of a vast array of file types, allowing you to find code snippets, document phrases, or any string within your files.
 
-## Archive Content Indexing
-Anything can open a wide range of archives and index contained filenames so a search result can point directly to a file inside formats such as tar, cpio, zip, ar, iso, cab, rar, 7z, xar, and lha, including compressed variants (gz, bz2, xz, Z, lzma, lz4, zst).
+Source Code: Indexes plain text from .c, .cpp, .h, .py, .java, .cs, and many more.
 
-## Cloud Drive Integration
-Stub scanners exist for OneDrive, Google Drive, and Dropbox. They will use official APIs to pull file listings and merge them into the local database.
+Documents & Emails: Uses native OS interfaces (IFilter on Windows) to extract text from .pdf, .docx, .pptx, and email files like .eml and .pst.
 
-## Native WSL File System Indexing
-The WSL scanner reads the ext4.vhdx virtual disk directly to enumerate files and capture full metadata without shelling out to `wsl.exe` for every file.
+Rich, GPU-Accelerated UI: The interface is built with ImGui and features a Direct2D backend on Windows for an exceptionally smooth, high-framerate experience that remains fluid even when scrolling through millions of results.
 
-## macOS Virtual Machine Disk Indexing
-The MacVM scanner can read ext4-based virtual disk images used by Docker, Parallels or VMware on macOS. It opens the disk image directly and walks the contained filesystem without needing to boot the virtual machine.
+Result Virtualization: Only renders visible rows, ensuring minimal resource usage regardless of the result count.
 
-## Plugin API
-Custom data source scanners can be implemented as DLLs. Place compiled plugins in a `plugins` folder next to the executable and they will be loaded at startup. The `plugin.h` header documents the API each DLL must expose.
+Lazy-Loaded Previews: Generates and displays thumbnails and content previews on demand, preventing UI lag.
 
+Integrated Code & Markdown Viewer: Previews source code with syntax highlighting and renders Markdown files directly in the preview pane.
 
-Example plugins include `ocr_plugin.c`, which uses Tesseract OCR to extract and index text from images and scanned PDFs, `registry_plugin.c`, a Windows-only plugin that scans the system registry for searchable keys and values, `gmail_plugin.c`, a plugin that indexes Gmail messages via the Google Gmail API using OAuth 2.0, and `microsoft_mail_plugin.c`, which indexes Outlook.com and Office 365 mail via the Microsoft Graph API with OAuth 2.0 tokens loaded from secure environment variables or token files.
+Extensible Plugin System: "Anything" can be expanded to index virtually any data source through a simple plugin architecture. Included plugins turn it into a unified search hub for your entire digital life:
 
-The Microsoft Mail plugin looks for an access token in the `MS_MAIL_TOKEN` environment variable. As an alternative, a token may be stored on disk with user-only permissions in a file pointed to by `MS_MAIL_TOKEN_FILE` (defaulting to `~/.anything/ms_mail_token`). This allows credentials to be kept separate from the executable while still enabling automated scans.
+Git History: Indexes commit messages, authors, and code diffs across all local Git repositories.
 
-## Build
-This project is written in **C** for Windows.
+Web Archives: Fetches and indexes the full text of your browser history and bookmarks from Chrome, Firefox, Edge, and more.
 
-### Requirements
-- **Microsoft Visual Studio** (with C compiler and Windows SDK)
-- **LMDB** library (include and link `lmdb.h`, `lmdb.lib`)
-- **gumbo-parser** library for robust HTML parsing in the web archive plugin
+Image Content (OCR): Uses Tesseract OCR to find text inside images and scanned documents.
 
-### Example Build Command (Visual Studio Developer Command Prompt)
-```bat
-cl /O2 /MD anything.c database.c exfat.c ntfs.c search.c util.c plugin.c lmdb.lib shlwapi.lib
-```
+Cloud Mail: Indexes recent emails from Gmail, iCloud, and Microsoft Mail accounts.
 
-## Graphical User Interface
-`ui_imgui.cpp` provides a Dear ImGui front end that streams instant search results from the LMDB database. It features a preview pane with highlighted text snippets, syntax-colored code previews, or image thumbnails and an "Advanced Search Builder" for extension, size, date, path, regex and whole-word filters.
+System Registry: Makes the entire Windows Registry instantly searchable.
 
-Compile with `HAS_IMGUI` (and optionally `HAS_STB_IMAGE` for image previews) and link against ImGui, GLFW, OpenGL, LMDB, stb_image and the Win32 shlwapi library:
+Advanced Query Syntax: Combine keywords with boolean operators (AND, OR, NOT) and powerful filters like ext:, content:, author:, and size:> to precisely target your search.
 
-```
-cl /std:c++17 /EHsc ui_imgui.cpp imgui*.cpp glfw3.lib opengl32.lib lmdb.lib shlwapi.lib
-```
+High Performance by Design:
 
-Without these libraries the `run_ui` function prints a message and exits so command-line tools remain usable.
+Persistent Index: Unlike some tools, "Anything" creates a persistent database and only indexes changes on subsequent startups, leading to near-instant launch times after the initial scan.
 
-### Windows Direct2D Virtual List Renderer
+Advanced Indexing: Utilizes Trigram indexing and Bloom filters to dramatically accelerate substring and content searches.
 
-For native Win32 interfaces that previously relied on GDI to draw large result sets, the new `direct2d_renderer` module exposes a
-hardware-accelerated rendering path backed by Direct2D and DirectWrite. Feed it a `VirtualListView` structure and it will batch all
-visible rows into a single text layout, issuing just one GPU draw call per frame. The implementation keeps scroll offsets, selection
-highlighting and row height spacing entirely on the GPU, eliminating the CPU-bound bottlenecks that appear once the result list
-exceeds a few thousand entries. Integrate it with an existing message loop by creating a renderer with `direct2d_renderer_create`,
-forwarding `WM_SIZE` messages to `direct2d_renderer_resize`, and calling `direct2d_renderer_paint` from your paint handler.
+SIMD Optimization: Critical code paths like trigram extraction and hash calculation are accelerated with AVX2 and SSE4.1 intrinsics.
 
-## Memory and Buffer Optimizations
-- Configurable `g_sort_buffer_size` (default 256MB) controls how much data is sorted in memory before spilling to temporary files.
-- Sort buffers pack variable-length values using length prefixes and include incremental 64-bit hashing helpers for composite sort keys.
-- If the data set exceeds the in-memory buffer, an external sort writes sorted chunks to temp files and merges them with a k-way merge.
-- Work memory is determined dynamically at runtime via `GlobalMemoryStatusEx` to adapt to available RAM.
+Efficient Storage: Leverages LMDB, a high-performance, memory-mapped key-value store, as its database backend.
+
+🚀 **Building From Source**
+"Anything" is a C/C++ project that uses CMake for building.
+
+Dependencies
+You will need to install the following libraries before compiling:
+
+LMDB: Core database engine.
+
+GLFW: Windowing and input for the UI.
+
+libcurl: For cloud plugins.
+
+cJSON: For parsing JSON in plugins.
+
+libgit2: For the Git plugin.
+
+Tesseract: For the OCR plugin.
+
+gumbo-parser: For parsing HTML in the web archive plugin.
+
+libarchive: For indexing archive file contents.
+
+SQLite3: For reading browser history databases.
+
+Windows (using vcpkg):
+
+Bash
+
+vcpkg install lmdb glfw3 libcurl cjson libgit2 tesseract gumbo-parser libarchive sqlite3
+macOS (using Homebrew):
+
+Bash
+
+brew install lmdb glfw libcurl cjson libgit2 tesseract gumbo-parser libarchive sqlite
+Ubuntu/Debian (using apt):
+
+Bash
+
+sudo apt-get install liblmdb-dev libglfw3-dev libcurl4-openssl-dev libcjson-dev libgit2-dev libleptonica-dev libtesseract-dev libgumbo-dev libarchive-dev libsqlite3-dev
+Compilation Steps
+Clone the repository:
+
+Bash
+
+git clone https://github.com/your-username/anything.git
+cd anything
+Configure with CMake:
+
+On Windows, if using vcpkg, specify the toolchain file.
+
+Bash
+
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=[path-to-vcpkg]/scripts/buildsystems/vcpkg.cmake
+On Linux/macOS:
+
+Bash
+
+cmake -B build -S .
+Build the project:
+
+Bash
+
+cmake --build build --config Release
+Run: The executables (anything.exe, search.exe) will be located in the build/Release or build directory.
+
+💻 **Usage**
+"Anything" consists of two main executables: anything.exe for indexing and ui_imgui.exe (or similar) for the search interface.
+
+1. Indexing
+First, you must build the database. You can index a specific folder or all drives.
+
+Index a specific drive or folder:
+
+Bash
+
+anything.exe index --db anything.mdb --root C:\
+Index all fixed drives on Windows:
+
+Bash
+
+anything.exe index --db anything.mdb --all-drives
+The first run will take some time as it builds the initial index. Subsequent runs will be much faster as they only process changes.
+
+2. Searching
+Launch the UI executable. It will automatically load the anything.mdb database from its directory and provide an interactive search window.
+
+🤝 **Contributing**
+Contributions are welcome! If you have a feature idea, a bug fix, or a new plugin you'd like to build, please open an issue or submit a pull request.
+
+📜 **License**
+This project is licensed under the MIT License. See the LICENSE file for details.
