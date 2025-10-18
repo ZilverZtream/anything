@@ -73,6 +73,7 @@ size_t db_current_mapsize(Db* db);
 size_t db_max_mapsize(Db* db);
 BOOL   db_set_mapsize(Db* db, size_t new_size_bytes);
 const DbError* db_last_error(Db* db);
+size_t db_last_write_progress(Db* db);
 
 BOOL db_ensure_loaded(Db* db, IndexLoadState state);
 

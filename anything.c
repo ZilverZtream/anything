@@ -859,7 +859,9 @@ static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch
             ctx->grow_attempts++;
             continue; // retry put
         } else {
-            fprintf(stderr, "db_put_records failed: %s (code=%d)\n", err->message, err->detail);
+            size_t progress = db_last_write_progress(ctx->db);
+            fprintf(stderr, "db_put_records failed after %zu/%zu records: %s (code=%d)\n",
+                    progress, in_batch, err->message, err->detail);
             return FALSE;
         }
     }
