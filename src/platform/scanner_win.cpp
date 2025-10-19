@@ -33,6 +33,21 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
         s->kind = FS_NTFS;
         return s;
     }
+    DWORD err = GetLastError();
+    if(err != ERROR_SUCCESS){
+        LPWSTR msg = NULL;
+        DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+        DWORD len = FormatMessageW(flags, NULL, err, 0, (LPWSTR)&msg, 0, NULL);
+        if(len > 0 && msg){
+            while(len > 0 && (msg[len-1] == L'\r' || msg[len-1] == L'\n')){
+                msg[--len] = L'\0';
+            }
+            fwprintf(stderr, L"NTFS scanner unavailable for %ls (err=%lu: %ls); falling back to generic traversal.\n", rootPath, (unsigned long)err, msg);
+            LocalFree(msg);
+        } else {
+            fwprintf(stderr, L"NTFS scanner unavailable for %ls (err=%lu); falling back to generic traversal.\n", rootPath, (unsigned long)err);
+        }
+    }
     s->u.gen = GenericScanner_Start(rootPath, threads, outQueue, cancelToken);
     if(!s->u.gen){
         free(s);

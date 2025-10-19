@@ -585,11 +585,17 @@ typedef struct USNScanner {
     CancelToken* cancel;
     wchar_t volRoot[8]; // e.g., L"C:\\"
     wchar_t volPrefix[8]; // e.g., L"\\\\.\\C:" or root path for path building "C:\"
+    USN_JOURNAL_DATA_V0 journal_info;
+    BOOL journal_info_valid;
     FrnMap map;
     AdaptiveThreadPool pool;
     volatile LONG next_idx;
     int max_threads;
     HANDLE thread;
+    HANDLE start_event;
+    volatile LONG start_notified;
+    volatile LONG start_ok;
+    DWORD start_error;
     BOOL streaming_mode;
     BOOL map_emit_async;
     BOOL map_freed;
@@ -603,6 +609,40 @@ typedef struct USNScanner {
 static BOOL volume_from_root(const wchar_t* root, wchar_t* volprefix, size_t cch){
     if(!root || wcslen(root)<2 || root[1]!=L':') return FALSE;
     return swprintf(volprefix, cch, L"\\\\.\\%c:", root[0])>0;
+}
+
+static void usn_notify_start(USNScanner* s, BOOL ok, DWORD err){
+    if(!s || !s->start_event){
+        return;
+    }
+    if(InterlockedCompareExchange(&s->start_notified, 1, 0) == 0){
+        s->start_ok = ok ? 1 : 0;
+        s->start_error = ok ? ERROR_SUCCESS : err;
+        SetEvent(s->start_event);
+    }
+}
+
+static void usn_log_error(const wchar_t* volume_root, DWORD err, const wchar_t* context){
+    if(!context){
+        context = L"operation";
+    }
+    if(!volume_root){
+        volume_root = L"<unknown>";
+    }
+#ifdef _WIN32
+    LPWSTR msg = NULL;
+    DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+    DWORD len = FormatMessageW(flags, NULL, err, 0, (LPWSTR)&msg, 0, NULL);
+    if(len > 0 && msg){
+        while(len > 0 && (msg[len-1] == L'\r' || msg[len-1] == L'\n')){
+            msg[--len] = L'\0';
+        }
+        fwprintf(stderr, L"NTFS scanner %ls for %ls failed (err=%lu: %ls).\n", context, volume_root, (unsigned long)err, msg);
+        LocalFree(msg);
+        return;
+    }
+#endif
+    fwprintf(stderr, L"NTFS scanner %ls for %ls failed (err=%lu).\n", context, volume_root, (unsigned long)err);
 }
 
 // Build full path from FRN by walking parents in the map
@@ -890,18 +930,76 @@ static DWORD WINAPI usn_thread(void* p){
     USNScanner* s = (USNScanner*)p;
     FrnMode mode = FRN_MODE_BUILDING;
     size_t last_progress_emit = 0;
+    DWORD fatal_error = ERROR_SUCCESS;
+    BOOL start_signaled = FALSE;
     BYTE* buf = (BYTE*)VirtualAlloc(NULL, 16*1024*1024, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-    if(!buf) return 1;
+    if(!buf){
+        fatal_error = GetLastError();
+        if(fatal_error == ERROR_SUCCESS){
+            fatal_error = ERROR_NOT_ENOUGH_MEMORY;
+        }
+        usn_log_error(s->volRoot, fatal_error, L"failed to allocate USN journal buffer");
+        usn_notify_start(s, FALSE, fatal_error);
+        return 1;
+    }
     MFT_ENUM_DATA_V1 med = {0};
     med.StartFileReferenceNumber = 0;
-    med.LowUsn = 0;
-    med.HighUsn = MAXLONGLONG;
+    if(s->journal_info_valid){
+        med.LowUsn = s->journal_info.FirstUsn;
+        med.HighUsn = s->journal_info.NextUsn;
+        wprintf(L"Journal ID: 0x%llx, FirstUsn: 0x%llx, NextUsn: 0x%llx\n",
+                (unsigned long long)s->journal_info.UsnJournalID,
+                (unsigned long long)s->journal_info.FirstUsn,
+                (unsigned long long)s->journal_info.NextUsn);
+    } else {
+        med.LowUsn = 0;
+        med.HighUsn = MAXLONGLONG;
+    }
+    wprintf(L"Starting NTFS enumeration on volume %ls\n", s->volRoot);
+    wprintf(L"Initial MFT start: %llu, USN range: %llu to %llu\n",
+            (unsigned long long)med.StartFileReferenceNumber,
+            (unsigned long long)med.LowUsn,
+            (unsigned long long)med.HighUsn);
     DWORD bytes;
     frnmap_init(&s->map, 1<<20);
+    int iteration = 0;
     for(;;){
         if(is_cancelled(s->cancel)) break;
+        iteration++;
         if(!DeviceIoControl(s->hVol, FSCTL_ENUM_USN_DATA, &med, sizeof(med), buf, 16*1024*1024, &bytes, NULL)){
-            DWORD e = GetLastError(); if(e==ERROR_HANDLE_EOF) break; else { break; }
+            DWORD e = GetLastError();
+            wprintf(L"DeviceIoControl failed on iteration %d with error %lu\n", iteration, (unsigned long)e);
+            if(e == ERROR_HANDLE_EOF){
+                wprintf(L"  \u2192 Reached end of journal (enumerated all records)\n");
+                if(!start_signaled){
+                    usn_notify_start(s, TRUE, ERROR_SUCCESS);
+                    start_signaled = TRUE;
+                }
+                break;
+            }
+            if(e == ERROR_JOURNAL_NOT_ACTIVE){
+                wprintf(L"  \u2192 Journal not active\n");
+            } else if(e == ERROR_ACCESS_DENIED){
+                wprintf(L"  \u2192 Access denied\n");
+            } else {
+                wprintf(L"  \u2192 Unknown error\n");
+            }
+            fatal_error = e ? e : ERROR_GEN_FAILURE;
+            if(!start_signaled){
+                usn_log_error(s->volRoot, fatal_error, L"failed to enumerate the USN journal");
+                usn_notify_start(s, FALSE, fatal_error);
+                start_signaled = TRUE;
+            } else if(s->start_ok){
+                usn_log_error(s->volRoot, fatal_error, L"encountered an error while enumerating the USN journal");
+            }
+            break;
+        }
+        if(iteration == 1 || iteration % 100 == 0){
+            wprintf(L"Iteration %d: received %lu bytes\n", iteration, (unsigned long)bytes);
+        }
+        if(!start_signaled){
+            usn_notify_start(s, TRUE, ERROR_SUCCESS);
+            start_signaled = TRUE;
         }
         DWORD_PTR pRec = (DWORD_PTR)buf + sizeof(USN);
         while(pRec + sizeof(USN_RECORD_V2) <= (DWORD_PTR)buf + bytes){
@@ -924,6 +1022,10 @@ static DWORD WINAPI usn_thread(void* p){
                     live_updates_push_progress((uint64_t)s->map.count, TRUE);
                     usn_queue_streaming_emit(s, r);
                 } else if(!fe){
+                    fatal_error = ERROR_OUTOFMEMORY;
+                    if(s->start_ok){
+                        usn_log_error(s->volRoot, fatal_error, L"ran out of memory while building the NTFS index");
+                    }
                     VirtualFree(buf,0,MEM_RELEASE);
                     return 1;
                 } else {
@@ -949,6 +1051,10 @@ static DWORD WINAPI usn_thread(void* p){
         }
         med.StartFileReferenceNumber = *(USN*)buf;
         usn_check_async_emit_done(s);
+    }
+    if(!start_signaled){
+        usn_notify_start(s, TRUE, ERROR_SUCCESS);
+        start_signaled = TRUE;
     }
     if(mode == FRN_MODE_BUILDING){
         live_updates_push_progress((uint64_t)s->map.count, TRUE);
@@ -977,6 +1083,9 @@ static DWORD WINAPI usn_thread(void* p){
         s->map_freed = TRUE;
     }
     VirtualFree(buf,0,MEM_RELEASE);
+    if(fatal_error != ERROR_SUCCESS && s->start_ok){
+        return 1;
+    }
     return 0;
 }
 
@@ -984,25 +1093,126 @@ NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue
     USNScanner* s = (USNScanner*)calloc(1,sizeof(USNScanner));
     if(!s) return NULL;
     s->outq = outQueue; s->cancel = cancelToken;
-    wcscpy_s(s->volRoot, 8, volumeRoot);
-    volume_from_root(volumeRoot, s->volPrefix, 8);
-    s->hVol = CreateFileW(s->volPrefix, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
-    if(s->hVol==INVALID_HANDLE_VALUE){ free(s); return NULL; }
+    s->journal_info_valid = FALSE;
+
+    size_t root_cch = sizeof(s->volRoot) / sizeof(s->volRoot[0]);
+    size_t prefix_cch = sizeof(s->volPrefix) / sizeof(s->volPrefix[0]);
+    if(wcscpy_s(s->volRoot, root_cch, volumeRoot) != 0){
+        free(s);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    if(!volume_from_root(volumeRoot, s->volPrefix, prefix_cch)){
+        free(s);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+
+    DWORD desired_access = GENERIC_READ | GENERIC_WRITE;
+    DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
+    s->hVol = CreateFileW(s->volPrefix, desired_access, share_mode, NULL, OPEN_EXISTING, flags, NULL);
+    if(s->hVol==INVALID_HANDLE_VALUE && GetLastError()==ERROR_ACCESS_DENIED){
+        desired_access = GENERIC_READ;
+        s->hVol = CreateFileW(s->volPrefix, desired_access, share_mode, NULL, OPEN_EXISTING, flags, NULL);
+    }
+    if(s->hVol==INVALID_HANDLE_VALUE){
+        DWORD err = GetLastError();
+        usn_log_error(volumeRoot, err, L"failed to open the NTFS volume");
+        free(s);
+        SetLastError(err);
+        return NULL;
+    }
+
+    DWORD bytes = 0;
+    USN_JOURNAL_DATA_V0 journal_info = {0};
+    if(!DeviceIoControl(s->hVol, FSCTL_QUERY_USN_JOURNAL, NULL, 0, &journal_info, sizeof(journal_info), &bytes, NULL)){
+        DWORD err = GetLastError();
+        usn_log_error(s->volRoot, err, L"failed to query the USN journal");
+        CloseHandle(s->hVol);
+        free(s);
+        SetLastError(err);
+        return NULL;
+    }
+    s->journal_info = journal_info;
+    s->journal_info_valid = TRUE;
+
     s->max_threads = threads > 0 ? threads : 1;
+    s->start_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if(!s->start_event){
+        DWORD err = GetLastError();
+        CloseHandle(s->hVol);
+        free(s);
+        SetLastError(err);
+        return NULL;
+    }
+    s->start_notified = 0;
+    s->start_ok = 0;
+    s->start_error = ERROR_SUCCESS;
     uintptr_t h = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))usn_thread,s,0,NULL);
+    if(!h){
+        DWORD err = GetLastError();
+        if(err == ERROR_SUCCESS){
+            err = ERROR_NOT_ENOUGH_MEMORY;
+        }
+        CloseHandle(s->start_event);
+        CloseHandle(s->hVol);
+        free(s);
+        SetLastError(err);
+        return NULL;
+    }
     s->thread = (HANDLE)h;
+    DWORD wait = WaitForSingleObject(s->start_event, INFINITE);
+    if(wait != WAIT_OBJECT_0){
+        DWORD err = GetLastError();
+        if(err == ERROR_SUCCESS){
+            err = ERROR_GEN_FAILURE;
+        }
+        usn_log_error(s->volRoot, err, L"failed while waiting for the NTFS scanner to initialize");
+        WaitForSingleObject(s->thread, INFINITE);
+        CloseHandle(s->thread);
+        CloseHandle(s->start_event);
+        CloseHandle(s->hVol);
+        free(s);
+        SetLastError(err);
+        return NULL;
+    }
+    if(!s->start_ok){
+        DWORD err = s->start_error ? s->start_error : ERROR_GEN_FAILURE;
+        usn_log_error(s->volRoot, err, L"failed to initialize the NTFS scanner");
+        WaitForSingleObject(s->thread, INFINITE);
+        CloseHandle(s->thread);
+        CloseHandle(s->start_event);
+        CloseHandle(s->hVol);
+        frnmap_free(&s->map);
+        free(s);
+        SetLastError(err);
+        return NULL;
+    }
     return (NTFSScanner*)s;
 }
 void NTFSScanner_Wait(NTFSScanner* s_){
     USNScanner* s = (USNScanner*)s_;
     if(!s) return;
-    WaitForSingleObject(s->thread, INFINITE);
+    if(s->thread){
+        WaitForSingleObject(s->thread, INFINITE);
+    }
 }
 void NTFSScanner_Free(NTFSScanner* s_){
     USNScanner* s = (USNScanner*)s_;
     if(!s) return;
-    CloseHandle(s->thread);
-    if(s->hVol && s->hVol!=INVALID_HANDLE_VALUE) CloseHandle(s->hVol);
+    if(s->thread){
+        CloseHandle(s->thread);
+        s->thread = NULL;
+    }
+    if(s->start_event){
+        CloseHandle(s->start_event);
+        s->start_event = NULL;
+    }
+    if(s->hVol && s->hVol!=INVALID_HANDLE_VALUE){
+        CloseHandle(s->hVol);
+        s->hVol = INVALID_HANDLE_VALUE;
+    }
     frnmap_free(&s->map);
     free(s);
 }
