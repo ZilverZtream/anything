@@ -16,6 +16,8 @@
 #include <limits.h>
 #pragma comment(lib, "shlwapi.lib")
 
+#include "anything/database.h"
+
 #ifndef _WIN32
 #include <pthread.h>
 #include <unistd.h>
@@ -39,30 +41,11 @@ static inline size_t bloom_log2_to_bytes(uint8_t log2){
 }
 
 static BOOL string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta_out){
-    if(!value) return FALSE;
-    BOOL present = FALSE;
-    size_t total = value->mv_size;
-    if(total >= sizeof(StringMeta)){
-        const uint8_t* base = (const uint8_t*)value->mv_data;
-        const StringMeta* tail = (const StringMeta*)(base + total - sizeof(StringMeta));
-        if(tail->magic0 == STRING_META_MAGIC0 && tail->magic1 == STRING_META_MAGIC1){
-            present = TRUE;
-            if(meta_out) *meta_out = *tail;
-            total -= sizeof(StringMeta);
-        }
-    }
-    if(meta_out && !present){
-        memset(meta_out, 0, sizeof(*meta_out));
-    }
-    if(text){
-        text->mv_data = value->mv_data;
-        text->mv_size = total;
-    }
-    return present;
+    return db_string_value_parse(value, text, meta_out, NULL);
 }
 
 static size_t string_meta_bloom_bytes(const StringMeta* sm){
-    if(!sm) return 0;
+    if(!sm || sm->bloom_pending) return 0;
     if(sm->magic0 == STRING_META_MAGIC0 && sm->magic1 == STRING_META_MAGIC1){
         if(sm->bloom_log2){
             size_t bytes = bloom_log2_to_bytes(sm->bloom_log2);
@@ -343,18 +326,6 @@ void prog_mark_done(ProgState* ps, uint8_t stage){
 #endif
 #endif
 
-typedef struct {
-    uint32_t trigram_count;
-    uint8_t  hash_count;
-    uint8_t  bloom_log2;
-    uint8_t  magic0;
-    uint8_t  magic1;
-    uint64_t bloom_offset;
-    uint32_t bloom_length;
-} StringMeta;
-
-#define STRING_META_MAGIC0 'B'
-#define STRING_META_MAGIC1 'F'
 #ifdef _WIN32
 static HANDLE bloom_mapping = NULL;
 #else
@@ -2669,7 +2640,11 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
                 }
             }
             BOOL ok = FALSE;
-            if(sm && sm->bloom_offset < g_bloom_size && g_bloom_size - sm->bloom_offset >= sm->bloom_length){
+            if(sm && sm->bloom_pending && text_val.mv_size >= 5){
+                bloom_generator_request(name_ids.ids[i]);
+                ok = string_contains_lower_term(&text_val, tl);
+            }
+            else if(sm && !sm->bloom_pending && sm->bloom_offset < g_bloom_size && g_bloom_size - sm->bloom_offset >= sm->bloom_length){
                 size_t bloom_bytes = 0;
                 uint8_t* bloom = bloom_cache_get(name_ids.ids[i], sm, &bloom_bytes);
                 if(bloom){

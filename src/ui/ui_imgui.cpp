@@ -65,19 +65,6 @@ extern "C" {
 #define MDB_DBI_INVALID ((MDB_dbi)~(unsigned)0)
 #endif
 
-struct StringMeta {
-    uint32_t trigram_count;
-    uint8_t  hash_count;
-    uint8_t  bloom_log2;
-    uint8_t  magic0;
-    uint8_t  magic1;
-    uint64_t bloom_offset;
-    uint32_t bloom_length;
-};
-
-static constexpr uint8_t STRING_META_MAGIC0 = 'B';
-static constexpr uint8_t STRING_META_MAGIC1 = 'F';
-
 #ifdef _WIN32
 static HANDLE bloom_mapping = NULL;
 #else
@@ -94,31 +81,15 @@ static inline size_t bloom_log2_to_bytes(uint8_t log2){
 }
 
 static bool string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta_out, bool* has_meta = nullptr){
-    if(!value) return false;
-    bool present = false;
-    size_t total = value->mv_size;
-    if(total >= sizeof(StringMeta)){
-        const uint8_t* base = static_cast<const uint8_t*>(value->mv_data);
-        const StringMeta* tail = reinterpret_cast<const StringMeta*>(base + total - sizeof(StringMeta));
-        if(tail->magic0 == STRING_META_MAGIC0 && tail->magic1 == STRING_META_MAGIC1){
-            present = true;
-            if(meta_out) *meta_out = *tail;
-            total -= sizeof(StringMeta);
-        }
-    }
-    if(meta_out && !present){
-        memset(meta_out, 0, sizeof(*meta_out));
-    }
-    if(text){
-        text->mv_data = value->mv_data;
-        text->mv_size = total;
-    }
-    if(has_meta) *has_meta = present;
-    return present;
+    BOOL has_local = FALSE;
+    BOOL* has_ptr = has_meta ? &has_local : nullptr;
+    BOOL present = db_string_value_parse(value, text, meta_out, has_ptr);
+    if(has_meta) *has_meta = has_local ? true : false;
+    return present ? true : false;
 }
 
 static size_t string_meta_bloom_bytes(const StringMeta* sm){
-    if(!sm) return 0;
+    if(!sm || sm->bloom_pending) return 0;
     if(sm->magic0 == STRING_META_MAGIC0 && sm->magic1 == STRING_META_MAGIC1){
         if(sm->bloom_log2){
             size_t bytes = bloom_log2_to_bytes(sm->bloom_log2);

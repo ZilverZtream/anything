@@ -32,19 +32,6 @@
 #endif
 
 typedef struct {
-    uint32_t trigram_count;
-    uint8_t  hash_count;
-    uint8_t  bloom_log2;
-    uint8_t  magic0;
-    uint8_t  magic1;
-    uint64_t bloom_offset; // offset in bloom file
-    uint32_t bloom_length;
-} StringMeta;
-
-#define STRING_META_MAGIC0 'B'
-#define STRING_META_MAGIC1 'F'
-
-typedef struct {
     volatile uint64_t hash;
     volatile LONG64   stamp;
     volatile uint32_t string_id;
@@ -491,14 +478,26 @@ static void string_meta_init(StringMeta* sm){
     ZeroMemory(sm, sizeof(*sm));
     sm->magic0 = STRING_META_MAGIC0;
     sm->magic1 = STRING_META_MAGIC1;
+    sm->bloom_pending = 0;
 }
 
-static BOOL string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta_out, BOOL* has_meta){
+BOOL db_string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta_out, BOOL* has_meta){
     if(!value) return FALSE;
     BOOL present = FALSE;
     size_t total = value->mv_size;
+    const uint8_t* base = (const uint8_t*)value->mv_data;
+
+    typedef struct {
+        uint32_t trigram_count;
+        uint8_t  hash_count;
+        uint8_t  bloom_log2;
+        uint8_t  magic0;
+        uint8_t  magic1;
+        uint64_t bloom_offset;
+        uint32_t bloom_length;
+    } StringMetaV1;
+
     if(total >= sizeof(StringMeta)){
-        const uint8_t* base = (const uint8_t*)value->mv_data;
         const StringMeta* tail = (const StringMeta*)(base + total - sizeof(StringMeta));
         if(tail->magic0 == STRING_META_MAGIC0 && tail->magic1 == STRING_META_MAGIC1){
             present = TRUE;
@@ -506,8 +505,24 @@ static BOOL string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* 
             total -= sizeof(StringMeta);
         }
     }
+    if(!present && total >= sizeof(StringMetaV1)){
+        const StringMetaV1* legacy = (const StringMetaV1*)(base + total - sizeof(StringMetaV1));
+        if(legacy->magic0 == STRING_META_MAGIC0 && legacy->magic1 == STRING_META_MAGIC1){
+            present = TRUE;
+            if(meta_out){
+                string_meta_init(meta_out);
+                meta_out->trigram_count = legacy->trigram_count;
+                meta_out->hash_count = legacy->hash_count;
+                meta_out->bloom_log2 = legacy->bloom_log2;
+                meta_out->bloom_offset = legacy->bloom_offset;
+                meta_out->bloom_length = legacy->bloom_length;
+                meta_out->bloom_pending = 0;
+            }
+            total -= sizeof(StringMetaV1);
+        }
+    }
     if(meta_out && !present){
-        ZeroMemory(meta_out, sizeof(*meta_out));
+        string_meta_init(meta_out);
     }
     if(text){
         text->mv_data = value->mv_data;
@@ -520,7 +535,7 @@ static BOOL string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* 
 static BOOL string_value_update(DbImpl* d, uint64_t id, const MDB_val* current, const StringMeta* meta){
     if(!d || !current || !meta || !d->wtxn) return FALSE;
     MDB_val text;
-    string_value_parse(current, &text, NULL, NULL);
+    db_string_value_parse(current, &text, NULL, NULL);
     size_t text_len = text.mv_size;
     size_t total = text_len + sizeof(StringMeta);
     uint8_t* buf = (uint8_t*)malloc(total);
@@ -592,75 +607,161 @@ static BOOL bloom_buffer_flush(DbImpl* d){
 }
 
 static BOOL ensure_bloom_for_string(DbImpl* d, uint64_t str_id, MDB_val* value, NameBloomContext* ctx, StringMeta* existing_meta, uint64_t* bloom_offset_tmp){
-    if(!d || !value || !ctx || !bloom_offset_tmp) return FALSE;
+    (void)bloom_offset_tmp;
+    if(!d || !value || !ctx) return FALSE;
     BOOL meta_present = existing_meta && existing_meta->magic0 == STRING_META_MAGIC0 && existing_meta->magic1 == STRING_META_MAGIC1;
-    BOOL has_bloom = meta_present && existing_meta->hash_count > 0 && existing_meta->bloom_length > 0;
+
+    if(meta_present){
+        if(existing_meta->hash_count > 0 && existing_meta->bloom_length > 0 && !existing_meta->bloom_pending){
+            return TRUE;
+        }
+        if(existing_meta->bloom_pending){
+            return TRUE;
+        }
+    }
 
     if(ctx->lower_len < 5){
-        if(!meta_present || existing_meta->hash_count != 0 || existing_meta->bloom_length != 0 || existing_meta->bloom_offset != 0 || existing_meta->bloom_log2 != 0 || existing_meta->trigram_count != (uint32_t)ctx->trigram_count){
-            StringMeta sm; string_meta_init(&sm);
-            sm.trigram_count = (uint32_t)ctx->trigram_count;
+        StringMeta sm; string_meta_init(&sm);
+        sm.trigram_count = (uint32_t)ctx->trigram_count;
+        sm.bloom_pending = 0;
+        BOOL needs_update = TRUE;
+        if(meta_present){
+            needs_update = existing_meta->hash_count != 0 ||
+                           existing_meta->bloom_length != 0 ||
+                           existing_meta->bloom_offset != 0 ||
+                           existing_meta->bloom_log2 != 0 ||
+                           existing_meta->trigram_count != sm.trigram_count ||
+                           existing_meta->bloom_pending != 0;
+        }
+        if(needs_update){
             if(!string_value_update(d, str_id, value, &sm)){
                 set_error(d, DB_ERROR_OS, 0, "failed to update string meta");
                 return FALSE;
             }
+            d->dirty = TRUE;
             if(existing_meta) *existing_meta = sm;
         }
         return TRUE;
     }
 
-    if(has_bloom){
-        return TRUE;
+    StringMeta placeholder; string_meta_init(&placeholder);
+    placeholder.trigram_count = (uint32_t)ctx->trigram_count;
+    placeholder.bloom_pending = 1;
+    BOOL needs_update = TRUE;
+    if(meta_present){
+        needs_update = existing_meta->trigram_count != placeholder.trigram_count ||
+                       existing_meta->hash_count != 0 ||
+                       existing_meta->bloom_length != 0 ||
+                       existing_meta->bloom_offset != 0 ||
+                       existing_meta->bloom_log2 != 0 ||
+                       existing_meta->bloom_pending != 1;
     }
+    if(needs_update){
+        if(!string_value_update(d, str_id, value, &placeholder)){
+            set_error(d, DB_ERROR_OS, 0, "failed to update string meta with placeholder");
+            return FALSE;
+        }
+        d->dirty = TRUE;
+    }
+    if(existing_meta) *existing_meta = placeholder;
+    return TRUE;
+}
 
-    if(ctx->bloom_bytes > 8192u){
-        set_error(d, DB_ERROR_OS, 0, "unsupported bloom size");
+BOOL db_generate_bloom_blob(const char* text_utf8, size_t text_len, StringMeta* meta_out, uint8_t** bloom_data_out, size_t* bloom_len_out){
+    (void)text_len;
+    if(!text_utf8 || !meta_out || !bloom_data_out || !bloom_len_out) return FALSE;
+    *bloom_data_out = NULL;
+    *bloom_len_out = 0;
+
+    NameBloomContext ctx;
+    if(!name_bloom_context_prepare(text_utf8, &ctx)){
         return FALSE;
     }
 
     uint8_t bloom[8192];
-    uint32_t tc = build_bloom_from_context(ctx, bloom);
-    if(ctx->bloom_bytes == 0 || ctx->hash_count == 0 || tc == 0){
-        StringMeta sm; string_meta_init(&sm);
-        sm.trigram_count = tc ? tc : (uint32_t)ctx->trigram_count;
-        if(!string_value_update(d, str_id, value, &sm)){
-            set_error(d, DB_ERROR_OS, 0, "failed to update string meta");
-            return FALSE;
-        }
-        if(existing_meta) *existing_meta = sm;
+    uint32_t tc = build_bloom_from_context(&ctx, bloom);
+
+    string_meta_init(meta_out);
+    meta_out->trigram_count = tc ? tc : (uint32_t)ctx.trigram_count;
+    meta_out->bloom_pending = 0;
+
+    if(ctx.bloom_bytes == 0 || ctx.hash_count == 0 || tc == 0){
+        name_bloom_context_release(&ctx);
         return TRUE;
     }
 
     uint8_t encoded[8192 + 1024];
-    size_t bloom_bytes = ctx->bloom_bytes;
+    size_t bloom_bytes = ctx.bloom_bytes;
     size_t enc_len = bloom_packbits_compress(bloom, bloom_bytes, encoded, sizeof(encoded));
     const uint8_t* out_data = bloom;
-    DWORD out_bytes = (DWORD)bloom_bytes;
-    uint32_t stored_len = (uint32_t)bloom_bytes;
+    size_t out_len = bloom_bytes;
     if(enc_len > 0 && enc_len < bloom_bytes){
         out_data = encoded;
-        out_bytes = (DWORD)enc_len;
-        stored_len = (uint32_t)enc_len;
+        out_len = enc_len;
     }
-    if(*bloom_offset_tmp > UINT64_MAX - stored_len){
-        set_error(d, DB_ERROR_OS, 0, "bloom file too large");
+
+    uint8_t* copy = (uint8_t*)malloc(out_len);
+    if(!copy){
+        name_bloom_context_release(&ctx);
         return FALSE;
     }
-    if(!bloom_buffer_append(d, out_data, out_bytes)){
+    memcpy(copy, out_data, out_len);
+
+    meta_out->hash_count = ctx.hash_count;
+    meta_out->bloom_log2 = bloom_bytes_to_log2(bloom_bytes);
+    meta_out->bloom_length = (uint32_t)out_len;
+    meta_out->bloom_offset = 0;
+    meta_out->bloom_pending = 0;
+
+    *bloom_data_out = copy;
+    *bloom_len_out = out_len;
+
+    name_bloom_context_release(&ctx);
+    return TRUE;
+}
+
+BOOL db_apply_generated_bloom(Db* db_, const BloomResultItem* result){
+    if(!db_ || !result) return FALSE;
+    DbImpl* d = (DbImpl*)db_;
+    if(!d->wtxn) return FALSE;
+
+    MDB_val key = {.mv_data = (void*)&result->string_id, .mv_size = sizeof(result->string_id)};
+    MDB_val val;
+    int rc = mdb_get(d->wtxn, d->dbi_strings, &key, &val);
+    if(rc == MDB_NOTFOUND){
+        return TRUE;
+    }
+    if(rc != 0){
+        set_mdb_error(d, rc);
         return FALSE;
     }
-    StringMeta sm; string_meta_init(&sm);
-    sm.trigram_count = tc;
-    sm.hash_count = ctx->hash_count;
-    sm.bloom_log2 = bloom_bytes_to_log2(bloom_bytes);
-    sm.bloom_offset = *bloom_offset_tmp;
-    sm.bloom_length = stored_len;
-    if(!string_value_update(d, str_id, value, &sm)){
-        set_error(d, DB_ERROR_OS, 0, "failed to update string meta");
+
+    StringMeta meta = result->new_meta;
+    meta.magic0 = STRING_META_MAGIC0;
+    meta.magic1 = STRING_META_MAGIC1;
+    meta.bloom_pending = 0;
+
+    if(result->bloom_data && result->bloom_data_len > 0){
+        if(d->bloom_offset > UINT64_MAX - result->bloom_data_len){
+            set_error(d, DB_ERROR_OS, 0, "bloom file too large");
+            return FALSE;
+        }
+        uint64_t bloom_offset = d->bloom_offset;
+        if(!bloom_buffer_append(d, result->bloom_data, result->bloom_data_len)){
+            return FALSE;
+        }
+        meta.bloom_offset = bloom_offset;
+        meta.bloom_length = (uint32_t)result->bloom_data_len;
+    } else {
+        meta.bloom_offset = 0;
+        meta.bloom_length = 0;
+    }
+
+    if(!string_value_update(d, result->string_id, &val, &meta)){
+        set_error(d, DB_ERROR_OS, 0, "failed to update string meta with generated bloom");
         return FALSE;
     }
-    *bloom_offset_tmp += stored_len;
-    if(existing_meta) *existing_meta = sm;
+    d->dirty = TRUE;
     return TRUE;
 }
 
@@ -1321,7 +1422,7 @@ static BOOL str_by_id_with_retry(DbImpl* d, uint64_t id, MDB_val* out, int max_r
     MDB_val key; key.mv_data = &id; key.mv_size = sizeof(id);
     if(d->wtxn){
         if(mdb_get(d->wtxn, d->dbi_strings, &key, out) == 0){
-            string_value_parse(out, out, meta_out, has_meta);
+            db_string_value_parse(out, out, meta_out, has_meta);
             return TRUE;
         }
         return FALSE;
@@ -1331,7 +1432,7 @@ static BOOL str_by_id_with_retry(DbImpl* d, uint64_t id, MDB_val* out, int max_r
         if(mdb_txn_begin(d->env, NULL, MDB_RDONLY, &txn) == 0){
             int rc = mdb_get(txn, d->dbi_strings, &key, out);
             if(rc == 0){
-                string_value_parse(out, out, meta_out, has_meta);
+                db_string_value_parse(out, out, meta_out, has_meta);
                 mdb_txn_abort(txn);
                 return TRUE;
             }
