@@ -27,6 +27,8 @@ find_package(Gumbo REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(unofficial-lmdb REQUIRED)
+find_package(e2fsprogs REQUIRED)
+find_package(libzip REQUIRED)
 
 # --- Define Public Include Directory ---
 include_directories(
@@ -74,7 +76,7 @@ add_executable(search_cli
 if(WIN32)
     target_sources(anything PRIVATE
         src/platform/ntfs.c
-        src/platform/scanner_win.c
+        src/platform/scanner_win.cpp
         src/platform/wsl.c
         src/ui/direct2d_renderer.cpp
     )
@@ -94,6 +96,8 @@ target_link_libraries(anything PRIVATE
     unofficial::lmdb::lmdb
     LibArchive::LibArchive
     ${CMAKE_THREAD_LIBS_INIT}
+    e2fsprogs::ext2fs
+    libzip::zip
 )
 
 target_link_libraries(ui_imgui PRIVATE
@@ -104,7 +108,11 @@ target_link_libraries(ui_imgui PRIVATE
     cjson
 )
 
-target_link_libraries(search_cli PRIVATE unofficial::lmdb::lmdb)
+target_link_libraries(search_cli PRIVATE
+    unofficial::lmdb::lmdb
+    e2fsprogs::ext2fs
+    libzip::zip
+)
 
 if(WIN32)
     target_link_libraries(anything PRIVATE Shlwapi.lib Ole32.lib Query.lib)
