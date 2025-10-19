@@ -1136,9 +1136,39 @@ typedef struct {
     DbHeader header_cache;
     IndexLoadState load_state;
     size_t   last_write_progress;
+    BOOL     bulk_mode;
+    DWORD    bulk_sync_interval_ms;
+    ULONGLONG bulk_last_sync_tick;
+    size_t   bulk_unsynced_commits;
+    size_t   bulk_sync_commit_limit;
 } DbImpl;
 
 static const size_t BLOOM_BUFFER_CHUNK = 1u << 20; // 1 MB
+
+static const size_t DEFAULT_BULK_SYNC_COMMIT_LIMIT = 4096;
+
+static BOOL db_should_sync(Db* db_){
+    DbImpl* d = (DbImpl*)db_;
+    if(!d || !d->bulk_mode) return FALSE;
+    ULONGLONG now = GetTickCount64();
+    if(d->bulk_sync_interval_ms > 0){
+        ULONGLONG elapsed = now - d->bulk_last_sync_tick;
+        if(elapsed >= d->bulk_sync_interval_ms){
+            return TRUE;
+        }
+    }
+    if(d->bulk_sync_commit_limit > 0 && d->bulk_unsynced_commits >= d->bulk_sync_commit_limit){
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void db_mark_synced(Db* db_){
+    DbImpl* d = (DbImpl*)db_;
+    if(!d) return;
+    d->bulk_unsynced_commits = 0;
+    d->bulk_last_sync_tick = GetTickCount64();
+}
 
 typedef struct { uint64_t key; uint64_t value; } IndexEntry64;
 typedef struct { uint32_t key; uint64_t value; } IndexEntry32;
@@ -1261,6 +1291,11 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
     if(!d->bloom_buffer){ CloseHandle(d->bloom_file); mdb_env_close(d->env); free(d); return FALSE; }
     d->bloom_buffer_cap = BLOOM_BUFFER_CHUNK;
     d->bloom_buffer_len = 0;
+    d->bulk_mode = FALSE;
+    d->bulk_sync_interval_ms = 0;
+    d->bulk_last_sync_tick = GetTickCount64();
+    d->bulk_unsynced_commits = 0;
+    d->bulk_sync_commit_limit = DEFAULT_BULK_SYNC_COMMIT_LIMIT;
     MDB_txn* txn;
     if((rc = mdb_txn_begin(d->env, NULL, 0, &txn))){ set_mdb_error(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
     if((rc = open_core_dbs(txn, d, TRUE))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
@@ -1308,6 +1343,7 @@ const DbHeader* db_open_readonly(const wchar_t* path, Db** out_db){
     d->bloom_buffer_cap = 0;
     d->bloom_file_size = 0;
     d->bloom_offset = 0;
+    d->bulk_sync_commit_limit = DEFAULT_BULK_SYNC_COMMIT_LIMIT;
     *out_db = (Db*)d;
     return &d->header_cache;
 }
@@ -1343,6 +1379,29 @@ BOOL db_set_mapsize(Db* db_, size_t new_size_bytes){
     if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     if(rc==0){ d->header_cache.map_size_bytes = new_size_bytes; }
     return rc==0;
+}
+
+BOOL db_set_bulk_mode(Db* db_, BOOL enable, uint32_t sync_interval_seconds){
+    DbImpl* d = (DbImpl*)db_;
+    if(!d) return FALSE;
+    int rc = mdb_env_set_flags(d->env, MDB_NOSYNC | MDB_NOMETASYNC, enable ? 1 : 0);
+    if(rc){ set_mdb_error(d, rc); return FALSE; }
+    d->bulk_mode = enable ? TRUE : FALSE;
+    if(enable){
+        DWORD interval_ms = sync_interval_seconds ? (DWORD)sync_interval_seconds * 1000u : 0u;
+        d->bulk_sync_interval_ms = interval_ms;
+        d->bulk_unsynced_commits = 0;
+        d->bulk_last_sync_tick = GetTickCount64();
+        if(d->bulk_sync_commit_limit == 0){
+            d->bulk_sync_commit_limit = DEFAULT_BULK_SYNC_COMMIT_LIMIT;
+        }
+    } else {
+        d->bulk_sync_interval_ms = 0;
+        d->bulk_unsynced_commits = 0;
+        d->bulk_last_sync_tick = GetTickCount64();
+    }
+    set_error(d, DB_ERROR_NONE,0,NULL);
+    return TRUE;
 }
 const DbError* db_last_error(Db* db_){
     DbImpl* d = (DbImpl*)db_;
@@ -1390,8 +1449,23 @@ BOOL db_commit_write_ex(Db* db_, BOOL force_sync){
     d->wtxn = NULL;
     if(rc==0){
         d->header_cache.map_size_bytes = db_current_mapsize(db_);
-        mdb_env_sync(d->env, force_sync ? 1 : 0);
         d->dirty = FALSE;
+
+        BOOL periodic_sync = db_should_sync(db_);
+        BOOL needs_sync = force_sync || !d->bulk_mode || periodic_sync;
+        if(needs_sync){
+            int sync_force = (force_sync || periodic_sync) ? 1 : 0;
+            int sync_rc = mdb_env_sync(d->env, sync_force);
+            if(sync_rc){
+                set_mdb_error(d, sync_rc);
+                return FALSE;
+            }
+            db_mark_synced(db_);
+        } else if(d->bulk_mode){
+            if(d->bulk_unsynced_commits < SIZE_MAX){
+                d->bulk_unsynced_commits++;
+            }
+        }
     }
     return rc==0;
 }

@@ -94,6 +94,7 @@ const DbHeader* db_header(Db* db);
 size_t db_current_mapsize(Db* db);
 size_t db_max_mapsize(Db* db);
 BOOL   db_set_mapsize(Db* db, size_t new_size_bytes);
+BOOL   db_set_bulk_mode(Db* db, BOOL enable, uint32_t sync_interval_seconds);
 const DbError* db_last_error(Db* db);
 size_t db_last_write_progress(Db* db);
 
