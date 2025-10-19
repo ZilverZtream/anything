@@ -257,20 +257,70 @@ void release_work_item(DbWorkItem* item){
     if(g_work_item_pool.initialized){
         DbWorkItem* start = g_work_item_pool.items;
         DbWorkItem* end = start ? start + g_work_item_pool.capacity : start;
-        BOOL from_pool = item >= start && item < end;
-        if(MPMC_Push(&g_work_item_pool.free_queue, item)){
+        DbWorkItem* candidate = item;
+        BOOL from_pool = candidate >= start && candidate < end;
+        if(MPMC_Push(&g_work_item_pool.free_queue, candidate)){
             return;
         }
         if(from_pool){
+            enum { WORK_ITEM_REQUEUE_SPIN_LIMIT = 1024, WORK_ITEM_DEFERRED_MAX = 128 };
+            DbWorkItem* deferred[WORK_ITEM_DEFERRED_MAX];
+            size_t deferred_count = 0;
             int tries = 0;
             while(g_work_item_pool.initialized){
-                if(MPMC_Push(&g_work_item_pool.free_queue, item)){
-                    return;
-                }
-                if(++tries > 1000){
+                if(MPMC_Push(&g_work_item_pool.free_queue, candidate)){
+                    if(deferred_count == 0){
+                        return;
+                    }
+                    candidate = deferred[--deferred_count];
                     tries = 0;
-                    Sleep(0);
+                    continue;
                 }
+                if(++tries >= WORK_ITEM_REQUEUE_SPIN_LIMIT){
+                    tries = 0;
+                    void* evicted_ptr = NULL;
+                    if(MPMC_Pop(&g_work_item_pool.free_queue, &evicted_ptr)){
+                        if(!evicted_ptr){
+                            continue;
+                        }
+                        DbWorkItem* evicted = (DbWorkItem*)evicted_ptr;
+                        BOOL evicted_from_pool = evicted >= start && evicted < end;
+                        if(evicted_from_pool){
+                            if(deferred_count < WORK_ITEM_DEFERRED_MAX){
+                                deferred[deferred_count++] = evicted;
+                            }else{
+                                // Defer list is full; retry pushing the evicted item immediately.
+                                while(g_work_item_pool.initialized && !MPMC_Push(&g_work_item_pool.free_queue, evicted)){
+                                    Sleep(0);
+                                }
+                            }
+                        }else{
+                            aligned_free(evicted);
+                        }
+                        continue;
+                    }
+                }
+                Sleep(0);
+            }
+            if(candidate >= start && candidate < end){
+                while(deferred_count > 0){
+                    DbWorkItem* deferred_item = deferred[--deferred_count];
+                    if(!g_work_item_pool.initialized){
+                        continue;
+                    }
+                    while(g_work_item_pool.initialized && !MPMC_Push(&g_work_item_pool.free_queue, deferred_item)){
+                        Sleep(0);
+                    }
+                }
+                return;
+            }
+            aligned_free(candidate);
+            while(deferred_count > 0){
+                DbWorkItem* deferred_item = deferred[--deferred_count];
+                if(deferred_item >= start && deferred_item < end){
+                    continue;
+                }
+                aligned_free(deferred_item);
             }
             return;
         }
