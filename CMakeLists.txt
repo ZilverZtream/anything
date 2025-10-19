@@ -63,6 +63,7 @@ list(REMOVE_ITEM ANYTHING_CORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/app/anyt
 # =============================================================================
 
 add_library(anything_core STATIC ${ANYTHING_CORE_SOURCES})
+set_target_properties(anything_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(WIN32)
     target_sources(anything_core PRIVATE ${PLATFORM_WIN_SOURCES})
