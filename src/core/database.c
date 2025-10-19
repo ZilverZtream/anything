@@ -2763,12 +2763,12 @@ static BOOL db_delete_record(DbImpl* d, uint64_t id, const DbRecord* r){
         }
     }
 
-    if(r->author_str_id){ MDB_val ak,av; to_mdb_val(&r->author_str_id, sizeof(r->author_str_id), &ak); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_author_index, &ak, &av); }
-    if(r->camera_str_id){ MDB_val ck,av; to_mdb_val(&r->camera_str_id, sizeof(r->camera_str_id), &ck); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_camera_index, &ck, &av); }
-    if(r->lens_str_id){ MDB_val lk,av; to_mdb_val(&r->lens_str_id, sizeof(r->lens_str_id), &lk); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_lens_index, &lk, &av); }
-    if(r->artist_str_id){ MDB_val ark,av; to_mdb_val(&r->artist_str_id, sizeof(r->artist_str_id), &ark); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_artist_index, &ark, &av); }
-    if(r->album_str_id){ MDB_val abk,av; to_mdb_val(&r->album_str_id, sizeof(r->album_str_id), &abk); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_album_index, &abk, &av); }
-    if(r->title_str_id){ MDB_val tk,av; to_mdb_val(&r->title_str_id, sizeof(r->title_str_id), &tk); to_mdb_val(&id, sizeof(id), &av); mdb_del(d->wtxn, d->dbi_title_index, &tk, &av); }
+    if(r->author_str_id){ MDB_val author_k,author_v; to_mdb_val(&r->author_str_id, sizeof(r->author_str_id), &author_k); to_mdb_val(&id, sizeof(id), &author_v); mdb_del(d->wtxn, d->dbi_author_index, &author_k, &author_v); }
+    if(r->camera_str_id){ MDB_val camera_k,camera_v; to_mdb_val(&r->camera_str_id, sizeof(r->camera_str_id), &camera_k); to_mdb_val(&id, sizeof(id), &camera_v); mdb_del(d->wtxn, d->dbi_camera_index, &camera_k, &camera_v); }
+    if(r->lens_str_id){ MDB_val lens_k,lens_v; to_mdb_val(&r->lens_str_id, sizeof(r->lens_str_id), &lens_k); to_mdb_val(&id, sizeof(id), &lens_v); mdb_del(d->wtxn, d->dbi_lens_index, &lens_k, &lens_v); }
+    if(r->artist_str_id){ MDB_val artist_k,artist_v; to_mdb_val(&r->artist_str_id, sizeof(r->artist_str_id), &artist_k); to_mdb_val(&id, sizeof(id), &artist_v); mdb_del(d->wtxn, d->dbi_artist_index, &artist_k, &artist_v); }
+    if(r->album_str_id){ MDB_val album_k,album_v; to_mdb_val(&r->album_str_id, sizeof(r->album_str_id), &album_k); to_mdb_val(&id, sizeof(id), &album_v); mdb_del(d->wtxn, d->dbi_album_index, &album_k, &album_v); }
+    if(r->title_str_id){ MDB_val title_k,title_v; to_mdb_val(&r->title_str_id, sizeof(r->title_str_id), &title_k); to_mdb_val(&id, sizeof(id), &title_v); mdb_del(d->wtxn, d->dbi_title_index, &title_k, &title_v); }
     return TRUE;
 }
 
