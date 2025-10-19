@@ -2539,6 +2539,24 @@ retry_batch:
         goto cleanup;
     }
 
+    if(d->dirty){
+        if(!db_commit_write_ex(db_, FALSE)){
+            result = FALSE;
+            goto cleanup;
+        }
+        if(!db_begin_write(db_)){
+            result = FALSE;
+            goto cleanup;
+        }
+        parent_txn = d->wtxn;
+        dirty_before = d->dirty;
+        header_before = d->header_cache;
+        bloom_offset_before = d->bloom_offset;
+        bloom_tail_before = (uint64_t)InterlockedCompareExchange64(&d->bloom_tail, 0, 0);
+        bloom_file_size_before = d->bloom_file_size;
+        bloom_committed_before = d->bloom_committed_tail;
+    }
+
     MDB_txn* batch_txn = NULL;
     int rc = mdb_txn_begin(d->env, parent_txn, 0, &batch_txn);
     if(rc){
