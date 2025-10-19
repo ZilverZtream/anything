@@ -28,6 +28,12 @@ extern "C" {
 typedef struct Db Db;
 typedef struct DbRecord DbRecord;
 typedef struct DbHeader DbHeader;
+typedef struct DbStringInternRequest {
+    const wchar_t* str;
+    BOOL           need_normalized;
+    uint64_t*      target;
+    uint64_t*      normalized_target;
+} DbStringInternRequest;
 typedef struct IndexState {
     uint64_t     last_usn;
     uint64_t     last_scan_time;
@@ -120,7 +126,12 @@ void db_intern_wstrings_batched(Db* db,
                                 size_t count,
                                 uint64_t* out_ids,
                                 uint64_t* out_normalized_ids);
-BOOL db_put_records(Db* db, const DbRecord* recs, size_t count);
+BOOL db_put_records(Db* db, DbRecord* recs, size_t count);
+BOOL db_put_records_with_strings(Db* db,
+                                 DbRecord* recs,
+                                 size_t count,
+                                 const DbStringInternRequest* strings,
+                                 size_t string_count);
 BOOL db_delete_path(Db* db, const wchar_t* parent, const wchar_t* name);
 BOOL db_get_record_by_path(Db* db, const wchar_t* parent, const wchar_t* name, DbRecord* out);
 

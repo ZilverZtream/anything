@@ -390,6 +390,7 @@ void live_updates_push_progress(uint64_t processed_count, BOOL done){
     }
 }
 
+#include "anything/database.h"
 #include "anything/metadata.h"
 
 // ---- MPMC queue implementation ----
@@ -1379,11 +1380,7 @@ static ContentResultItem* content_process_item(ContentWorkItem* wi, CancelToken*
     return result;
 }
 
-typedef struct BatchInternRequest {
-    wchar_t*   str;
-    uint64_t*  target;
-    uint64_t*  normalized_target;
-} BatchInternRequest;
+typedef DbStringInternRequest BatchInternRequest;
 
 static BOOL writer_add_intern_request(BatchInternRequest** reqs, size_t* count, size_t* capacity, wchar_t* str, uint64_t* target, uint64_t* normalized_target){
     if(!str || !target){
@@ -1403,6 +1400,7 @@ static BOOL writer_add_intern_request(BatchInternRequest** reqs, size_t* count, 
     (*reqs)[*count].str = str;
     (*reqs)[*count].target = target;
     (*reqs)[*count].normalized_target = normalized_target;
+    (*reqs)[*count].need_normalized = normalized_target != NULL;
     (*count)++;
     return TRUE;
 }
@@ -1411,7 +1409,7 @@ static void writer_release_intern_requests(BatchInternRequest* reqs, size_t coun
     if(!reqs) return;
     for(size_t i=0;i<count;i++){
         if(reqs[i].str){
-            free(reqs[i].str);
+            free((void*)reqs[i].str);
             reqs[i].str = NULL;
         }
     }
@@ -1927,62 +1925,6 @@ static BOOL writer_ensure_record_capacity(DbRecord** buf, size_t* capacity, size
     return TRUE;
 }
 
-static BOOL writer_resolve_intern_requests(WriterCtx* ctx, BatchInternRequest* reqs, size_t count){
-    if(!ctx || !reqs || count==0) return TRUE;
-    const wchar_t** strings = (const wchar_t**)malloc(sizeof(wchar_t*) * count);
-    uint8_t* needs_norm = (uint8_t*)malloc(sizeof(uint8_t) * count);
-    uint64_t* ids = (uint64_t*)malloc(sizeof(uint64_t) * count);
-    uint64_t* norm_ids = NULL;
-    BOOL any_norm = FALSE;
-    if(!strings || !ids || !needs_norm){
-        free(strings);
-        free(ids);
-        free(needs_norm);
-        writer_release_intern_requests(reqs, count);
-        return FALSE;
-    }
-    for(size_t i=0;i<count;i++){
-        strings[i] = reqs[i].str;
-        needs_norm[i] = (reqs[i].normalized_target != NULL) ? 1u : 0u;
-        if(needs_norm[i]) any_norm = TRUE;
-    }
-    if(any_norm){
-        norm_ids = (uint64_t*)malloc(sizeof(uint64_t) * count);
-        if(!norm_ids){
-            free(strings);
-            free(ids);
-            free(needs_norm);
-            writer_release_intern_requests(reqs, count);
-            return FALSE;
-        }
-    }
-    db_intern_wstrings_batched(ctx->db, strings, needs_norm, count, ids, norm_ids);
-    for(size_t i=0;i<count;i++){
-        if(reqs[i].target){
-            *(reqs[i].target) = ids[i];
-        }
-        if(reqs[i].normalized_target && norm_ids){
-            *(reqs[i].normalized_target) = norm_ids[i];
-        }
-    }
-    free(strings);
-    free(ids);
-    free(needs_norm);
-    if(norm_ids) free(norm_ids);
-    return TRUE;
-}
-
-static BOOL writer_finalize_batch(WriterCtx* ctx, BatchInternRequest* reqs, size_t* count){
-    if(!count) return TRUE;
-    size_t n = *count;
-    if(n == 0) return TRUE;
-    if(!writer_resolve_intern_requests(ctx, reqs, n)){
-        *count = 0;
-        return FALSE;
-    }
-    return TRUE;
-}
-
 // ---- Writer context & thread ----
 static void writer_queue_on_push(void* param){
     WriterCtx* ctx = (WriterCtx*)param;
@@ -1993,9 +1935,15 @@ static void writer_queue_on_push(void* param){
 static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch,
                                  BatchInternRequest* intern_requests, size_t intern_count){
     int bad_txn_retries = 0;
+    const DbStringInternRequest* db_strings = intern_count > 0
+                                             ? (const DbStringInternRequest*)intern_requests
+                                             : NULL;
+    size_t db_string_count = intern_count;
+    BOOL overall_success = FALSE;
     for(;;){
-        if(db_put_records(ctx->db, buf, in_batch)){
-            return TRUE;
+        if(db_put_records_with_strings(ctx->db, buf, in_batch, db_strings, db_string_count)){
+            overall_success = TRUE;
+            break;
         }
         const DbError* err = db_last_error(ctx->db);
         if(err->code == DB_ERROR_LMDB && err->detail == MDB_MAP_FULL){
@@ -2011,30 +1959,26 @@ static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch
             if(!db_set_mapsize(ctx->db, newsize)){
                 const DbError* serr = db_last_error(ctx->db);
                 fprintf(stderr, "db_set_mapsize failed: %s (code=%d)\n", serr->message, serr->detail);
-                return FALSE;
+                break;
             }
-            if(!db_begin_write(ctx->db)) return FALSE;
+            if(!db_begin_write(ctx->db)) break;
             ctx->grow_attempts++;
             continue; // retry put
         } else if(err->code == DB_ERROR_LMDB && err->detail == MDB_BAD_TXN && bad_txn_retries++ < 3){
             db_abort_write(ctx->db);
             db_string_cache_clear();
             if(!db_begin_write(ctx->db)){
-                return FALSE;
-            }
-            if(intern_count > 0){
-                if(!writer_resolve_intern_requests(ctx, intern_requests, intern_count)){
-                    return FALSE;
-                }
+                break;
             }
             continue; // retry after refreshing transaction
         } else {
             size_t progress = db_last_write_progress(ctx->db);
             fprintf(stderr, "db_put_records failed after %zu/%zu records: %s (code=%d)\n",
                     progress, in_batch, err->message, err->detail);
-            return FALSE;
+            break;
         }
     }
+    return overall_success;
 }
 
 static BOOL writer_backlog_push(WriterCtx* ctx, DbWorkItem* wi){
@@ -2555,10 +2499,6 @@ static DWORD WINAPI DbWriterThread(void* p){
         }
 
         if(in_batch >= (size_t)ctx->batch_size){
-            if(!writer_finalize_batch(ctx, intern_requests, &intern_count)){
-                success = FALSE;
-                goto cleanup;
-            }
             if(!put_batch_with_growth(ctx, buf, in_batch, intern_requests, intern_count)) { success = FALSE; goto cleanup; }
             if(!db_commit_write_ex(ctx->db, batch_requires_sync)) { success = FALSE; goto cleanup; }
             writer_release_intern_requests(intern_requests, intern_count);
@@ -2604,10 +2544,6 @@ static DWORD WINAPI DbWriterThread(void* p){
     }
 
     if(in_batch){
-        if(!writer_finalize_batch(ctx, intern_requests, &intern_count)){
-            success = FALSE;
-            goto cleanup;
-        }
         if(!put_batch_with_growth(ctx, buf, in_batch, intern_requests, intern_count)) { success = FALSE; goto cleanup; }
         if(!db_commit_write_ex(ctx->db, batch_requires_sync)) { success = FALSE; goto cleanup; }
         writer_release_intern_requests(intern_requests, intern_count);
