@@ -10,7 +10,7 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif
+#endif  // __cplusplus
 
 // configurable sort buffer size (default 256MB)
 extern size_t g_sort_buffer_size;
@@ -77,6 +77,6 @@ BOOL external_sort(const wchar_t* tmpdir, void* base, size_t n, size_t size,
                    int (*cmp)(const void*, const void*));
 
 #ifdef __cplusplus
-}
-#endif
-#endif
+}  // extern "C"
+#endif  // __cplusplus
+#endif  // UTIL_H
