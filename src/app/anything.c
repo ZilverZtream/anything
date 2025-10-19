@@ -557,7 +557,7 @@ static wchar_t* extract_with_filter(const wchar_t* path){
     size_t len = 0;
     bool success = false;
 
-    HRESULT hr = LoadIFilter(path, NULL, NULL, 0, 0, 0, &filter);
+    HRESULT hr = LoadIFilter(path, NULL, (IUnknown**)&filter);
     if(FAILED(hr)) goto cleanup;
 
 #ifdef __cplusplus
