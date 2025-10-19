@@ -15,7 +15,7 @@ typedef struct AnythingPlugin {
     const wchar_t* name;
     BOOL (*init)(const PluginHost* host);
     void (*scan)(void);
-    void (*shutdown)(void);
+    void (*plugin_shutdown)(void);
 } AnythingPlugin;
 
 typedef AnythingPlugin* (*Anything_GetPluginFn)(void);

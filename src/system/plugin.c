@@ -96,8 +96,8 @@ void Plugin_ScanAll(void){
 
 void Plugin_UnloadAll(void){
     for(size_t i=0;i<g_plugin_count;i++){
-        if(g_plugins[i].api->shutdown)
-            g_plugins[i].api->shutdown();
+        if(g_plugins[i].api->plugin_shutdown)
+            g_plugins[i].api->plugin_shutdown();
 #ifdef _WIN32
         FreeLibrary(g_plugins[i].module);
 #else
