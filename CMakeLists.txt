@@ -28,8 +28,11 @@ find_package(Tesseract CONFIG REQUIRED)
 find_package(unofficial-gumbo CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
-find_package(e2fsprogs CONFIG REQUIRED)
 find_package(libzip CONFIG REQUIRED)
+
+if(UNIX AND NOT APPLE)
+    find_package(e2fsprogs CONFIG REQUIRED)
+endif()
 
 
 # --- Define Public Include Directory ---
@@ -47,9 +50,9 @@ file(GLOB CORE_SYSTEM_SOURCES "src/system/*.c")
 file(GLOB CORE_ENTERPRISE_SOURCES "src/enterprise/*.c")
 file(GLOB SERVICE_SOURCES "src/services/*.c")
 file(GLOB UI_SOURCES "src/ui/*.cpp")
-file(GLOB PLATFORM_WIN_SOURCES "src/platform/ntfs.c" "src/platform/scanner_win.cpp" "src/platform/wsl.c")
+file(GLOB PLATFORM_WIN_SOURCES "src/platform/ntfs.c" "src/platform/scanner_win.cpp")
 file(GLOB PLATFORM_APPLE_SOURCES "src/platform/apfs.c" "src/platform/macvm.c" "src/platform/scanner_macos.c")
-file(GLOB PLATFORM_UNIX_SOURCES "src/platform/scanner_linux.c")
+file(GLOB PLATFORM_UNIX_SOURCES "src/platform/scanner_linux.c" "src/platform/wsl.c")
 
 # Group shared sources used by the main executable and plugins
 set(ANYTHING_CORE_SOURCES
@@ -81,9 +84,12 @@ target_link_libraries(anything_core PUBLIC
     LibArchive::LibArchive
     CURL::libcurl
     cjson
-    e2fsprogs::ext2fs
     libzip::zip
 )
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(anything_core PUBLIC e2fsprogs::ext2fs)
+endif()
 
 if(WIN32)
     target_link_libraries(anything_core PUBLIC Shlwapi.lib Ole32.lib Query.lib)
