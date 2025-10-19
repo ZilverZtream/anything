@@ -984,10 +984,38 @@ NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue
     USNScanner* s = (USNScanner*)calloc(1,sizeof(USNScanner));
     if(!s) return NULL;
     s->outq = outQueue; s->cancel = cancelToken;
-    wcscpy_s(s->volRoot, 8, volumeRoot);
-    volume_from_root(volumeRoot, s->volPrefix, 8);
+
+    size_t root_cch = sizeof(s->volRoot) / sizeof(s->volRoot[0]);
+    size_t prefix_cch = sizeof(s->volPrefix) / sizeof(s->volPrefix[0]);
+    if(wcscpy_s(s->volRoot, root_cch, volumeRoot) != 0){
+        free(s);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    if(!volume_from_root(volumeRoot, s->volPrefix, prefix_cch)){
+        free(s);
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+
     s->hVol = CreateFileW(s->volPrefix, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
-    if(s->hVol==INVALID_HANDLE_VALUE){ free(s); return NULL; }
+    if(s->hVol==INVALID_HANDLE_VALUE){
+        DWORD err = GetLastError();
+        free(s);
+        SetLastError(err);
+        return NULL;
+    }
+
+    DWORD bytes = 0;
+    USN_JOURNAL_DATA_V0 journal_info = {0};
+    if(!DeviceIoControl(s->hVol, FSCTL_QUERY_USN_JOURNAL, NULL, 0, &journal_info, sizeof(journal_info), &bytes, NULL)){
+        DWORD err = GetLastError();
+        CloseHandle(s->hVol);
+        free(s);
+        SetLastError(err);
+        return NULL;
+    }
+
     s->max_threads = threads > 0 ? threads : 1;
     uintptr_t h = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))usn_thread,s,0,NULL);
     s->thread = (HANDLE)h;
