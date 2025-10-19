@@ -942,7 +942,10 @@ static DWORD WINAPI usn_thread(void* p){
         usn_notify_start(s, FALSE, fatal_error);
         return 1;
     }
-    MFT_ENUM_DATA_V1 med = {0};
+    // Windows returns ERROR_INVALID_PARAMETER (87) if MinMajorVersion/MaxMajorVersion
+    // in MFT_ENUM_DATA_V1 are left unset on some systems. We only need the fields
+    // shared with V0, so use the older structure for broader compatibility.
+    MFT_ENUM_DATA_V0 med = {0};
     med.StartFileReferenceNumber = 0;
     if(s->journal_info_valid){
         med.LowUsn = s->journal_info.FirstUsn;
