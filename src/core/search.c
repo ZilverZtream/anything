@@ -284,6 +284,12 @@ typedef struct {
     uint8_t  stage;        // 0=name,1=meta,2=content
 } ProgHit; // consumer must free instances popped from ps->out
 
+typedef enum {
+    CACHE_KIND_QUERY = 0,
+    CACHE_KIND_TERM  = 1,
+    CACHE_KIND_STAGE = 2,
+} CacheKind;
+
 typedef struct {
     CRITICAL_SECTION mu;
     IdMap best;            // rec_id -> (stage<<8)|confidence
@@ -929,7 +935,7 @@ static int cmp_u32(const void* a, const void* b){
     return ua < ub ? -1 : (ua > ub);
 }
 
-static void sort_unique(uint32_t* ids, size_t* n){
+static void sort_unique_u32(uint32_t* ids, size_t* n){
     if(!ids || *n==0) return;
     qsort(ids, *n, sizeof(uint32_t), cmp_u32);
     size_t w=0; uint32_t prev=0;
@@ -958,7 +964,7 @@ static void results_to_ids(const SearchStageResult* res, size_t n, uint32_t** ou
     uint32_t* ids=(uint32_t*)malloc(n*sizeof(uint32_t));
     if(!ids){ *out_ids=NULL; *out_n=0; return; }
     for(size_t i=0;i<n;i++) ids[i]=(uint32_t)res[i].dummy;
-    *out_ids = ids; *out_n = n; sort_unique(*out_ids, out_n);
+    *out_ids = ids; *out_n = n; sort_unique_u32(*out_ids, out_n);
 }
 
 #define INTERSECT_EAGER_MAX 100000u
@@ -1173,12 +1179,6 @@ static void free_search_query(SearchQuery* q){
 
 // Result cache — last query & rec_ids
 #define CACHE_VERSION 3
-
-typedef enum {
-    CACHE_KIND_QUERY = 0,
-    CACHE_KIND_TERM  = 1,
-    CACHE_KIND_STAGE = 2,
-} CacheKind;
 
 typedef struct {
     uint32_t magic;
