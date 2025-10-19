@@ -44,6 +44,28 @@ typedef struct {
     uint8_t bytes[3];
 } uint24_t;
 
+#define STRING_META_MAGIC0 'B'
+#define STRING_META_MAGIC1 'F'
+
+typedef struct {
+    uint32_t trigram_count;
+    uint8_t  hash_count;
+    uint8_t  bloom_log2;
+    uint8_t  magic0;
+    uint8_t  magic1;
+    uint64_t bloom_offset;
+    uint32_t bloom_length;
+    uint8_t  bloom_pending;
+    uint8_t  _reserved[3];
+} StringMeta;
+
+typedef struct {
+    uint64_t   string_id;
+    StringMeta new_meta;
+    uint8_t*   bloom_data;
+    size_t     bloom_data_len;
+} BloomResultItem;
+
 typedef struct CompressedTrigram {
     uint24_t trigram;          // packed 24-bit trigram
     uint32_t string_id_count;  // number of encoded deltas
@@ -85,6 +107,18 @@ void db_abort_write(Db* db);
 BOOL db_get_index_state(Db* db, IndexState* out);
 BOOL db_set_index_state(Db* db, const IndexState* st);
 BOOL db_compress(Db* db, const wchar_t* out_path);
+
+// Internal helpers exposed for lazy bloom generation.
+BOOL db_string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta_out, BOOL* has_meta);
+BOOL db_generate_bloom_blob(const char* text_utf8, size_t text_len, StringMeta* meta_out, uint8_t** bloom_data_out, size_t* bloom_len_out);
+BOOL db_apply_generated_bloom(Db* db, const BloomResultItem* result);
+
+extern MPMCQueue g_bloom_gen_queue;
+extern MPMCQueue g_bloom_completion_queue;
+
+void bloom_generator_init(const wchar_t* dbPath);
+void bloom_generator_shutdown(void);
+void bloom_generator_request(uint64_t string_id);
 
 BOOL db_get_compressed_trigram(Db* db, uint32_t trigram, CompressedTrigram* out);
 void db_free_compressed_trigram(CompressedTrigram* ct);

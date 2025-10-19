@@ -28,20 +28,7 @@ static void make_temp_dir(wchar_t* out, size_t outsz){
     mbstowcs(out, dir, outsz);
 }
 
-typedef struct {
-    uint32_t trigram_count;
-    uint8_t  hash_count;
-    uint8_t  bloom_log2;
-    uint8_t  magic0;
-    uint8_t  magic1;
-    uint64_t bloom_offset;
-    uint32_t bloom_length;
-} TestStringMeta;
-
-#define STRING_META_MAGIC0 'B'
-#define STRING_META_MAGIC1 'F'
-
-static int read_string_meta(const wchar_t* path, uint64_t id, TestStringMeta* out){
+static int read_string_meta(const wchar_t* path, uint64_t id, StringMeta* out){
     MDB_env* env = NULL;
     if(mdb_env_create(&env) != 0) return 0;
     mdb_env_set_maxdbs(env, 32);
@@ -61,11 +48,11 @@ static int read_string_meta(const wchar_t* path, uint64_t id, TestStringMeta* ou
     MDB_val val;
     int rc = mdb_get(txn, dbi, &key, &val);
     int ok = 0;
-    if(rc == 0 && val.mv_size >= sizeof(TestStringMeta)){
-        const uint8_t* base = (const uint8_t*)val.mv_data;
-        const TestStringMeta* sm = (const TestStringMeta*)(base + val.mv_size - sizeof(TestStringMeta));
-        if(sm->magic0 == STRING_META_MAGIC0 && sm->magic1 == STRING_META_MAGIC1){
-            if(out) *out = *sm;
+    if(rc == 0){
+        MDB_val text;
+        StringMeta meta;
+        if(db_string_value_parse(&val, &text, &meta, NULL)){
+            if(out) *out = meta;
             ok = 1;
         }
     }
@@ -182,7 +169,7 @@ static void test_bloom_meta_sizes(){
         assert(db_put_records(db, &rec, 1));
         assert(db_commit_write(db));
 
-        TestStringMeta meta;
+        StringMeta meta;
         assert(read_string_meta(path, name_id, &meta));
         assert(meta.trigram_count >= (uint32_t)((len >= 3) ? (len - 2) : 0));
         assert(meta.hash_count == cases[i].expected_hash);

@@ -150,6 +150,15 @@ static int WideCharToMultiByte(unsigned int cp, unsigned int flags, const wchar_
 #endif
 
 static MPMCQueue g_live_updates;
+MPMCQueue g_bloom_gen_queue;
+MPMCQueue g_bloom_completion_queue;
+#ifdef _WIN32
+static HANDLE g_bloom_generator_thread = NULL;
+#else
+static pthread_t g_bloom_generator_thread = 0;
+#endif
+static volatile BOOL g_bloom_shutdown = FALSE;
+static wchar_t g_bloom_db_path[MAX_LONG_PATH];
 static BOOL g_live_inited = FALSE;
 static WorkItemPool g_work_item_pool = {0};
 
@@ -1353,6 +1362,197 @@ static BOOL writer_apply_content_result(WriterCtx* ctx,
     return TRUE;
 }
 
+#ifdef _WIN32
+static unsigned __stdcall BloomGeneratorThread(void* param){
+#else
+static void* BloomGeneratorThread(void* param){
+#endif
+    (void)param;
+    MDB_env* env = NULL;
+    if(mdb_env_create(&env) != 0){
+        return 0;
+    }
+    mdb_env_set_maxdbs(env, 64);
+    char utf8[MAX_PATH * 3];
+    to_utf8(g_bloom_db_path, utf8, sizeof(utf8));
+    if(mdb_env_open(env, utf8, MDB_RDONLY, 0664) != 0){
+        mdb_env_close(env);
+        return 0;
+    }
+
+    MDB_txn* txn = NULL;
+    MDB_dbi dbi_strings = 0;
+    if(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn) != 0){
+        mdb_env_close(env);
+        return 0;
+    }
+    if(mdb_dbi_open(txn, "strings", 0, &dbi_strings) != 0){
+        mdb_txn_abort(txn);
+        mdb_env_close(env);
+        return 0;
+    }
+    mdb_txn_commit(txn);
+    txn = NULL;
+
+    while(!g_bloom_shutdown){
+        void* item_ptr = NULL;
+        if(!MPMC_Pop(&g_bloom_gen_queue, &item_ptr)){
+            Sleep(100);
+            continue;
+        }
+        uint64_t string_id = (uint64_t)(uintptr_t)item_ptr;
+        if(string_id == 0) continue;
+
+        if(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn) != 0){
+            Sleep(10);
+            continue;
+        }
+        MDB_val key = {.mv_data = &string_id, .mv_size = sizeof(string_id)};
+        MDB_val val;
+        int rc = mdb_get(txn, dbi_strings, &key, &val);
+        if(rc != 0){
+            mdb_txn_abort(txn);
+            txn = NULL;
+            continue;
+        }
+        MDB_val text_val;
+        StringMeta current_meta;
+        db_string_value_parse(&val, &text_val, &current_meta, NULL);
+        size_t text_len = text_val.mv_size;
+        if(text_len < 5){
+            mdb_txn_abort(txn);
+            txn = NULL;
+            continue;
+        }
+        char* text_copy = (char*)malloc(text_len + 1);
+        if(!text_copy){
+            mdb_txn_abort(txn);
+            txn = NULL;
+            continue;
+        }
+        memcpy(text_copy, text_val.mv_data, text_len);
+        text_copy[text_len] = '\0';
+        mdb_txn_abort(txn);
+        txn = NULL;
+
+        uint8_t* bloom_data = NULL;
+        size_t bloom_len = 0;
+        StringMeta new_meta;
+        if(!db_generate_bloom_blob(text_copy, text_len, &new_meta, &bloom_data, &bloom_len)){
+            free(text_copy);
+            if(bloom_data) free(bloom_data);
+            continue;
+        }
+        free(text_copy);
+
+        BloomResultItem* result = (BloomResultItem*)malloc(sizeof(BloomResultItem));
+        if(!result){
+            if(bloom_data) free(bloom_data);
+            continue;
+        }
+        result->string_id = string_id;
+        result->new_meta = new_meta;
+        result->bloom_data = bloom_data;
+        result->bloom_data_len = bloom_len;
+
+        while(!MPMC_Push(&g_bloom_completion_queue, result)){
+            if(g_bloom_shutdown) break;
+            Sleep(1);
+        }
+    }
+
+    if(txn) mdb_txn_abort(txn);
+    if(env) mdb_env_close(env);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+void bloom_generator_init(const wchar_t* dbPath){
+    if(!dbPath) return;
+    if(g_bloom_generator_thread) return;
+    wcscpy_s(g_bloom_db_path, MAX_LONG_PATH, dbPath);
+    if(!MPMC_Init(&g_bloom_gen_queue, 1 << 12)) return;
+    if(!MPMC_Init(&g_bloom_completion_queue, 1 << 12)){
+        MPMC_Destroy(&g_bloom_gen_queue);
+        return;
+    }
+    g_bloom_shutdown = FALSE;
+#ifdef _WIN32
+    uintptr_t thread_handle = _beginthreadex(NULL, 0, BloomGeneratorThread, NULL, 0, NULL);
+    if(thread_handle == 0){
+        MPMC_Destroy(&g_bloom_gen_queue);
+        MPMC_Destroy(&g_bloom_completion_queue);
+        return;
+    }
+    g_bloom_generator_thread = (HANDLE)thread_handle;
+#else
+    if(pthread_create(&g_bloom_generator_thread, NULL, BloomGeneratorThread, NULL) != 0){
+        g_bloom_generator_thread = 0;
+        MPMC_Destroy(&g_bloom_gen_queue);
+        MPMC_Destroy(&g_bloom_completion_queue);
+        return;
+    }
+#endif
+}
+
+void bloom_generator_shutdown(void){
+    g_bloom_shutdown = TRUE;
+#ifdef _WIN32
+    if(g_bloom_generator_thread){
+        WaitForSingleObject(g_bloom_generator_thread, INFINITE);
+        CloseHandle(g_bloom_generator_thread);
+        g_bloom_generator_thread = NULL;
+    }
+#else
+    if(g_bloom_generator_thread){
+        pthread_join(g_bloom_generator_thread, NULL);
+        g_bloom_generator_thread = 0;
+    }
+#endif
+    void* item = NULL;
+    while(MPMC_Pop(&g_bloom_completion_queue, &item)){
+        BloomResultItem* result = (BloomResultItem*)item;
+        if(result){
+            if(result->bloom_data) free(result->bloom_data);
+            free(result);
+        }
+    }
+    while(MPMC_Pop(&g_bloom_gen_queue, &item)){
+        // discard
+    }
+    MPMC_Destroy(&g_bloom_gen_queue);
+    MPMC_Destroy(&g_bloom_completion_queue);
+}
+
+void bloom_generator_request(uint64_t string_id){
+#ifdef _WIN32
+    if(!g_bloom_generator_thread || string_id == 0) return;
+#else
+    if(g_bloom_generator_thread == 0 || string_id == 0) return;
+#endif
+    MPMC_Push(&g_bloom_gen_queue, (void*)(uintptr_t)string_id);
+}
+
+static BOOL writer_drain_bloom_results(WriterCtx* ctx){
+    if(!ctx) return TRUE;
+    void* completed_ptr = NULL;
+    while(MPMC_Pop(&g_bloom_completion_queue, &completed_ptr)){
+        BloomResultItem* result = (BloomResultItem*)completed_ptr;
+        if(!result) continue;
+        if(!db_apply_generated_bloom(ctx->db, result)){
+            if(result->bloom_data) free(result->bloom_data);
+            free(result);
+            return FALSE;
+        }
+        if(result->bloom_data) free(result->bloom_data);
+        free(result);
+    }
+    return TRUE;
+}
+
 static BOOL writer_process_content_results(WriterCtx* ctx,
                                            DbRecord** buf,
                                            size_t* buf_capacity,
@@ -2079,6 +2279,10 @@ static DWORD WINAPI DbWriterThread(void* p){
     BOOL success = TRUE;
 
     for(;;){
+        if(!writer_drain_bloom_results(ctx)){
+            success = FALSE;
+            goto cleanup;
+        }
         writer_drain_backlog(ctx);
         if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
                                            &intern_requests, &intern_count, &intern_capacity)){
@@ -2301,10 +2505,18 @@ static DWORD WINAPI DbWriterThread(void* p){
                 success = FALSE;
                 goto cleanup;
             }
+            if(!writer_drain_bloom_results(ctx)){
+                success = FALSE;
+                goto cleanup;
+            }
             Sleep(1);
         }
         if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
                                            &intern_requests, &intern_count, &intern_capacity)){
+            success = FALSE;
+            goto cleanup;
+        }
+        if(!writer_drain_bloom_results(ctx)){
             success = FALSE;
             goto cleanup;
         }
@@ -2322,6 +2534,11 @@ static DWORD WINAPI DbWriterThread(void* p){
         writer_release_intern_requests(intern_requests, intern_count);
         intern_count = 0;
         db_commit_write_ex(ctx->db, batch_requires_sync);
+    }
+
+    if(!writer_drain_bloom_results(ctx)){
+        success = FALSE;
+        goto cleanup;
     }
 
 cleanup:
@@ -2474,8 +2691,19 @@ int wmain(int argc, wchar_t** argv){
     ctx.push_timeout_ms = computed_timeout;
     PluginHost ph = { &ctx.queue, &ctx.cancel };
     Plugin_LoadAll(L"plugins", &ph);
+    bloom_generator_init(args.dbPath);
     uintptr_t wh = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))DbWriterThread,&ctx,0,NULL);
     HANDLE writer = (HANDLE)wh;
+    if(!writer){
+        fwprintf(stderr, L"Failed to start DbWriterThread\n");
+        bloom_generator_shutdown();
+        writer_signal_destroy(&ctx.data_signal);
+        MPMC_Destroy(&ctx.queue);
+        work_item_pool_destroy();
+        Plugin_UnloadAll();
+        db_close(db);
+        return 1;
+    }
 
     HANDLE drive_threads[26]; int drive_count=0;
     // Incremental index state
@@ -2557,6 +2785,7 @@ int wmain(int argc, wchar_t** argv){
     }
     writer_signal_destroy(&ctx.data_signal);
     Plugin_UnloadAll();
+    bloom_generator_shutdown();
     db_close(db);
     MPMC_Destroy(&ctx.queue);
     work_item_pool_destroy();
