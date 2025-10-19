@@ -262,6 +262,27 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
     }
 }
 
+void db_string_cache_clear(void){
+    for(size_t partition = 0; partition < CACHE_PARTITIONS; ++partition){
+        size_t partition_cap = string_cache_partition_capacity(partition);
+        if(partition_cap == 0) continue;
+        if(partition_cap > PARTITION_STRIDE) partition_cap = PARTITION_STRIDE;
+        StringCache* cache = g_string_cache[partition];
+        for(size_t i = 0; i < partition_cap; ++i){
+            StringCache* entry = &cache[i];
+            char* str = (char*)InterlockedExchangePointer((PVOID*)&entry->string, NULL);
+            if(str && str != STRING_CACHE_BUSY){
+                free(str);
+            }
+            entry->hash = 0;
+            InterlockedExchange64(&entry->stamp, 0);
+            InterlockedExchange((volatile LONG*)&entry->hot, 0);
+            InterlockedExchange((volatile LONG*)&entry->string_id, 0);
+        }
+    }
+    InterlockedExchange64(&g_string_cache_clock, 0);
+}
+
 #define PARENT_CACHE_PARTITIONS 64u
 #define PARENT_CACHE_SLOTS 256u
 
