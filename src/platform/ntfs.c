@@ -1084,7 +1084,7 @@ static DWORD WINAPI tail_thread(void* p){
                         // full is \?\C:\Dir\Name — split into parent/name
                         wchar_t parent[MAX_LONG_PATH]; wcscpy_s(parent, MAX_LONG_PATH, full);
                         if(wcsncmp(parent, L"\\\\?\\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
-                        wchar_t* p = wcsrchr(parent, L'\'); if(p){ *p=0; }
+                        wchar_t* p = wcsrchr(parent, L'\\'); if(p){ *p=0; }
                         DbWorkItem* wi = acquire_work_item();
                         if(!wi){
                             continue;
