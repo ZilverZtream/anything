@@ -28,8 +28,12 @@ static inline Result result_success(void* data){
 static inline Result result_error(ResultCode code, const char* msg){
     Result r; r.code = code; r.data = NULL;
     if(msg){
+#if defined(_MSC_VER)
+        strncpy_s(r.message, sizeof(r.message), msg, _TRUNCATE);
+#else
         strncpy(r.message, msg, sizeof(r.message)-1);
         r.message[sizeof(r.message)-1] = '\0';
+#endif
     } else {
         r.message[0] = '\0';
     }

@@ -895,7 +895,11 @@ BOOL db_generate_bloom_blob(const char* text_utf8, size_t text_len, StringMeta* 
     }
     memcpy(copy, out_data, out_len);
 
-    meta_out->hash_count = ctx.hash_count;
+    uint32_t hash_count = ctx.hash_count;
+    if(hash_count > UINT8_MAX){
+        hash_count = UINT8_MAX;
+    }
+    meta_out->hash_count = (uint8_t)hash_count;
     meta_out->bloom_log2 = bloom_bytes_to_log2(bloom_bytes);
     meta_out->bloom_length = (uint32_t)out_len;
     meta_out->bloom_offset = 0;
@@ -1780,6 +1784,8 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, c
     InternHashEntry* norm_table = NULL;
     char* norm_storage = NULL;
     uint8_t* arena = NULL;
+    MDB_txn* rtxn = NULL;
+    BOOL need_abort = FALSE;
     size_t task_count = 0;
     size_t unique_count = 0;
     size_t norm_unique_count = 0;
@@ -1925,8 +1931,8 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, c
         InternTask* t = unique[i];
         t->id = string_cache_lookup(t->utf8, t->utf8_hash);
     }
-    MDB_txn* rtxn = d->wtxn ? d->wtxn : NULL;
-    BOOL need_abort = FALSE;
+    rtxn = d->wtxn ? d->wtxn : NULL;
+    need_abort = FALSE;
     if(!rtxn){
         int rc = mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn);
         if(rc == 0){

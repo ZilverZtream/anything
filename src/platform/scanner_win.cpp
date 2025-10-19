@@ -140,13 +140,13 @@ wchar_t* GenerateThumbnail(const wchar_t* path){
         return NULL;
     }
     IShellItemImageFactory* factory = NULL;
-    if(FAILED(SHCreateItemFromParsingName(path, NULL, &IID_IShellItemImageFactory, (void**)&factory))){
+    if(FAILED(SHCreateItemFromParsingName(path, NULL, IID_PPV_ARGS(&factory)))){
         return NULL;
     }
     SIZE sz = {256,256};
     HBITMAP hbmp;
-    HRESULT hr = factory->lpVtbl->GetImage(factory, sz, SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT, &hbmp);
-    factory->lpVtbl->Release(factory);
+    HRESULT hr = factory->GetImage(sz, SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT, &hbmp);
+    factory->Release();
     if(FAILED(hr)){
         return NULL;
     }
