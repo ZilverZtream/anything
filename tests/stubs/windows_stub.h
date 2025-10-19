@@ -1,5 +1,5 @@
-#ifndef WINDOWS_H
-#define WINDOWS_H
+#ifndef WINDOWS_STUB_H
+#define WINDOWS_STUB_H
 #include <stdint.h>
 #include <stdlib.h>
 #include <wchar.h>
