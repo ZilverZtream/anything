@@ -29,7 +29,24 @@ find_package(unofficial-gumbo CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(libzip CONFIG REQUIRED)
-find_package(libpst-dev REQUIRED)
+
+set(LIBPST_IMPORTED_TARGET "")
+
+if(UNIX)
+    find_package(libpst-dev CONFIG QUIET)
+
+    if(TARGET libpst-dev::libpst)
+        set(LIBPST_IMPORTED_TARGET libpst-dev::libpst)
+    else()
+        find_package(libpst CONFIG QUIET)
+
+        if(TARGET libpst::libpst)
+            set(LIBPST_IMPORTED_TARGET libpst::libpst)
+        else()
+            message(FATAL_ERROR "Required libpst-dev package (libpst) not found")
+        endif()
+    endif()
+endif()
 
 if(UNIX AND NOT APPLE)
     find_package(e2fsprogs CONFIG REQUIRED)
@@ -87,8 +104,8 @@ target_link_libraries(anything_core PUBLIC
     libzip::zip
 )
 
-if(UNIX)
-    target_link_libraries(anything_core PUBLIC libpst::libpst)
+if(LIBPST_IMPORTED_TARGET)
+    target_link_libraries(anything_core PUBLIC ${LIBPST_IMPORTED_TARGET})
 endif()
 
 if(UNIX AND NOT APPLE)
@@ -118,10 +135,11 @@ add_executable(search_test "tests/search_test.c")
 # Link Libraries to Executables
 # =============================================================================
 
-target_link_libraries(anything PRIVATE
-    anything_core
-    libpst::libpst
-)
+target_link_libraries(anything PRIVATE anything_core)
+
+if(LIBPST_IMPORTED_TARGET)
+    target_link_libraries(anything PRIVATE ${LIBPST_IMPORTED_TARGET})
+endif()
 
 target_link_libraries(anything_ui PRIVATE
     anything_core
