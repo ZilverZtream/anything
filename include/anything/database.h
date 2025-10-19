@@ -113,6 +113,12 @@ BOOL db_get_compressed_trigram(Db* db, uint32_t trigram, CompressedTrigram* out)
 void db_free_compressed_trigram(CompressedTrigram* ct);
 
 uint64_t db_intern_wstring(Db* db, const wchar_t* s);
+void db_intern_wstrings_batched(Db* db,
+                                const wchar_t* const* strings,
+                                const uint8_t* need_normalized_flags,
+                                size_t count,
+                                uint64_t* out_ids,
+                                uint64_t* out_normalized_ids);
 BOOL db_put_records(Db* db, const DbRecord* recs, size_t count);
 BOOL db_delete_path(Db* db, const wchar_t* parent, const wchar_t* name);
 BOOL db_get_record_by_path(Db* db, const wchar_t* parent, const wchar_t* name, DbRecord* out);

@@ -71,6 +71,7 @@ set(ANYTHING_CORE_SOURCES
 # =============================================================================
 
 add_library(anything_core STATIC ${ANYTHING_CORE_SOURCES})
+target_sources(anything_core PRIVATE src/app/config.c)
 
 if(WIN32)
     target_sources(anything_core PRIVATE ${PLATFORM_WIN_SOURCES})
