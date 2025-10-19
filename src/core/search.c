@@ -50,6 +50,10 @@ static CRITICAL_SECTION g_bloom_cache_mu;
 static wchar_t g_db_path[MAX_LONG_PATH]={0};
 static uint64_t g_db_generation = 0;
 
+static void save_stage_cache(int stage, const SearchQuery* q, const IdVec* ids);
+static void save_term_cache(TermType ttype, const char* term, const IdVec* ids);
+static void sort_unique(IdVec* v);
+
 static inline size_t bloom_log2_to_bytes(uint8_t log2){
     if(log2 >= 8 && log2 <= 20){
         return (size_t)1u << log2;

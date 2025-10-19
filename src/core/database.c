@@ -100,6 +100,15 @@ typedef struct {
 #define PARTITION_STRIDE 512u
 #define PARTITION_MASK (PARTITION_STRIDE - 1u)
 
+static const size_t BLOOM_BUFFER_CHUNK = 1u << 20; // 1 MB
+
+static size_t bloom_packbits_compress(const uint8_t* src, size_t len, uint8_t* dst, size_t dst_cap);
+static inline void bloom_set(uint8_t* bloom, uint32_t h, uint32_t mask);
+static inline BOOL bloom_has(const uint8_t* bloom, uint32_t h, uint32_t mask);
+static void set_error(DbImpl* d, DbErrorCode code, int detail, const char* msg);
+static void set_mdb_error(DbImpl* d, int rc);
+static void set_sys_error(DbImpl* d, DWORD err);
+
 static inline size_t string_cache_partition_capacity(size_t partition){
     size_t cap = CACHE_PARTITION_BASE;
     if(partition < CACHE_PARTITION_REMAINDER){
@@ -1271,8 +1280,6 @@ uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom){
 
 
 #define ALIGN_UP(x,a)   (((x)+(a)-1) & ~((a)-1))
-
-static const size_t BLOOM_BUFFER_CHUNK = 1u << 20; // 1 MB
 
 static const size_t DEFAULT_BULK_SYNC_COMMIT_LIMIT = 4096;
 
