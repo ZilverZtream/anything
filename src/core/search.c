@@ -54,7 +54,10 @@ static CRITICAL_SECTION g_bloom_cache_mu;
 static wchar_t g_db_path[MAX_LONG_PATH]={0};
 static uint64_t g_db_generation = 0;
 
+static BOOL bloom_packbits_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_len);
+static BOOL load_stage_cache(int stage, const SearchQuery* q, IdVec* out);
 static void save_stage_cache(int stage, const SearchQuery* q, const IdVec* ids);
+static BOOL try_load_term_cache(TermType ttype, const char* term, IdVec* out);
 static void save_term_cache(TermType ttype, const char* term, const IdVec* ids);
 static void sort_unique(IdVec* v);
 
@@ -297,6 +300,9 @@ typedef enum {
     CACHE_KIND_TERM  = 1,
     CACHE_KIND_STAGE = 2,
 } CacheKind;
+
+static BOOL try_load_cache_internal(const wchar_t* dbPath, const char* key, CacheKind kind, uint16_t tag, IdVec* out);
+static BOOL save_cache_internal(const wchar_t* dbPath, const char* key, CacheKind kind, uint16_t tag, const IdVec* ids);
 
 typedef struct {
     CRITICAL_SECTION mu;
@@ -1082,7 +1088,7 @@ static int set_indexer_state(const wchar_t* dbPath, bool start, bool json){
         memcpy(&st, v.mv_data, sizeof(st));
     }
     st.indexing_level = start ? INDEX_FULL_CONTENT : 0;
-    MDB_val nv={.mv_data=&st,.mv_size=sizeof(st)};
+    MDB_val nv={.mv_data=(void*)&st,.mv_size=sizeof(st)};
     if(mdb_put(txn, dbi_meta, &k, &nv, 0)!=0){ mdb_txn_abort(txn); mdb_env_close(env); output_error(json, "set index state failed"); return 1; }
     mdb_txn_commit(txn);
     mdb_env_close(env);
@@ -2006,14 +2012,14 @@ static DWORD WINAPI filter_worker_thread(void* p){
         }
         processed++;
         uint64_t rid = a->ids[i];
-        MDB_val rk={.mv_data=&rid,.mv_size=sizeof(rid)}, rv;
+        MDB_val rk={.mv_data=(void*)&rid,.mv_size=sizeof(rid)}, rv;
         if(mdb_get(txn, dbi_records, &rk, &rv)!=0 || rv.mv_size<sizeof(DbRecord)) continue;
         DbRecord* r = (DbRecord*)rv.mv_data;
         if(r->file_size < a->q->size_min || r->file_size > a->q->size_max) continue;
         uint64_t day = filetime_days(r->modified_time);
         if(day < a->q->date_min_day || day > a->q->date_max_day) continue;
-        MDB_val pk={.mv_data=&r->parent_str_id,.mv_size=sizeof(r->parent_str_id)}, pv;
-        MDB_val nk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, nv;
+        MDB_val pk={.mv_data=(void*)&r->parent_str_id,.mv_size=sizeof(r->parent_str_id)}, pv;
+        MDB_val nk={.mv_data=(void*)&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, nv;
         char* parent = NULL;
         char* name = NULL;
         size_t parent_needed = 0;
@@ -2101,7 +2107,7 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         if(ex) fname_score += 2.0f; else if(pr) fname_score += 1.0f;
     }
     if(q->content_pattern && r->content_str_id){
-        MDB_val ck={.mv_data=&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, cv;
+        MDB_val ck={.mv_data=(void*)&r->content_str_id,.mv_size=sizeof(r->content_str_id)}, cv;
         if(mdb_get(txn, dbi_strings, &ck, &cv)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&cv, &text_val, &meta);
@@ -2118,7 +2124,7 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         }
     }
     if(q->author_pattern && r->author_str_id){
-        MDB_val ak={.mv_data=&r->author_str_id,.mv_size=sizeof(r->author_str_id)}, av;
+        MDB_val ak={.mv_data=(void*)&r->author_str_id,.mv_size=sizeof(r->author_str_id)}, av;
         if(mdb_get(txn, dbi_strings, &ak, &av)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&av, &text_val, &meta);
@@ -2132,7 +2138,7 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         }
     }
     if(q->camera_pattern && r->camera_str_id){
-        MDB_val ck={.mv_data=&r->camera_str_id,.mv_size=sizeof(r->camera_str_id)}, cv;
+        MDB_val ck={.mv_data=(void*)&r->camera_str_id,.mv_size=sizeof(r->camera_str_id)}, cv;
         if(mdb_get(txn, dbi_strings, &ck, &cv)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&cv, &text_val, &meta);
@@ -2146,7 +2152,7 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         }
     }
     if(q->lens_pattern && r->lens_str_id){
-        MDB_val lk={.mv_data=&r->lens_str_id,.mv_size=sizeof(r->lens_str_id)}, lv;
+        MDB_val lk={.mv_data=(void*)&r->lens_str_id,.mv_size=sizeof(r->lens_str_id)}, lv;
         if(mdb_get(txn, dbi_strings, &lk, &lv)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&lv, &text_val, &meta);
@@ -2160,7 +2166,7 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         }
     }
     if(q->artist_pattern && r->artist_str_id){
-        MDB_val ark={.mv_data=&r->artist_str_id,.mv_size=sizeof(r->artist_str_id)}, av2;
+        MDB_val ark={.mv_data=(void*)&r->artist_str_id,.mv_size=sizeof(r->artist_str_id)}, av2;
         if(mdb_get(txn, dbi_strings, &ark, &av2)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&av2, &text_val, &meta);
@@ -2174,7 +2180,7 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         }
     }
     if(q->album_pattern && r->album_str_id){
-        MDB_val abk={.mv_data=&r->album_str_id,.mv_size=sizeof(r->album_str_id)}, abv;
+        MDB_val abk={.mv_data=(void*)&r->album_str_id,.mv_size=sizeof(r->album_str_id)}, abv;
         if(mdb_get(txn, dbi_strings, &abk, &abv)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&abv, &text_val, &meta);
@@ -2188,7 +2194,7 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         }
     }
     if(q->title_pattern && r->title_str_id){
-        MDB_val tk={.mv_data=&r->title_str_id,.mv_size=sizeof(r->title_str_id)}, tv;
+        MDB_val tk={.mv_data=(void*)&r->title_str_id,.mv_size=sizeof(r->title_str_id)}, tv;
         if(mdb_get(txn, dbi_strings, &tk, &tv)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&tv, &text_val, &meta);
@@ -2242,6 +2248,17 @@ static int cpu_has_avx2(void){
     return 0;
 #endif
 }
+#if defined(__AVX2__)
+static int count_trailing_zeros_u32(unsigned int mask){
+#if defined(_MSC_VER)
+    unsigned long idx;
+    _BitScanForward(&idx, mask);
+    return (int)idx;
+#else
+    return __builtin_ctz(mask);
+#endif
+}
+#endif
 static void intersect_avx2(IdVec* a, const IdVec* b){
 #if defined(__AVX2__)
     size_t i=0,j=0,w=0;
@@ -2252,7 +2269,7 @@ static void intersect_avx2(IdVec* a, const IdVec* b){
             __m256i cmp=_mm256_cmpeq_epi64(xx,bx);
             int mask=_mm256_movemask_pd(_mm256_castsi256_pd(cmp));
             if(mask){
-                int lane=__builtin_ctz(mask);
+                int lane=count_trailing_zeros_u32((unsigned int)mask);
                 a->ids[w++]=a->ids[i++];
                 j += lane+1;
                 continue;
@@ -2408,7 +2425,7 @@ static void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const 
     for(size_t i=0;i+3<=len;i++){
         uint32_t key = ((uint8_t)tmp[i]<<16)|((uint8_t)tmp[i+1]<<8)|((uint8_t)tmp[i+2]);
         MDB_cursor* c=NULL; mdb_cursor_open(txn, dbi_trigram, &c);
-        MDB_val k={.mv_data=&key,.mv_size=3}, v;
+        MDB_val k={.mv_data=(void*)&key,.mv_size=3}, v;
         IdVec gram; idvec_init(&gram);
         if(mdb_cursor_get(c, &k, &v, MDB_SET_KEY)==0){
             do{
@@ -2519,9 +2536,9 @@ static void collect_record(uint64_t id, void* ctx){
 
 static void records_for_range(MDB_txn* txn, MDB_dbi dbi, uint64_t minv, uint64_t maxv, IdVec* out){
     MDB_cursor* c=NULL; mdb_cursor_open(txn, dbi, &c);
-    MDB_val k={.mv_data=&minv,.mv_size=sizeof(minv)}, v;
+    MDB_val k={.mv_data=(void*)&minv,.mv_size=sizeof(minv)}, v;
     int rc = mdb_cursor_get(c,&k,&v,MDB_SET_RANGE);
-    MDB_val maxk={.mv_data=&maxv,.mv_size=sizeof(maxv)};
+    MDB_val maxk={.mv_data=(void*)&maxv,.mv_size=sizeof(maxv)};
     while(rc==0 && mdb_cmp(txn, dbi, &k, &maxk) <= 0){
         idvec_push(out, *(uint64_t*)v.mv_data);
         rc = mdb_cursor_get(c,&k,&v,MDB_NEXT);
@@ -2534,7 +2551,7 @@ static void records_for_meta(MDB_txn* txn, MDB_dbi dbi_index, MDB_dbi dbi_strrev
     if(mdb_get(txn, dbi_strrev,&k,&v)==0){
         uint64_t sid=*(uint64_t*)v.mv_data;
         MDB_cursor* c=NULL; mdb_cursor_open(txn, dbi_index,&c);
-        MDB_val ak={.mv_data=&sid,.mv_size=sizeof(sid)}, av;
+        MDB_val ak={.mv_data=(void*)&sid,.mv_size=sizeof(sid)}, av;
         if(mdb_cursor_get(c,&ak,&av,MDB_SET_KEY)==0){
             do{ idvec_push(out, *(uint64_t*)av.mv_data); }
             while(mdb_cursor_get(c,&ak,&av,MDB_NEXT_DUP)==0);
@@ -2581,7 +2598,7 @@ static void records_for_content(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_c
     sort_unique(&ids);
     MDB_cursor* cc=NULL; mdb_cursor_open(txn, dbi_content, &cc);
     for(size_t i=0;i<ids.n;i++){
-        MDB_val k={.mv_data=&ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
+        MDB_val k={.mv_data=(void*)&ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
         if(mdb_cursor_get(cc,&k,&v,MDB_SET_KEY)==0){
             do{ idvec_push(out, *(uint64_t*)v.mv_data); }
             while(mdb_cursor_get(cc,&k,&v,MDB_NEXT_DUP)==0);
@@ -2624,7 +2641,7 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
             h=2166136261u ^ 0x1F1F1F1Fu; for(int k=0;k<3;k++){ h^=(uint8_t)tl[i+k]; h*=16777619u; } hbuf[hn++]=h;
         }
         for(size_t i=0;i<name_ids.n;i++){
-            MDB_val key={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, val;
+            MDB_val key={.mv_data=(void*)&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, val;
             if(mdb_get(txn, dbi_strings,&key,&val)!=0) continue;
             MDB_val text_val; StringMeta inline_meta;
             BOOL has_inline = string_value_parse(&val, &text_val, &inline_meta);
@@ -2672,7 +2689,7 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
     BOOL limit_reached = FALSE;
     if(name_ids.n>0){
         for(size_t i=0;i<name_ids.n && !limit_reached;i++){
-            MDB_val k={.mv_data=&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
+            MDB_val k={.mv_data=(void*)&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
             if(mdb_cursor_get(cix,&k,&v,MDB_SET_KEY)==0){
                 do{
                     if(out->n >= MAX_NAME_RESULTS){ limit_reached = TRUE; break; }
@@ -2687,7 +2704,7 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
         int rc=mdb_cursor_get(cix,&key,&val,MDB_FIRST);
         while(rc==0 && !limit_reached){
             uint64_t sid=*(uint64_t*)key.mv_data;
-            MDB_val sk={.mv_data=&sid,.mv_size=sizeof(sid)}, sv;
+            MDB_val sk={.mv_data=(void*)&sid,.mv_size=sizeof(sid)}, sv;
             if(mdb_get(txn, dbi_strings, &sk, &sv)!=0){
                 rc = mdb_cursor_get(cix,&key,&val,MDB_NEXT_NODUP);
                 continue;
@@ -2943,11 +2960,11 @@ int wmain(int argc, wchar_t** argv){
     MDB_dbi dbi_stringsP, dbi_recordsP; mdb_dbi_open(txnprint,"strings",0,&dbi_stringsP); mdb_dbi_open(txnprint,"records",0,&dbi_recordsP);
     if(json_output) printf("[\n");
     for(size_t i2=0;i2<show;i2++){
-        uint64_t rid = all[i2].rec_id; MDB_val rk={.mv_data=&rid,.mv_size=sizeof(rid)}, rv;
+        uint64_t rid = all[i2].rec_id; MDB_val rk={.mv_data=(void*)&rid,.mv_size=sizeof(rid)}, rv;
         if(mdb_get(txnprint, dbi_recordsP, &rk, &rv)!=0 || rv.mv_size<sizeof(DbRecord)) continue;
         DbRecord* r = (DbRecord*)rv.mv_data;
-        MDB_val pk={.mv_data=&r->parent_str_id,.mv_size=sizeof(r->parent_str_id)}, pv;
-        MDB_val nk={.mv_data=&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, nv;
+        MDB_val pk={.mv_data=(void*)&r->parent_str_id,.mv_size=sizeof(r->parent_str_id)}, pv;
+        MDB_val nk={.mv_data=(void*)&r->name_str_id,.mv_size=sizeof(r->name_str_id)}, nv;
         const char *pstr="?", *nstr="?";
         if(mdb_get(txnprint, dbi_stringsP, &pk, &pv)==0) pstr=(const char*)pv.mv_data;
         if(mdb_get(txnprint, dbi_stringsP, &nk, &nv)==0) nstr=(const char*)nv.mv_data;
