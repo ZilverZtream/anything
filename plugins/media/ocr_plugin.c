@@ -1,6 +1,7 @@
 #include "anything/plugin.h"
 #include "anything/util.h"
 #include <tesseract/capi.h>
+#include <leptonica/allheaders.h>
 #include <wchar.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -44,12 +45,21 @@ static wchar_t* ocr_file(const wchar_t* path){
 #else
     wcstombs(upath, path, sizeof(upath));
 #endif
-    if(!TessBaseAPIProcessPages(api, upath, NULL, 0, NULL)){
-        fwprintf(stderr,L"[ocr] ProcessPages failed for %ls\n",path);
+    Pix* pix = pixRead(upath);
+    if(!pix){
+        fwprintf(stderr,L"[ocr] pixRead failed for %ls\n",path);
+        TessBaseAPIDelete(api);
+        return NULL;
+    }
+    TessBaseAPISetImage2(api, pix);
+    if(TessBaseAPIRecognize(api, NULL) != 0){
+        fwprintf(stderr,L"[ocr] Recognize failed for %ls\n",path);
+        pixDestroy(&pix);
         TessBaseAPIDelete(api);
         return NULL;
     }
     char* text = TessBaseAPIGetUTF8Text(api);
+    pixDestroy(&pix);
     TessBaseAPIDelete(api);
     if(!text){
         fwprintf(stderr,L"[ocr] GetUTF8Text returned NULL for %ls\n",path);
