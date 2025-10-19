@@ -78,9 +78,11 @@ static LONG64 atomic_dec64(volatile LONG64* v){ return __sync_sub_and_fetch(v, 1
 static LONG64 atomic_load64(volatile LONG64* v){ return __sync_add_and_fetch(v, 0); }
 #endif
 #define CP_UTF8 65001
-#define MAX_INDEXED_CONTENT (1024*1024) // 1MB
-#define MAX_TOTAL_EPUB_SIZE (4*1024*1024) // 4MB safety cap for aggregated EPUB text
-#define MAX_EPUB_HTML_FILES 2048
+enum {
+    MAX_INDEXED_CONTENT = 1024 * 1024,          // 1MB
+    MAX_TOTAL_EPUB_SIZE = 4 * 1024 * 1024,      // 4MB safety cap for aggregated EPUB text
+    MAX_EPUB_HTML_FILES = 2048
+};
 #ifdef __APPLE__
 static void utf8_to_wide(const char* src, wchar_t* dst, size_t dstlen){
     if(!dstlen) return;
@@ -151,6 +153,8 @@ static int WideCharToMultiByte(unsigned int cp, unsigned int flags, const wchar_
 typedef struct BloomThreadParam {
     int index;
 } BloomThreadParam;
+
+typedef struct WriterCtx WriterCtx;
 
 static MPMCQueue g_live_updates;
 MPMCQueue g_bloom_gen_queue;
@@ -1867,8 +1871,6 @@ static BOOL writer_signal_wait(WriterSignal* sig, DWORD timeout_ms, BOOL* timed_
     return TRUE;
 #endif
 }
-
-typedef struct WriterCtx WriterCtx;
 
 static BOOL writer_ensure_record_capacity(DbRecord** buf, size_t* capacity, size_t required){
     if(!buf || !capacity) return FALSE;
