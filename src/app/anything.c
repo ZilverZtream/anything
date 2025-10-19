@@ -1636,9 +1636,10 @@ void bloom_generator_shutdown(void){
 
 void bloom_generator_request(uint64_t string_id){
     if(g_bloom_thread_count == 0 || string_id == 0) return;
-    while(!MPMC_Push(&g_bloom_gen_queue, (void*)(uintptr_t)string_id)){
-        if(g_bloom_shutdown) return;
-        Sleep(1);
+    if(g_bloom_shutdown) return;
+    if(!MPMC_Push(&g_bloom_gen_queue, (void*)(uintptr_t)string_id)){
+        // queue is full; drop the request instead of blocking the writer thread
+        return;
     }
 }
 
