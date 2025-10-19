@@ -29,7 +29,9 @@ find_package(unofficial-gumbo CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(libzip CONFIG REQUIRED)
-find_package(libpst-dev REQUIRED)
+if(UNIX)
+    find_package(libpst CONFIG REQUIRED)
+endif()
 
 if(UNIX AND NOT APPLE)
     find_package(e2fsprogs CONFIG REQUIRED)
@@ -120,7 +122,6 @@ add_executable(search_test "tests/search_test.c")
 
 target_link_libraries(anything PRIVATE
     anything_core
-    libpst::libpst
 )
 
 target_link_libraries(anything_ui PRIVATE
