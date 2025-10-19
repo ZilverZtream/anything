@@ -44,7 +44,7 @@ static wchar_t* ocr_file(const wchar_t* path){
 #else
     wcstombs(upath, path, sizeof(upath));
 #endif
-    if(!TessBaseAPIProcessPages(api, upath, NULL, 0)){
+    if(!TessBaseAPIProcessPages(api, upath, NULL, 0, NULL)){
         fwprintf(stderr,L"[ocr] ProcessPages failed for %ls\n",path);
         TessBaseAPIDelete(api);
         return NULL;
