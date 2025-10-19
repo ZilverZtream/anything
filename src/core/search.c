@@ -504,7 +504,7 @@ static void idvec_free(IdVec* v){ free(v->ids); v->ids=NULL; v->n=v->cap=0; }
 
 // Parallel search helpers
 typedef SearchQuery Query;
-typedef struct { uint64_t dummy; } Result;
+typedef struct { uint64_t dummy; } SearchStageResult;
 
 // Forward declarations for helpers defined later in this file.
 static void galloping_intersect(IdVec* a, const IdVec* b);
@@ -526,7 +526,7 @@ static void records_for_title(MDB_txn* txn, MDB_dbi dbi_title, MDB_dbi dbi_strre
 static ProgState* g_prog_state = NULL;
 
 // Stage 0: filename search and basic filters.
-static int search_names(Query* q, Result* results){
+static int search_names(Query* q, SearchStageResult* results){
     (void)results;
     if(!g_db_path[0]) return 0;
     MDB_env* env=NULL; MDB_txn* txn=NULL;
@@ -624,7 +624,7 @@ fail:
 }
 
 // Stage 1: metadata indexes (author/camera/etc.).
-static int search_metadata(Query* q, Result* results){
+static int search_metadata(Query* q, SearchStageResult* results){
     (void)results;
     if(!g_db_path[0]){ prog_mark_done(g_prog_state,1); return 0; }
     MDB_env* env=NULL; MDB_txn* txn=NULL;
@@ -727,7 +727,7 @@ static int search_metadata(Query* q, Result* results){
 }
 
 // Stage 2: content search (trigram/regex).
-static int search_content(Query* q, Result* results){
+static int search_content(Query* q, SearchStageResult* results){
     (void)results;
     if(!g_db_path[0]){ prog_mark_done(g_prog_state,2); return 0; }
     MDB_env* env=NULL; MDB_txn* txn=NULL;
@@ -769,12 +769,12 @@ static int search_content(Query* q, Result* results){
     return (int)n;
 }
 
-typedef int (*SearchFn)(Query*, Result*);
+typedef int (*SearchFn)(Query*, SearchStageResult*);
 
 typedef struct {
     SearchFn fn;
     Query* q;
-    Result* results;
+    SearchStageResult* results;
 } SearchTask;
 
 typedef struct {
@@ -871,7 +871,7 @@ static void save_stage_cache(int stage, const SearchQuery* q, const IdVec* ids){
 
 // Adaptive search that runs stages serially for cheap queries and
 // leverages a small thread pool for heavier ones.
-static void progressive_search(Query* q, Result* results, ProgState* ps){
+static void progressive_search(Query* q, SearchStageResult* results, ProgState* ps){
     g_prog_state = ps;
     unsigned hw = get_hw_threads();
     unsigned pool_size = hw < 3 ? hw : 3;
@@ -953,7 +953,7 @@ static uint32_t* intersect_sorted(const uint32_t* a, size_t na, const uint32_t* 
     return out;
 }
 
-static void results_to_ids(const Result* res, size_t n, uint32_t** out_ids, size_t* out_n){
+static void results_to_ids(const SearchStageResult* res, size_t n, uint32_t** out_ids, size_t* out_n){
     if(n==0){ *out_ids=NULL; *out_n=0; return; }
     uint32_t* ids=(uint32_t*)malloc(n*sizeof(uint32_t));
     if(!ids){ *out_ids=NULL; *out_n=0; return; }
