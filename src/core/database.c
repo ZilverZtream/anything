@@ -1765,7 +1765,7 @@ static InternTask* acquire_task_buffer(size_t count, InternTask* stack_buf, size
 }
 
 
-static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const uint8_t* need_normalized_flags, size_t count, uint64_t* out_ids, uint64_t* out_normalized_ids){
+void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const uint8_t* need_normalized_flags, size_t count, uint64_t* out_ids, uint64_t* out_normalized_ids){
     if(!db_ || !out_ids || !strings || count == 0){
         if(out_normalized_ids){
             for(size_t i = 0; i < count; ++i){

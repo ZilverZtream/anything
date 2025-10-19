@@ -195,6 +195,14 @@ static const size_t MAP_GROWTH_INCREMENT = 1ull * 1024ull * 1024ull * 1024ull; /
 static MPMCQueue g_live_updates;
 MPMCQueue g_bloom_gen_queue;
 MPMCQueue g_bloom_completion_queue;
+#if defined(_WIN32)
+#ifndef __LOADIFILTER_FWD_DECLARED__
+#define __LOADIFILTER_FWD_DECLARED__
+HRESULT STDAPICALLTYPE LoadIFilter(LPCWSTR pwcsPath, IUnknown* pUnkOuter, IUnknown** ppIUnk);
+#endif
+#endif
+
+static BOOL writer_ensure_record_capacity(DbRecord** buf, size_t* capacity, size_t required);
 #ifdef _WIN32
 static HANDLE g_bloom_generator_threads[BLOOM_GENERATOR_MAX_THREADS] = {0};
 #else
