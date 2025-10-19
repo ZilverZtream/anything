@@ -33,6 +33,10 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
         s->kind = FS_NTFS;
         return s;
     }
+    DWORD err = GetLastError();
+    if(err != ERROR_SUCCESS){
+        fwprintf(stderr, L"NTFS scanner unavailable for %ls (err=%lu); falling back to generic traversal.\n", rootPath, (unsigned long)err);
+    }
     s->u.gen = GenericScanner_Start(rootPath, threads, outQueue, cancelToken);
     if(!s->u.gen){
         free(s);
