@@ -1338,10 +1338,76 @@ static uint64_t now_filetime(void) {
 }
 static void to_mdb_val(const void* p, size_t n, MDB_val* mv){ mv->mv_data=(void*)p; mv->mv_size=(size_t)n; }
 
+static BOOL is_unc_share_root(const wchar_t* path){
+    if(!path || !*path) return FALSE;
+    if(path[0] != L'\\' || path[1] != L'\\') return FALSE;
+    size_t len = wcslen(path);
+    while(len > 2 && (path[len-1] == L'\\' || path[len-1] == L'/')){
+        len--;
+    }
+    if(len <= 2) return FALSE;
+    int separators = 0;
+    for(size_t i = 2; i < len; ++i){
+        if(path[i] == L'\\'){
+            separators++;
+            if(separators > 1) return FALSE;
+        }
+    }
+    return separators == 1;
+}
+
 static BOOL ensure_dir(const wchar_t* path){
-    wchar_t tmp[MAX_PATH]; wcsncpy_s(tmp, MAX_PATH, path, _TRUNCATE);
-    wchar_t* p = wcsrchr(tmp, L'\\'); if(p){ *p=0; CreateDirectoryW(tmp, NULL); }
-    return TRUE;
+    if(!path || !*path) return FALSE;
+
+    wchar_t full[MAX_LONG_PATH];
+    DWORD n = GetFullPathNameW(path, (DWORD)ARRAYSIZE(full), full, NULL);
+    if(n == 0 || n >= ARRAYSIZE(full)) return FALSE;
+
+    while(n > 0 && (full[n-1] == L'\\' || full[n-1] == L'/')){
+        full[--n] = L'\0';
+    }
+    if(n == 0) return FALSE;
+
+    BOOL drive_root = (n == 2 && full[1] == L':');
+    if(drive_root){
+        if(n + 1 >= ARRAYSIZE(full)) return FALSE;
+        full[n++] = L'\\';
+        full[n] = L'\0';
+    }
+
+    wchar_t long_path[MAX_LONG_PATH];
+    make_long_path(full, long_path, ARRAYSIZE(long_path));
+
+    DWORD attrs = GetFileAttributesW(long_path);
+    if(attrs != INVALID_FILE_ATTRIBUTES){
+        if(attrs & FILE_ATTRIBUTE_DIRECTORY) return TRUE;
+        SetLastError(ERROR_ALREADY_EXISTS);
+        return FALSE;
+    }
+
+    wchar_t parent[MAX_LONG_PATH];
+    BOOL has_parent = path_dirname(full, parent, ARRAYSIZE(parent));
+    if(has_parent){
+        size_t plen = wcslen(parent);
+        while(plen > 0 && (parent[plen-1] == L'\\' || parent[plen-1] == L'/')){
+            parent[--plen] = L'\0';
+        }
+        BOOL is_drive_root = (plen == 2 && parent[1] == L':');
+        BOOL is_unc_root = is_unc_share_root(parent);
+        if(plen > 0 && !is_drive_root && !is_unc_root){
+            if(!ensure_dir(parent)) return FALSE;
+        }
+    }
+
+    if(CreateDirectoryW(long_path, NULL)) return TRUE;
+
+    DWORD err = GetLastError();
+    if(err == ERROR_ALREADY_EXISTS) return TRUE;
+    if(err == ERROR_PATH_NOT_FOUND && has_parent){
+        if(!ensure_dir(parent)) return FALSE;
+        return ensure_dir(full);
+    }
+    return FALSE;
 }
 
 static int open_core_dbs(MDB_txn* txn, DbImpl* d, BOOL create){
@@ -1411,7 +1477,11 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
     size_t min_init = 1024ull * 1024ull * 1024ull; // start with at least 1 GB
     if(d->map_init < min_init) d->map_init = min_init;
     if(d->map_max  < d->map_init)   d->map_max = d->map_init*4;
-    ensure_dir(path);
+    if(!ensure_dir(path)){
+        set_sys_error(d, GetLastError());
+        free(d);
+        return FALSE;
+    }
     int rc = mdb_env_create(&d->env);
     if(rc){ set_mdb_error(d,rc); free(d); return FALSE; }
     mdb_env_set_mapsize(d->env, d->map_init);
