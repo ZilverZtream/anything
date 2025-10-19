@@ -1,5 +1,5 @@
 # =============================================================================
-# CMake Build Script for the "Anything" Project (Corrected)
+# CMake Build Script for the "Anything" Project (Corrected Linker Targets)
 # =============================================================================
 cmake_minimum_required(VERSION 3.16)
 project(Anything C CXX)
@@ -18,8 +18,7 @@ else()
     add_compile_options(-msse4.1 -mavx2 -Wextra -Wall)
 endif()
 
-# --- Find Dependencies using vcpkg (with corrected names) ---
-# The names here MUST match what vcpkg provides.
+# --- Find Dependencies using vcpkg ---
 find_package(unofficial-lmdb CONFIG REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(CURL REQUIRED)
@@ -46,9 +45,7 @@ file(GLOB CORE_SYSTEM_SOURCES "src/system/*.c")
 file(GLOB CORE_ENTERPRISE_SOURCES "src/enterprise/*.c")
 file(GLOB SERVICE_SOURCES "src/services/*.c")
 file(GLOB UI_SOURCES "src/ui/*.cpp")
-
 file(GLOB PLATFORM_WIN_SOURCES "src/platform/ntfs.c" "src/platform/scanner_win.c" "src/platform/wsl.c")
-# ... other platform sources would go here
 
 # =============================================================================
 # Define Executable Targets
@@ -59,6 +56,7 @@ add_executable(anything
     ${CORE_ENGINE_SOURCES}
     ${CORE_SYSTEM_SOURCES}
     ${SERVICE_SOURCES}
+    ${CORE_ENTERPRISE_SOURCES}
 )
 
 add_executable(anything_ui
@@ -69,13 +67,12 @@ add_executable(anything_ui
 
 add_executable(search_test "tests/search_test.c" "src/core/util.c")
 
-# --- Add Platform-Specific Sources ---
 if(WIN32)
     target_sources(anything PRIVATE ${PLATFORM_WIN_SOURCES})
 endif()
 
 # =============================================================================
-# Link Libraries to Executables (with corrected target names)
+# Link Libraries to Executables
 # =============================================================================
 
 target_link_libraries(anything PRIVATE
@@ -110,18 +107,18 @@ macro(add_anything_plugin name sources)
     endif()
 endmacro()
 
-# Define each plugin
-add_anything_plugin(code_plugin "plugins/code_plugin.c")
-add_anything_plugin(git_plugin "plugins/git_plugin.c")
-add_anything_plugin(icloud_plugin "plugins/icloud_plugin.c")
-add_anything_plugin(gmail_plugin "plugins/gmail_plugin.c")
-add_anything_plugin(msmail_plugin "plugins/microsoft_mail_plugin.c")
-add_anything_plugin(ocr_plugin "plugins/ocr_plugin.c")
-add_anything_plugin(duplicates_plugin "plugins/duplicates_plugin.c")
-add_anything_plugin(registry_plugin "plugins/registry_plugin.c")
-add_anything_plugin(web_archive_plugin "plugins/web_archive_plugin.c")
+add_anything_plugin(code_plugin "plugins/code/code_plugin.c")
+add_anything_plugin(git_plugin "plugins/code/git_plugin.c")
+add_anything_plugin(icloud_plugin "plugins/data_sources/icloud_plugin.c")
+add_anything_plugin(gmail_plugin "plugins/data_sources/gmail_plugin.c")
+add_anything_plugin(msmail_plugin "plugins/data_sources/microsoft_mail_plugin.c")
+add_anything_plugin(web_archive_plugin "plugins/data_sources/web_archive_plugin.c")
+add_anything_plugin(ocr_plugin "plugins/media/ocr_plugin.c")
+add_anything_plugin(duplicates_plugin "plugins/system/duplicates_plugin.c")
+add_anything_plugin(registry_plugin "plugins/system/registry_plugin.c")
 
-# Link plugin-specific dependencies (with corrected target names)
-target_link_libraries(git_plugin PRIVATE libgit2::git2)
+# --- Link plugin-specific dependencies (with corrected target names) ---
+# --- FIX: Changed libgit2::git2 to libgit2::libgit2package ---
+target_link_libraries(git_plugin PRIVATE libgit2::libgit2package)
 target_link_libraries(ocr_plugin PRIVATE Tesseract::libtesseract)
 target_link_libraries(web_archive_plugin PRIVATE unofficial::gumbo::gumbo unofficial::sqlite3::sqlite3)
