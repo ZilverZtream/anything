@@ -673,7 +673,7 @@ static BOOL frn_resolve_parent_path(USNScanner* s, uint64_t parent_frn, wchar_t*
     DWORD got = GetFinalPathNameByHandleW(hPar, parent_full, MAX_LONG_PATH, FILE_NAME_NORMALIZED);
     CloseHandle(hPar);
     if(got>0 && got<MAX_LONG_PATH){
-        if(wcsncmp(parent_full, L"\\?\", 4)==0){
+        if(wcsncmp(parent_full, L"\\\\?\\", 4)==0){
             memmove(parent_full, parent_full+4, (wcslen(parent_full)-3)*sizeof(wchar_t));
         }
         ok = wcscpy_s(parent, cch, parent_full)==0;
@@ -1054,7 +1054,7 @@ static DWORD WINAPI tail_thread(void* p){
                     wchar_t parent[MAX_LONG_PATH]; DWORD got = GetFinalPathNameByHandleW(hPar, parent, MAX_LONG_PATH, FILE_NAME_NORMALIZED);
                     CloseHandle(hPar);
                     if(got>0 && got<MAX_LONG_PATH){
-                        if(wcsncmp(parent, L"\\?\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
+                        if(wcsncmp(parent, L"\\\\?\\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
                         DbWorkItem* wi = acquire_work_item();
                         if(!wi){
                             continue;
@@ -1083,7 +1083,7 @@ static DWORD WINAPI tail_thread(void* p){
                     if(got>0 && got<MAX_LONG_PATH){
                         // full is \?\C:\Dir\Name — split into parent/name
                         wchar_t parent[MAX_LONG_PATH]; wcscpy_s(parent, MAX_LONG_PATH, full);
-                        if(wcsncmp(parent, L"\\?\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
+                        if(wcsncmp(parent, L"\\\\?\\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
                         wchar_t* p = wcsrchr(parent, L'\'); if(p){ *p=0; }
                         DbWorkItem* wi = acquire_work_item();
                         if(!wi){
