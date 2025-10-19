@@ -1996,6 +1996,7 @@ static void writer_queue_on_push(void* param){
 }
 
 static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch){
+    int bad_txn_retries = 0;
     for(;;){
         if(db_put_records(ctx->db, buf, in_batch)){
             return TRUE;
@@ -2019,6 +2020,12 @@ static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch
             if(!db_begin_write(ctx->db)) return FALSE;
             ctx->grow_attempts++;
             continue; // retry put
+        } else if(err->code == DB_ERROR_LMDB && err->detail == MDB_BAD_TXN && bad_txn_retries++ < 3){
+            db_abort_write(ctx->db);
+            if(!db_begin_write(ctx->db)){
+                return FALSE;
+            }
+            continue; // retry after refreshing transaction
         } else {
             size_t progress = db_last_write_progress(ctx->db);
             fprintf(stderr, "db_put_records failed after %zu/%zu records: %s (code=%d)\n",
