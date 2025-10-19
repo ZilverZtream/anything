@@ -1,5 +1,5 @@
 # =============================================================================
-# CMake Build Script for the "Anything" Project
+# CMake Build Script for the "Anything" Project (Corrected)
 # =============================================================================
 cmake_minimum_required(VERSION 3.16)
 project(Anything C CXX)
@@ -9,107 +9,90 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/plugins")
 
-# Enable SIMD instruction sets where available
 if(MSVC)
-    add_compile_options(/arch:AVX2)
+    add_compile_options(/arch:AVX2 /W4 /bigobj)
 else()
-    add_compile_options(-msse4.1 -mavx2)
+    add_compile_options(-msse4.1 -mavx2 -Wextra -Wall)
 endif()
 
-# --- Find Dependencies using vcpkg ---
-find_package(glfw3 REQUIRED)
+# --- Find Dependencies using vcpkg (with corrected names) ---
+# The names here MUST match what vcpkg provides.
+find_package(unofficial-lmdb CONFIG REQUIRED)
+find_package(glfw3 CONFIG REQUIRED)
 find_package(CURL REQUIRED)
-find_package(cjson REQUIRED)
-find_package(libgit2 REQUIRED)
-find_package(Tesseract REQUIRED)
-find_package(Gumbo REQUIRED)
+find_package(cJSON CONFIG REQUIRED)
+find_package(libgit2 CONFIG REQUIRED)
+find_package(Tesseract CONFIG REQUIRED)
+find_package(unofficial-gumbo CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
-find_package(SQLite3 REQUIRED)
-find_package(unofficial-lmdb REQUIRED)
+find_package(unofficial-sqlite3 CONFIG REQUIRED)
+
 
 # --- Define Public Include Directory ---
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cJSON
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
 # =============================================================================
-# Core Application & UI Executables
+# Collect Source Files
+# =============================================================================
+file(GLOB CORE_APP_SOURCES "src/app/*.c")
+file(GLOB CORE_ENGINE_SOURCES "src/core/*.c")
+file(GLOB CORE_SYSTEM_SOURCES "src/system/*.c")
+file(GLOB CORE_ENTERPRISE_SOURCES "src/enterprise/*.c")
+file(GLOB SERVICE_SOURCES "src/services/*.c")
+file(GLOB UI_SOURCES "src/ui/*.cpp")
+
+file(GLOB PLATFORM_WIN_SOURCES "src/platform/ntfs.c" "src/platform/scanner_win.c" "src/platform/wsl.c")
+# ... other platform sources would go here
+
+# =============================================================================
+# Define Executable Targets
 # =============================================================================
 
-# --- Main Indexer Executable ---
 add_executable(anything
-    src/app/anything.c
-    src/app/config.c
-    src/core/database.c
-    src/core/util.c
-    src/services/archive.c
-    src/services/cloud.c
-    src/services/exfat.c
-    src/services/metadata.c
-    src/services/network.c
-    src/system/plugin.c
+    ${CORE_APP_SOURCES}
+    ${CORE_ENGINE_SOURCES}
+    ${CORE_SYSTEM_SOURCES}
+    ${SERVICE_SOURCES}
 )
 
-# --- UI Executable ---
-add_executable(ui_imgui
-    src/ui/ui_imgui.cpp
-    src/ui/TextEditor.cpp
-    src/core/database.c # Share implementation
-    src/core/util.c
-    third_party/cJSON/cJSON.c
+add_executable(anything_ui
+    ${UI_SOURCES}
+    ${CORE_ENGINE_SOURCES}
+    "third_party/cJSON/cJSON.c"
 )
 
-# --- Search CLI Executable ---
-add_executable(search_cli
-    src/core/search.c
-    src/core/database.c
-    src/core/util.c
-    src/enterprise/enterprise.c
-)
+add_executable(search_test "tests/search_test.c" "src/core/util.c")
 
-# --- Platform-Specific Source Files ---
+# --- Add Platform-Specific Sources ---
 if(WIN32)
-    target_sources(anything PRIVATE
-        src/platform/ntfs.c
-        src/platform/scanner_win.c
-        src/platform/wsl.c
-        src/ui/direct2d_renderer.cpp
-    )
-    target_sources(search_cli PRIVATE src/platform/ntfs.c)
-elseif(APPLE)
-    target_sources(anything PRIVATE
-        src/platform/apfs.c
-        src/platform/macvm.c
-        src/platform/scanner_macos.c
-    )
-elseif(UNIX)
-    target_sources(anything PRIVATE src/platform/scanner_linux.c)
+    target_sources(anything PRIVATE ${PLATFORM_WIN_SOURCES})
 endif()
 
-# --- Link Libraries to Executables ---
+# =============================================================================
+# Link Libraries to Executables (with corrected target names)
+# =============================================================================
+
 target_link_libraries(anything PRIVATE
     unofficial::lmdb::lmdb
     LibArchive::LibArchive
-    ${CMAKE_THREAD_LIBS_INIT}
 )
 
-target_link_libraries(ui_imgui PRIVATE
+target_link_libraries(anything_ui PRIVATE
     unofficial::lmdb::lmdb
     glfw
-    ${CMAKE_DL_LIBS}
     CURL::libcurl
     cjson
 )
 
-target_link_libraries(search_cli PRIVATE unofficial::lmdb::lmdb)
-
 if(WIN32)
     target_link_libraries(anything PRIVATE Shlwapi.lib Ole32.lib Query.lib)
-    target_link_libraries(ui_imgui PRIVATE gdiplus.lib d2d1.lib dwrite.lib)
-    target_link_libraries(search_cli PRIVATE Shlwapi.lib)
+    target_link_libraries(anything_ui PRIVATE gdiplus.lib d2d1.lib dwrite.lib Shlwapi.lib Shell32.lib)
 endif()
 
 # =============================================================================
@@ -122,23 +105,23 @@ macro(add_anything_plugin name sources)
         cjson
         CURL::libcurl
     )
+    if(WIN32)
+        target_link_libraries(${name} PRIVATE Shlwapi.lib)
+    endif()
 endmacro()
 
-add_anything_plugin(code_plugin plugins/code/code_plugin.c)
-add_anything_plugin(git_plugin plugins/code/git_plugin.c)
-add_anything_plugin(icloud_plugin plugins/data_sources/icloud_plugin.c)
-add_anything_plugin(gmail_plugin plugins/data_sources/gmail_plugin.c)
-add_anything_plugin(msmail_plugin plugins/data_sources/microsoft_mail_plugin.c)
-add_anything_plugin(ocr_plugin plugins/media/ocr_plugin.c)
-add_anything_plugin(duplicates_plugin plugins/system/duplicates_plugin.c)
-add_anything_plugin(registry_plugin plugins/system/registry_plugin.c)
-add_anything_plugin(web_archive_plugin plugins/system/web_archive_plugin.c)
+# Define each plugin
+add_anything_plugin(code_plugin "plugins/code_plugin.c")
+add_anything_plugin(git_plugin "plugins/git_plugin.c")
+add_anything_plugin(icloud_plugin "plugins/icloud_plugin.c")
+add_anything_plugin(gmail_plugin "plugins/gmail_plugin.c")
+add_anything_plugin(msmail_plugin "plugins/microsoft_mail_plugin.c")
+add_anything_plugin(ocr_plugin "plugins/ocr_plugin.c")
+add_anything_plugin(duplicates_plugin "plugins/duplicates_plugin.c")
+add_anything_plugin(registry_plugin "plugins/registry_plugin.c")
+add_anything_plugin(web_archive_plugin "plugins/web_archive_plugin.c")
 
-target_link_libraries(git_plugin PRIVATE Git2::git2)
+# Link plugin-specific dependencies (with corrected target names)
+target_link_libraries(git_plugin PRIVATE libgit2::git2)
 target_link_libraries(ocr_plugin PRIVATE Tesseract::libtesseract)
-target_link_libraries(web_archive_plugin PRIVATE Gumbo::gumbo SQLite::SQLite3)
-
-# =============================================================================
-# Test Executable
-# =============================================================================
-add_executable(search_test tests/search_test.c src/core/util.c)
+target_link_libraries(web_archive_plugin PRIVATE unofficial::gumbo::gumbo unofficial::sqlite3::sqlite3)
