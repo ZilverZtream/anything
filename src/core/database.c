@@ -35,15 +35,26 @@ typedef struct {
     volatile uint64_t hash;
     volatile LONG64   stamp;
     volatile uint32_t string_id;
+    volatile LONG     hot;
     volatile char*    string;
 } StringCache;
 
-#define STRING_CACHE_SIZE 65536u
-#define CACHE_PARTITIONS 64u
-#define PARTITION_SIZE (STRING_CACHE_SIZE / CACHE_PARTITIONS)
-#define PARTITION_MASK (PARTITION_SIZE-1u)
+#define STRING_CACHE_SIZE 131072u
+#define CACHE_PARTITIONS 257u
+#define CACHE_PARTITION_BASE (STRING_CACHE_SIZE / CACHE_PARTITIONS)
+#define CACHE_PARTITION_REMAINDER (STRING_CACHE_SIZE % CACHE_PARTITIONS)
+#define PARTITION_STRIDE 512u
+#define PARTITION_MASK (PARTITION_STRIDE - 1u)
 
-static StringCache g_string_cache[CACHE_PARTITIONS][PARTITION_SIZE];
+static inline size_t string_cache_partition_capacity(size_t partition){
+    size_t cap = CACHE_PARTITION_BASE;
+    if(partition < CACHE_PARTITION_REMAINDER){
+        cap += 1u;
+    }
+    return cap;
+}
+
+static StringCache g_string_cache[CACHE_PARTITIONS][PARTITION_STRIDE];
 static const char* const STRING_CACHE_BUSY = (const char*)(intptr_t)1;
 
 static volatile LONG64 g_string_cache_clock = 0;
@@ -55,17 +66,23 @@ static inline char* atomic_load_char(volatile char** p){
 static uint64_t string_cache_lookup(const char* s, uint64_t h){
     if(!s) return 0;
     size_t partition = (size_t)(h % CACHE_PARTITIONS);
-    size_t mask = PARTITION_MASK;
-    size_t idx = ((size_t)(h / CACHE_PARTITIONS)) & mask;
-    size_t step = (((size_t)(h >> 32) & mask) | 1u);
-    if(step == 0) step = 1u;
+    size_t partition_cap = string_cache_partition_capacity(partition);
+    if(partition_cap == 0) return 0;
+    if(partition_cap > PARTITION_STRIDE) partition_cap = PARTITION_STRIDE;
+    size_t base_idx = (size_t)((h / CACHE_PARTITIONS) % partition_cap);
     StringCache* cache = g_string_cache[partition];
-    for(size_t probe = 0; probe < PARTITION_SIZE; ++probe){
+    size_t idx = base_idx;
+    for(size_t probe = 0; probe < PARTITION_STRIDE; ++probe){
+        size_t next_idx = (base_idx + ((probe + 1) * (probe + 1))) & PARTITION_MASK;
+        if(idx >= partition_cap){
+            idx = next_idx;
+            continue;
+        }
         StringCache* c = &cache[idx];
         char* str = atomic_load_char((volatile char**)&c->string);
         if(!str) return 0;
         if(str == STRING_CACHE_BUSY){
-            idx = (idx + step) & mask;
+            idx = next_idx;
             continue;
         }
         if(c->hash == h && strcmp(str, s) == 0){
@@ -73,10 +90,11 @@ static uint64_t string_cache_lookup(const char* s, uint64_t h){
             if(cached_id != 0){
                 LONG64 stamp = InterlockedIncrement64(&g_string_cache_clock);
                 InterlockedExchange64(&c->stamp, stamp);
+                InterlockedExchange((volatile LONG*)&c->hot, 1);
                 return (uint64_t)cached_id;
             }
         }
-        idx = (idx + step) & mask;
+        idx = next_idx;
     }
     return 0;
 }
@@ -84,16 +102,24 @@ static uint64_t string_cache_lookup(const char* s, uint64_t h){
 static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
     if(!s || id == 0 || id > UINT32_MAX) return;
     size_t partition = (size_t)(h % CACHE_PARTITIONS);
-    size_t mask = PARTITION_MASK;
-    size_t idx = ((size_t)(h / CACHE_PARTITIONS)) & mask;
-    size_t step = (((size_t)(h >> 32) & mask) | 1u);
-    if(step == 0) step = 1u;
-    size_t best_idx = idx;
-    LONG64 best_stamp = LLONG_MAX;
+    size_t partition_cap = string_cache_partition_capacity(partition);
+    if(partition_cap == 0) return;
+    if(partition_cap > PARTITION_STRIDE) partition_cap = PARTITION_STRIDE;
+    size_t base_idx = (size_t)((h / CACHE_PARTITIONS) % partition_cap);
+    size_t idx = base_idx;
+    size_t best_cold_idx = SIZE_MAX;
+    LONG64 best_cold_stamp = LLONG_MAX;
+    size_t fallback_idx = SIZE_MAX;
+    LONG64 fallback_stamp = LLONG_MAX;
     uint32_t id32 = (uint32_t)id;
     LONG64 stamp = InterlockedIncrement64(&g_string_cache_clock);
     StringCache* cache = g_string_cache[partition];
-    for(size_t probe = 0; probe < PARTITION_SIZE; ++probe){
+    for(size_t probe = 0; probe < PARTITION_STRIDE; ++probe){
+        size_t next_idx = (base_idx + ((probe + 1) * (probe + 1))) & PARTITION_MASK;
+        if(idx >= partition_cap){
+            idx = next_idx;
+            continue;
+        }
         StringCache* c = &cache[idx];
         char* str = atomic_load_char((volatile char**)&c->string);
         if(!str){
@@ -101,10 +127,12 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
                 c->hash = h;
                 InterlockedExchange((volatile LONG*)&c->string_id, (LONG)id32);
                 InterlockedExchange64(&c->stamp, stamp);
+                InterlockedExchange((volatile LONG*)&c->hot, 1);
                 char* dup = _strdup(s);
                 if(!dup){
                     InterlockedExchange((volatile LONG*)&c->string_id, 0);
                     InterlockedExchange64(&c->stamp, 0);
+                    InterlockedExchange((volatile LONG*)&c->hot, 0);
                     InterlockedExchangePointer((PVOID*)&c->string, NULL);
                     return;
                 }
@@ -112,25 +140,38 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
                 InterlockedExchangePointer((PVOID*)&c->string, dup);
                 return;
             }
+            idx = next_idx;
             continue;
         }
         if(str == STRING_CACHE_BUSY){
-            idx = (idx + step) & mask;
+            idx = next_idx;
             continue;
         }
         if(c->hash == h && strcmp(str, s) == 0){
             InterlockedExchange((volatile LONG*)&c->string_id, (LONG)id32);
             InterlockedExchange64(&c->stamp, stamp);
+            InterlockedExchange((volatile LONG*)&c->hot, 1);
             return;
         }
         LONG64 entry_stamp = InterlockedCompareExchange64(&c->stamp, 0, 0);
-        if(entry_stamp < best_stamp){
-            best_stamp = entry_stamp;
-            best_idx = idx;
+        if(entry_stamp < fallback_stamp){
+            fallback_stamp = entry_stamp;
+            fallback_idx = idx;
         }
-        idx = (idx + step) & mask;
+        LONG was_hot = InterlockedCompareExchange((volatile LONG*)&c->hot, 0, 0);
+        if(was_hot){
+            InterlockedExchange((volatile LONG*)&c->hot, 0);
+        } else {
+            if(entry_stamp < best_cold_stamp){
+                best_cold_stamp = entry_stamp;
+                best_cold_idx = idx;
+            }
+        }
+        idx = next_idx;
     }
-    StringCache* victim = &cache[best_idx];
+    size_t victim_idx = (best_cold_idx != SIZE_MAX) ? best_cold_idx : fallback_idx;
+    if(victim_idx == SIZE_MAX) return;
+    StringCache* victim = &cache[victim_idx];
     for(;;){
         char* expected = atomic_load_char((volatile char**)&victim->string);
         if(expected == STRING_CACHE_BUSY) continue;
@@ -139,10 +180,12 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
             victim->hash = h;
             InterlockedExchange((volatile LONG*)&victim->string_id, (LONG)id32);
             InterlockedExchange64(&victim->stamp, stamp);
+            InterlockedExchange((volatile LONG*)&victim->hot, 1);
             char* dup = _strdup(s);
             if(!dup){
                 InterlockedExchange((volatile LONG*)&victim->string_id, 0);
                 InterlockedExchange64(&victim->stamp, 0);
+                InterlockedExchange((volatile LONG*)&victim->hot, 0);
                 InterlockedExchangePointer((PVOID*)&victim->string, NULL);
                 return;
             }
@@ -1527,21 +1570,46 @@ typedef struct InternTask {
     struct InternTask* leader;
     BOOL need_normalized;
     uint64_t normalized_id;
+    char* normalized_utf8;
+    size_t normalized_len;
+    uint64_t normalized_hash;
+    struct InternTask* normalized_leader;
 } InternTask;
-
-typedef struct NormalizedTask {
-    InternTask* owner;
-    char* utf8;
-    size_t utf8_len;
-    uint64_t utf8_hash;
-    uint64_t id;
-    struct NormalizedTask* leader;
-} NormalizedTask;
 
 typedef struct InternHashEntry {
     uint64_t hash;
     size_t index;
 } InternHashEntry;
+
+static THREAD_LOCAL InternTask* g_tls_task_pool = NULL;
+static THREAD_LOCAL size_t g_tls_task_capacity = 0;
+
+static InternTask* acquire_task_buffer(size_t count, InternTask* stack_buf, size_t stack_cap, size_t* out_cap, BOOL* out_tls){
+    if(count <= stack_cap){
+        *out_cap = stack_cap;
+        *out_tls = FALSE;
+        return stack_buf;
+    }
+    size_t new_cap = g_tls_task_capacity ? g_tls_task_capacity : stack_cap;
+    if(new_cap == 0) new_cap = 1;
+    while(new_cap < count){
+        if(new_cap > SIZE_MAX / 2){
+            new_cap = count;
+            break;
+        }
+        new_cap <<= 1;
+    }
+    if(new_cap == 0 || new_cap < count) new_cap = count;
+    InternTask* resized = (InternTask*)realloc(g_tls_task_pool, new_cap * sizeof(InternTask));
+    if(!resized){
+        return NULL;
+    }
+    g_tls_task_pool = resized;
+    g_tls_task_capacity = new_cap;
+    *out_cap = g_tls_task_capacity;
+    *out_tls = TRUE;
+    return g_tls_task_pool;
+}
 
 
 static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const uint8_t* need_normalized_flags, size_t count, uint64_t* out_ids, uint64_t* out_normalized_ids){
@@ -1554,19 +1622,20 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, c
         return;
     }
     DbImpl* d = (DbImpl*)db_;
-    size_t task_cap = count;
+    size_t task_cap = 0;
     InternTask stack_tasks[8];
-    InternTask* tasks = (count <= ARRAYSIZE(stack_tasks)) ? stack_tasks : (InternTask*)malloc(sizeof(InternTask) * task_cap);
+    BOOL tasks_from_tls = FALSE;
+    InternTask* tasks = acquire_task_buffer(count, stack_tasks, ARRAYSIZE(stack_tasks), &task_cap, &tasks_from_tls);
     InternTask** unique = NULL;
-    NormalizedTask* norm_tasks = NULL;
-    NormalizedTask** norm_unique = NULL;
+    InternTask** norm_unique = NULL;
+    InternHashEntry* norm_table = NULL;
+    char* norm_storage = NULL;
     uint8_t* arena = NULL;
-    uint8_t* norm_arena = NULL;
     size_t task_count = 0;
     size_t unique_count = 0;
-    size_t norm_valid = 0;
     size_t norm_unique_count = 0;
     BOOL any_need_normalized = FALSE;
+    size_t total_normalized_bytes = 0;
     if(!tasks){
         if(out_normalized_ids){
             for(size_t i = 0; i < count; ++i){
@@ -1596,6 +1665,10 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, c
         if((size_t)needed > SIZE_MAX - total_utf8_bytes) goto cleanup;
         task.utf8_len = (size_t)(needed - 1);
         total_utf8_bytes += (size_t)needed;
+        if(task.need_normalized){
+            if((size_t)needed > SIZE_MAX - total_normalized_bytes) goto cleanup;
+            total_normalized_bytes += (size_t)needed;
+        }
         if(task_count < task_cap){
             tasks[task_count++] = task;
         }
@@ -1612,11 +1685,19 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, c
     }
     size_t unique_array_size = task_count * sizeof(InternTask*);
     size_t hash_table_size = ht_cap * sizeof(InternHashEntry);
+    size_t norm_unique_size = any_need_normalized ? (task_count * sizeof(InternTask*)) : 0;
+    size_t norm_hash_size = any_need_normalized ? (ht_cap * sizeof(InternHashEntry)) : 0;
     size_t arena_size = unique_array_size;
     if(arena_size > SIZE_MAX - hash_table_size) goto cleanup;
     arena_size += hash_table_size;
+    if(arena_size > SIZE_MAX - norm_unique_size) goto cleanup;
+    arena_size += norm_unique_size;
+    if(arena_size > SIZE_MAX - norm_hash_size) goto cleanup;
+    arena_size += norm_hash_size;
     if(arena_size > SIZE_MAX - total_utf8_bytes) goto cleanup;
     arena_size += total_utf8_bytes;
+    if(arena_size > SIZE_MAX - total_normalized_bytes) goto cleanup;
+    arena_size += total_normalized_bytes;
     if(arena_size == 0) arena_size = 1;
     arena = (uint8_t*)malloc(arena_size);
     if(!arena) goto cleanup;
@@ -1625,10 +1706,21 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, c
     arena_ptr += unique_array_size;
     InternHashEntry* table = (InternHashEntry*)arena_ptr;
     arena_ptr += hash_table_size;
+    if(any_need_normalized){
+        norm_unique = (InternTask**)arena_ptr;
+        arena_ptr += norm_unique_size;
+        norm_table = (InternHashEntry*)arena_ptr;
+        arena_ptr += norm_hash_size;
+    }
     char* utf8_storage = (char*)arena_ptr;
     for(size_t i = 0; i < ht_cap; ++i){
         table[i].index = SIZE_MAX;
         table[i].hash = 0;
+    }
+    arena_ptr += total_utf8_bytes;
+    if(any_need_normalized){
+        norm_storage = (char*)arena_ptr;
+        arena_ptr += total_normalized_bytes;
     }
     size_t storage_offset = 0;
     for(size_t i = 0; i < task_count; ++i){
@@ -1649,6 +1741,10 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, c
         t->leader = NULL;
         t->id = 0;
         t->normalized_id = 0;
+        t->normalized_utf8 = NULL;
+        t->normalized_len = 0;
+        t->normalized_hash = 0;
+        t->normalized_leader = NULL;
         size_t bucket = (size_t)(t->utf8_hash & (ht_cap - 1));
         for(;;){
             InternHashEntry* entry = &table[bucket];
@@ -1745,150 +1841,115 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, c
         header_dirty = TRUE;
     }
     if(any_need_normalized && unique_count){
-        size_t norm_candidates = 0;
-        size_t norm_total_bytes = 0;
+        size_t norm_hash_cap = ht_cap;
+        if(norm_table){
+            for(size_t i = 0; i < norm_hash_cap; ++i){
+                norm_table[i].index = SIZE_MAX;
+                norm_table[i].hash = 0;
+            }
+        }
+        size_t norm_offset = 0;
         for(size_t i = 0; i < unique_count; ++i){
             InternTask* leader = unique[i];
             if(!leader->need_normalized) continue;
             size_t bufcap = leader->utf8_len + 1;
             if(bufcap == 0) bufcap = 1;
-            if(bufcap > SIZE_MAX - norm_total_bytes) goto cleanup;
-            norm_total_bytes += bufcap;
-            norm_candidates++;
-        }
-        if(norm_candidates){
-            size_t norm_ht_cap = 1;
-            size_t norm_desired = (norm_candidates > SIZE_MAX / 2) ? SIZE_MAX : norm_candidates * 2;
-            if(norm_desired == 0) norm_desired = 1;
-            while(norm_ht_cap < norm_desired){
-                if(norm_ht_cap > SIZE_MAX / 2){
-                    goto cleanup;
-                }
-                norm_ht_cap <<= 1;
-            }
-            size_t norm_tasks_size = norm_candidates * sizeof(NormalizedTask);
-            size_t norm_unique_size = norm_candidates * sizeof(NormalizedTask*);
-            size_t norm_hash_size = norm_ht_cap * sizeof(InternHashEntry);
-            size_t norm_arena_size = norm_tasks_size;
-            if(norm_arena_size > SIZE_MAX - norm_unique_size) goto cleanup;
-            norm_arena_size += norm_unique_size;
-            if(norm_arena_size > SIZE_MAX - norm_hash_size) goto cleanup;
-            norm_arena_size += norm_hash_size;
-            if(norm_arena_size > SIZE_MAX - norm_total_bytes) goto cleanup;
-            norm_arena_size += norm_total_bytes;
-            if(norm_arena_size == 0) norm_arena_size = 1;
-            norm_arena = (uint8_t*)malloc(norm_arena_size);
-            if(!norm_arena) goto cleanup;
-            uint8_t* norm_ptr = norm_arena;
-            norm_tasks = (NormalizedTask*)norm_ptr;
-            norm_ptr += norm_tasks_size;
-            norm_unique = (NormalizedTask**)norm_ptr;
-            norm_ptr += norm_unique_size;
-            InternHashEntry* norm_table = (InternHashEntry*)norm_ptr;
-            norm_ptr += norm_hash_size;
-            char* norm_strings = (char*)norm_ptr;
-            for(size_t i = 0; i < norm_ht_cap; ++i){
-                norm_table[i].index = SIZE_MAX;
-                norm_table[i].hash = 0;
-            }
-            size_t norm_offset = 0;
-            for(size_t i = 0; i < unique_count; ++i){
-                InternTask* leader = unique[i];
-                if(!leader->need_normalized) continue;
-                size_t bufcap = leader->utf8_len + 1;
-                if(bufcap == 0) bufcap = 1;
+            if(norm_storage){
                 if(norm_offset > SIZE_MAX - bufcap) goto cleanup;
-                NormalizedTask* nt = &norm_tasks[norm_valid];
-                memset(nt, 0, sizeof(*nt));
-                nt->owner = leader;
-                nt->utf8 = norm_strings + norm_offset;
+                if(norm_offset + bufcap > total_normalized_bytes) goto cleanup;
+                char* buf = norm_storage + norm_offset;
                 norm_offset += bufcap;
-                normalize_filename_utf8(leader->utf8, nt->utf8, bufcap);
-                size_t nlen = strlen(nt->utf8);
-                nt->utf8_len = nlen;
-                nt->utf8_hash = hash64(nt->utf8, nlen);
-                size_t bucket = (size_t)(nt->utf8_hash & (norm_ht_cap - 1));
-                for(;;){
-                    InternHashEntry* entry = &norm_table[bucket];
-                    if(entry->index == SIZE_MAX){
-                        entry->index = norm_valid;
-                        entry->hash = nt->utf8_hash;
-                        nt->leader = nt;
-                        norm_unique[norm_unique_count++] = nt;
-                        break;
-                    }
-                    NormalizedTask* leader_nt = &norm_tasks[entry->index];
-                    if(entry->hash == nt->utf8_hash && leader_nt->utf8_len == nt->utf8_len && strcmp(leader_nt->utf8, nt->utf8) == 0){
-                        nt->leader = leader_nt;
-                        break;
-                    }
-                    bucket = (bucket + 1) & (norm_ht_cap - 1);
-                }
-                norm_valid++;
+                normalize_filename_utf8(leader->utf8, buf, bufcap);
+                leader->normalized_utf8 = buf;
+                leader->normalized_len = strlen(buf);
+                leader->normalized_hash = hash64(buf, leader->normalized_len);
+            } else {
+                leader->normalized_utf8 = NULL;
+                leader->normalized_len = 0;
+                leader->normalized_hash = 0;
             }
+            leader->normalized_leader = leader;
+            size_t bucket = (size_t)(leader->normalized_hash & (norm_hash_cap - 1));
+            for(;;){
+                InternHashEntry* entry = &norm_table[bucket];
+                if(entry->index == SIZE_MAX){
+                    entry->index = norm_unique_count;
+                    entry->hash = leader->normalized_hash;
+                    norm_unique[norm_unique_count++] = leader;
+                    break;
+                }
+                InternTask* existing = norm_unique[entry->index];
+                if(entry->hash == leader->normalized_hash && existing->normalized_len == leader->normalized_len && memcmp(existing->normalized_utf8, leader->normalized_utf8, leader->normalized_len) == 0){
+                    leader->normalized_leader = existing;
+                    break;
+                }
+                bucket = (bucket + 1) & (norm_hash_cap - 1);
+            }
+        }
+        for(size_t i = 0; i < norm_unique_count; ++i){
+            InternTask* leader = norm_unique[i];
+            if(!leader->normalized_utf8) continue;
+            leader->normalized_id = string_cache_lookup(leader->normalized_utf8, leader->normalized_hash);
+        }
+        if(rtxn){
             for(size_t i = 0; i < norm_unique_count; ++i){
-                NormalizedTask* nt = norm_unique[i];
-                nt->id = string_cache_lookup(nt->utf8, nt->utf8_hash);
-            }
-            if(rtxn){
-                for(size_t i = 0; i < norm_unique_count; ++i){
-                    NormalizedTask* nt = norm_unique[i];
-                    if(nt->id) continue;
-                    MDB_val k = {.mv_data = nt->utf8, .mv_size = nt->utf8_len};
-                    MDB_val v;
-                    if(mdb_get(rtxn, d->dbi_strrev, &k, &v) == 0){
-                        nt->id = *(uint64_t*)v.mv_data;
-                        string_cache_insert(nt->utf8, nt->utf8_hash, nt->id);
-                    }
+                InternTask* leader = norm_unique[i];
+                if(!leader->normalized_utf8) continue;
+                if(leader->normalized_id) continue;
+                MDB_val k = {.mv_data = leader->normalized_utf8, .mv_size = leader->normalized_len};
+                MDB_val v;
+                if(mdb_get(rtxn, d->dbi_strrev, &k, &v) == 0){
+                    leader->normalized_id = *(uint64_t*)v.mv_data;
+                    string_cache_insert(leader->normalized_utf8, leader->normalized_hash, leader->normalized_id);
                 }
             }
-            for(size_t i = 0; i < norm_unique_count; ++i){
-                NormalizedTask* nt = norm_unique[i];
-                if(nt->id) continue;
-                if(!d->wtxn && !db_begin_write(db_)){
-                    d->header_cache.string_count = original_count;
-                    goto cleanup;
-                }
-                uint64_t new_id = d->header_cache.string_count + 1;
-                d->header_cache.string_count = new_id;
-                MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-                size_t total_len = nt->utf8_len + sizeof(StringMeta);
-                uint8_t* storage = (uint8_t*)malloc(total_len);
-                if(!storage){
-                    d->header_cache.string_count = original_count;
-                    set_error(d, DB_ERROR_OS, 0, "out of memory");
-                    goto cleanup;
-                }
-                memcpy(storage, nt->utf8, nt->utf8_len);
-                StringMeta placeholder; string_meta_init(&placeholder);
-                memcpy(storage + nt->utf8_len, &placeholder, sizeof(placeholder));
-                MDB_val idval = {.mv_data = storage, .mv_size = total_len};
-                int rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
-                free(storage);
-                if(rc){
-                    d->header_cache.string_count = original_count;
-                    set_mdb_error(d, rc);
-                    goto cleanup;
-                }
-                MDB_val revkey = {.mv_data = nt->utf8, .mv_size = nt->utf8_len};
-                MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-                rc = mdb_put(d->wtxn, d->dbi_strrev, &revkey, &revid, 0);
-                if(rc){
-                    d->header_cache.string_count = original_count;
-                    set_mdb_error(d, rc);
-                    goto cleanup;
-                }
-                nt->id = new_id;
-                string_cache_insert(nt->utf8, nt->utf8_hash, nt->id);
-                header_dirty = TRUE;
+        }
+        for(size_t i = 0; i < norm_unique_count; ++i){
+            InternTask* leader = norm_unique[i];
+            if(!leader->normalized_utf8) continue;
+            if(leader->normalized_id) continue;
+            if(!d->wtxn && !db_begin_write(db_)){
+                d->header_cache.string_count = original_count;
+                goto cleanup;
             }
-            for(size_t i = 0; i < norm_valid; ++i){
-                NormalizedTask* nt = &norm_tasks[i];
-                NormalizedTask* leader = nt->leader ? nt->leader : nt;
-                if(leader->id){
-                    nt->owner->normalized_id = leader->id;
-                }
+            uint64_t new_id = d->header_cache.string_count + 1;
+            d->header_cache.string_count = new_id;
+            MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
+            size_t total_len = leader->normalized_len + sizeof(StringMeta);
+            uint8_t* storage = (uint8_t*)malloc(total_len);
+            if(!storage){
+                d->header_cache.string_count = original_count;
+                set_error(d, DB_ERROR_OS, 0, "out of memory");
+                goto cleanup;
             }
+            memcpy(storage, leader->normalized_utf8, leader->normalized_len);
+            StringMeta placeholder; string_meta_init(&placeholder);
+            memcpy(storage + leader->normalized_len, &placeholder, sizeof(placeholder));
+            MDB_val idval = {.mv_data = storage, .mv_size = total_len};
+            int rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
+            free(storage);
+            if(rc){
+                d->header_cache.string_count = original_count;
+                set_mdb_error(d, rc);
+                goto cleanup;
+            }
+            MDB_val revkey = {.mv_data = leader->normalized_utf8, .mv_size = leader->normalized_len};
+            MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
+            rc = mdb_put(d->wtxn, d->dbi_strrev, &revkey, &revid, 0);
+            if(rc){
+                d->header_cache.string_count = original_count;
+                set_mdb_error(d, rc);
+                goto cleanup;
+            }
+            leader->normalized_id = new_id;
+            string_cache_insert(leader->normalized_utf8, leader->normalized_hash, leader->normalized_id);
+            header_dirty = TRUE;
+        }
+        for(size_t i = 0; i < unique_count; ++i){
+            InternTask* leader = unique[i];
+            if(!leader->need_normalized) continue;
+            InternTask* norm_leader = leader->normalized_leader ? leader->normalized_leader : leader;
+            leader->normalized_id = norm_leader->normalized_id;
         }
     }
     if(header_dirty){
@@ -1915,9 +1976,8 @@ cleanup:
     if(need_abort && rtxn){
         mdb_txn_abort(rtxn);
     }
-    if(norm_arena) free(norm_arena);
     if(arena) free(arena);
-    if(tasks && tasks != stack_tasks) free(tasks);
+    if(tasks && !tasks_from_tls && tasks != stack_tasks) free(tasks);
 }
 
 
