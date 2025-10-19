@@ -2642,6 +2642,10 @@ int wmain(int argc, wchar_t** argv){
         fwprintf(stderr, L"Failed to create/open DB at %s (err=%d: %hs)\n", args.dbPath, cerr?cerr->detail:0, cerr?cerr->message:"");
         return 1;
     }
+    if(!db_set_bulk_mode(db, TRUE, 5)){
+        const DbError* derr = db_last_error(db);
+        fwprintf(stderr, L"Warning: failed to enable bulk DB mode (err=%d: %hs)\n", derr?derr->detail:0, derr?derr->message:"");
+    }
 
     size_t pool_bytes = dynamic_work_mem();
     size_t pool_capacity = pool_bytes / sizeof(DbWorkItem);
@@ -2766,6 +2770,20 @@ int wmain(int argc, wchar_t** argv){
     push_with_backoff(&ctx.queue, NULL, INFINITE, "main thread sentinel");
     WaitForSingleObject(writer, INFINITE);
     CloseHandle(writer);
+
+    if(!db_set_bulk_mode(db, FALSE, 0)){
+        const DbError* derr = db_last_error(db);
+        fwprintf(stderr, L"Warning: failed to disable bulk DB mode (err=%d: %hs)\n", derr?derr->detail:0, derr?derr->message:"");
+    }
+    if(db_begin_write(db)){
+        if(!db_commit_write_ex(db, TRUE)){
+            const DbError* derr = db_last_error(db);
+            fwprintf(stderr, L"Warning: final database sync failed (err=%d: %hs)\n", derr?derr->detail:0, derr?derr->message:"");
+        }
+    } else {
+        const DbError* derr = db_last_error(db);
+        fwprintf(stderr, L"Warning: failed to begin final sync transaction (err=%d: %hs)\n", derr?derr->detail:0, derr?derr->message:"");
+    }
 
     memcpy(st.drive_signatures, current_sigs, sizeof(current_sigs));
     FILETIME now; GetSystemTimeAsFileTime(&now);
