@@ -70,18 +70,12 @@ static uint64_t string_cache_lookup(const char* s, uint64_t h){
     if(partition_cap > PARTITION_STRIDE) partition_cap = PARTITION_STRIDE;
     size_t base_idx = (size_t)((h / CACHE_PARTITIONS) % partition_cap);
     StringCache* cache = g_string_cache[partition];
-    size_t idx = base_idx;
-    for(size_t probe = 0; probe < PARTITION_STRIDE; ++probe){
-        size_t next_idx = (base_idx + ((probe + 1) * (probe + 1))) % partition_cap;
-        if(idx >= partition_cap){
-            idx = next_idx;
-            continue;
-        }
+    for(size_t probe = 0; probe < partition_cap; ++probe){
+        size_t idx = (base_idx + probe) % partition_cap;
         StringCache* c = &cache[idx];
         char* str = atomic_load_char((volatile char**)&c->string);
         if(!str) return 0;
         if(str == STRING_CACHE_BUSY){
-            idx = next_idx;
             continue;
         }
         if(c->hash == h && strcmp(str, s) == 0){
@@ -93,7 +87,6 @@ static uint64_t string_cache_lookup(const char* s, uint64_t h){
                 return (uint64_t)cached_id;
             }
         }
-        idx = next_idx;
     }
     return 0;
 }
@@ -105,7 +98,6 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
     if(partition_cap == 0) return;
     if(partition_cap > PARTITION_STRIDE) partition_cap = PARTITION_STRIDE;
     size_t base_idx = (size_t)((h / CACHE_PARTITIONS) % partition_cap);
-    size_t idx = base_idx;
     size_t best_cold_idx = SIZE_MAX;
     LONG64 best_cold_stamp = LLONG_MAX;
     size_t fallback_idx = SIZE_MAX;
@@ -113,12 +105,8 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
     uint32_t id32 = (uint32_t)id;
     LONG64 stamp = InterlockedIncrement64(&g_string_cache_clock);
     StringCache* cache = g_string_cache[partition];
-    for(size_t probe = 0; probe < PARTITION_STRIDE; ++probe){
-        size_t next_idx = (base_idx + ((probe + 1) * (probe + 1))) % partition_cap;
-        if(idx >= partition_cap){
-            idx = next_idx;
-            continue;
-        }
+    for(size_t probe = 0; probe < partition_cap; ++probe){
+        size_t idx = (base_idx + probe) % partition_cap;
         StringCache* c = &cache[idx];
         char* str = atomic_load_char((volatile char**)&c->string);
         if(!str){
@@ -139,11 +127,9 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
                 InterlockedExchangePointer((PVOID*)&c->string, dup);
                 return;
             }
-            idx = next_idx;
             continue;
         }
         if(str == STRING_CACHE_BUSY){
-            idx = next_idx;
             continue;
         }
         if(c->hash == h && strcmp(str, s) == 0){
@@ -166,7 +152,6 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
                 best_cold_idx = idx;
             }
         }
-        idx = next_idx;
     }
     size_t victim_idx = (best_cold_idx != SIZE_MAX) ? best_cold_idx : fallback_idx;
     if(victim_idx == SIZE_MAX) return;
