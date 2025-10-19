@@ -78,11 +78,10 @@ static LONG64 atomic_dec64(volatile LONG64* v){ return __sync_sub_and_fetch(v, 1
 static LONG64 atomic_load64(volatile LONG64* v){ return __sync_add_and_fetch(v, 0); }
 #endif
 #define CP_UTF8 65001
-enum {
-    MAX_INDEXED_CONTENT = 1024 * 1024,          // 1MB
-    MAX_TOTAL_EPUB_SIZE = 4 * 1024 * 1024,      // 4MB safety cap for aggregated EPUB text
-    MAX_EPUB_HTML_FILES = 2048
-};
+
+#define MAX_INDEXED_CONTENT   ((size_t)1024 * 1024)        // 1MB
+#define MAX_TOTAL_EPUB_SIZE   ((size_t)4 * 1024 * 1024)    // 4MB safety cap for aggregated EPUB text
+#define MAX_EPUB_HTML_FILES   ((size_t)2048)
 #ifdef __APPLE__
 static void utf8_to_wide(const char* src, wchar_t* dst, size_t dstlen){
     if(!dstlen) return;
@@ -154,7 +153,42 @@ typedef struct BloomThreadParam {
     int index;
 } BloomThreadParam;
 
-typedef struct WriterCtx WriterCtx;
+typedef struct WriterSignal {
+#ifdef _WIN32
+    HANDLE event;
+#else
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    BOOL            signaled;
+    clockid_t       clock_id;
+#endif
+} WriterSignal;
+
+typedef struct WriterCtx {
+    Db* db;
+    int batch_size;
+    volatile BOOL done;
+    MPMCQueue queue;
+    CancelToken cancel;
+    ContentThreadPool* content_pool;
+    size_t grow_attempts;
+    DbWorkItem** backlog;
+    size_t backlog_head;
+    size_t backlog_tail;
+    size_t backlog_count;
+    size_t backlog_capacity;
+    DWORD push_timeout_ms;
+    int    min_batch_size;
+    int    max_batch_size;
+    DWORD  idle_wait_ms;
+    size_t consecutive_full_batches;
+    size_t consecutive_idle_waits;
+    WriterSignal data_signal;
+    int content_threads;
+    wchar_t db_path[MAX_PATH];
+} WriterCtx;
+
+static const size_t MAP_GROWTH_INCREMENT = 1ull * 1024ull * 1024ull * 1024ull; // 1 GB
 
 static MPMCQueue g_live_updates;
 MPMCQueue g_bloom_gen_queue;
@@ -1747,17 +1781,6 @@ static BOOL writer_process_content_results(WriterCtx* ctx,
     return TRUE;
 }
 
-typedef struct WriterSignal {
-#ifdef _WIN32
-    HANDLE event;
-#else
-    pthread_mutex_t mutex;
-    pthread_cond_t  cond;
-    BOOL            signaled;
-    clockid_t       clock_id;
-#endif
-} WriterSignal;
-
 static BOOL writer_signal_init(WriterSignal* sig){
     if(!sig) return FALSE;
 #ifdef _WIN32
@@ -1948,32 +1971,6 @@ static BOOL writer_finalize_batch(WriterCtx* ctx, BatchInternRequest* reqs, size
 }
 
 // ---- Writer context & thread ----
-typedef struct WriterCtx {
-    Db* db;
-    int batch_size;
-    volatile BOOL done;
-    MPMCQueue queue;
-    CancelToken cancel;
-    ContentThreadPool* content_pool;
-    size_t grow_attempts;
-    DbWorkItem** backlog;
-    size_t backlog_head;
-    size_t backlog_tail;
-    size_t backlog_count;
-    size_t backlog_capacity;
-    DWORD push_timeout_ms;
-    int    min_batch_size;
-    int    max_batch_size;
-    DWORD  idle_wait_ms;
-    size_t consecutive_full_batches;
-    size_t consecutive_idle_waits;
-    WriterSignal data_signal;
-    int content_threads;
-    wchar_t db_path[MAX_PATH];
-} WriterCtx;
-
-static const size_t MAP_GROWTH_INCREMENT = 1ull * 1024ull * 1024ull * 1024ull; // 1 GB
-
 static void writer_queue_on_push(void* param){
     WriterCtx* ctx = (WriterCtx*)param;
     if(!ctx) return;
