@@ -47,11 +47,8 @@ file(GLOB SERVICE_SOURCES "src/services/*.c")
 file(GLOB UI_SOURCES "src/ui/*.cpp")
 file(GLOB PLATFORM_WIN_SOURCES "src/platform/ntfs.c" "src/platform/scanner_win.c" "src/platform/wsl.c")
 
-# =============================================================================
-# Define Executable Targets
-# =============================================================================
-
-add_executable(anything
+# Group shared sources used by the main executable and plugins
+set(ANYTHING_CORE_SOURCES
     ${CORE_APP_SOURCES}
     ${CORE_ENGINE_SOURCES}
     ${CORE_SYSTEM_SOURCES}
@@ -59,36 +56,60 @@ add_executable(anything
     ${CORE_ENTERPRISE_SOURCES}
 )
 
+list(REMOVE_ITEM ANYTHING_CORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/app/anything_main_stub.c")
+
+# =============================================================================
+# Shared Core Library
+# =============================================================================
+
+add_library(anything_core STATIC ${ANYTHING_CORE_SOURCES})
+
+if(WIN32)
+    target_sources(anything_core PRIVATE ${PLATFORM_WIN_SOURCES})
+endif()
+
+target_link_libraries(anything_core PUBLIC
+    unofficial::lmdb::lmdb
+    LibArchive::LibArchive
+    CURL::libcurl
+    cjson
+)
+
+if(WIN32)
+    target_link_libraries(anything_core PUBLIC Shlwapi.lib Ole32.lib Query.lib)
+endif()
+
+# =============================================================================
+# Define Executable Targets
+# =============================================================================
+
+add_executable(anything src/app/anything_main_stub.c)
+
 add_executable(anything_ui
     ${UI_SOURCES}
-    ${CORE_ENGINE_SOURCES}
     "third_party/cJSON/cJSON.c"
 )
 
-add_executable(search_test "tests/search_test.c" "src/core/util.c")
-
-if(WIN32)
-    target_sources(anything PRIVATE ${PLATFORM_WIN_SOURCES})
-endif()
+add_executable(search_test "tests/search_test.c")
 
 # =============================================================================
 # Link Libraries to Executables
 # =============================================================================
 
 target_link_libraries(anything PRIVATE
-    unofficial::lmdb::lmdb
-    LibArchive::LibArchive
+    anything_core
 )
 
 target_link_libraries(anything_ui PRIVATE
-    unofficial::lmdb::lmdb
+    anything_core
     glfw
     CURL::libcurl
     cjson
 )
 
+target_link_libraries(search_test PRIVATE anything_core)
+
 if(WIN32)
-    target_link_libraries(anything PRIVATE Shlwapi.lib Ole32.lib Query.lib)
     target_link_libraries(anything_ui PRIVATE gdiplus.lib d2d1.lib dwrite.lib Shlwapi.lib Shell32.lib)
 endif()
 
@@ -98,13 +119,11 @@ endif()
 macro(add_anything_plugin name sources)
     add_library(${name} MODULE ${sources})
     target_link_libraries(${name} PRIVATE
+        anything_core
         unofficial::lmdb::lmdb
         cjson
         CURL::libcurl
     )
-    if(WIN32)
-        target_link_libraries(${name} PRIVATE Shlwapi.lib)
-    endif()
 endmacro()
 
 add_anything_plugin(code_plugin "plugins/code/code_plugin.c")
