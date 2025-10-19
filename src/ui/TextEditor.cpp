@@ -1,4 +1,8 @@
 #include "core/pch.h"
+
+#ifndef HAS_IMGUI
+void TextEditor_NoImGuiStub(void) {}
+#else
 #include <algorithm>
 #include <chrono>
 #include <string>
@@ -3166,3 +3170,5 @@ const TextEditor::LanguageDefinition& TextEditor::LanguageDefinition::Lua()
 	}
 	return langDef;
 }
+
+#endif // HAS_IMGUI

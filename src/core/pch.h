@@ -38,6 +38,9 @@
 #if __has_include(<filter.h>)
 #include <filter.h>
 #endif
+#if __has_include(<filterr.h>)
+#include <filterr.h>
+#endif
 #endif
 #else
 #include <lmdb.h>
@@ -67,4 +70,12 @@ extern "C" {
 #include "anything/util.h"
 #ifdef __cplusplus
 }
+#endif
+
+#if !defined(HAS_IMGUI)
+#if defined(__has_include)
+#if __has_include(<imgui.h>) && __has_include(<imgui_impl_glfw.h>) && __has_include(<imgui_impl_opengl3.h>)
+#define HAS_IMGUI 1
+#endif
+#endif
 #endif
