@@ -2430,7 +2430,11 @@ static BOOL record_is_names_only(const DbRecord* r){
     return TRUE;
 }
 
-BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
+static BOOL db_put_records_internal(Db* db_,
+                                    DbRecord* recs,
+                                    size_t count,
+                                    const DbStringInternRequest* strings,
+                                    size_t string_count){
     DbImpl* d = (DbImpl*)db_;
     if(!d->wtxn){ if(!db_begin_write(db_)) return FALSE; }
     if(count == 0){ set_error(d, DB_ERROR_NONE, 0, NULL); return TRUE; }
@@ -2446,6 +2450,18 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
     MDB_txn* parent_txn = d->wtxn;
     d->last_write_progress = 0;
     BOOL result = TRUE;
+    BOOL commit_succeeded = FALSE;
+
+    const DbStringInternRequest** request_refs = NULL;
+    const wchar_t** intern_strings = NULL;
+    uint8_t* intern_needs_norm = NULL;
+    uint64_t* intern_ids = NULL;
+    uint64_t* intern_norm_ids = NULL;
+    uint64_t* intern_target_backup = NULL;
+    uint64_t* intern_norm_backup = NULL;
+    size_t intern_active = 0;
+    BOOL intern_any_norm = FALSE;
+    BOOL assigned_intern_targets = FALSE;
 
     IndexEntry64* fname_entries = NULL; size_t fname_count = 0, fname_cap = 0;
     IndexEntry64* parent_entries = NULL; size_t parent_count = 0, parent_cap = 0;
@@ -2462,6 +2478,54 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
     IndexEntry64* artist_entries = NULL; size_t artist_count = 0, artist_cap = 0;
     IndexEntry64* album_entries = NULL; size_t album_count = 0, album_cap = 0;
     IndexEntry64* title_entries = NULL; size_t title_count = 0, title_cap = 0;
+
+    if(strings && string_count){
+        for(size_t i = 0; i < string_count; ++i){
+            const DbStringInternRequest* req = &strings[i];
+            if(!req->str || !req->target) continue;
+            intern_active++;
+            if(req->need_normalized || req->normalized_target) intern_any_norm = TRUE;
+        }
+        if(intern_active){
+            request_refs = (const DbStringInternRequest**)malloc(sizeof(*request_refs) * intern_active);
+            intern_strings = (const wchar_t**)malloc(sizeof(*intern_strings) * intern_active);
+            intern_needs_norm = (uint8_t*)malloc(sizeof(*intern_needs_norm) * intern_active);
+            intern_ids = (uint64_t*)malloc(sizeof(*intern_ids) * intern_active);
+            intern_target_backup = (uint64_t*)malloc(sizeof(*intern_target_backup) * intern_active);
+            if(intern_any_norm){
+                intern_norm_ids = (uint64_t*)malloc(sizeof(*intern_norm_ids) * intern_active);
+                intern_norm_backup = (uint64_t*)malloc(sizeof(*intern_norm_backup) * intern_active);
+            }
+            if(!request_refs || !intern_strings || !intern_needs_norm || !intern_ids ||
+               (intern_any_norm && (!intern_norm_ids || !intern_norm_backup)) ||
+               !intern_target_backup){
+                free(request_refs);
+                free(intern_strings);
+                free(intern_needs_norm);
+                free(intern_ids);
+                free(intern_target_backup);
+                if(intern_norm_ids) free(intern_norm_ids);
+                if(intern_norm_backup) free(intern_norm_backup);
+                set_error(d, DB_ERROR_OS, 0, "out of memory");
+                return FALSE;
+            }
+            size_t idx = 0;
+            for(size_t i = 0; i < string_count; ++i){
+                const DbStringInternRequest* req = &strings[i];
+                if(!req->str || !req->target) continue;
+                request_refs[idx] = req;
+                intern_strings[idx] = req->str;
+                uint8_t need_norm = (uint8_t)(req->need_normalized || req->normalized_target ? 1 : 0);
+                intern_needs_norm[idx] = need_norm;
+                intern_target_backup[idx] = *(req->target);
+                if(intern_any_norm && intern_norm_backup){
+                    uint64_t existing = req->normalized_target ? *(req->normalized_target) : 0;
+                    intern_norm_backup[idx] = existing;
+                }
+                idx++;
+            }
+        }
+    }
 
 retry_batch:
     if(attempt++ >= MAX_BATCH_RETRIES){
@@ -2492,10 +2556,46 @@ retry_batch:
 
     d->wtxn = batch_txn;
 
+    if(intern_active){
+        db_intern_wstrings_batched(db_,
+                                   intern_strings,
+                                   intern_needs_norm,
+                                   intern_active,
+                                   intern_ids,
+                                   intern_any_norm ? intern_norm_ids : NULL);
+        for(size_t i = 0; i < intern_active; ++i){
+            const DbStringInternRequest* req = request_refs[i];
+            if(req->target){
+                *(req->target) = intern_ids[i];
+            }
+            if(req->normalized_target && intern_norm_ids){
+                *(req->normalized_target) = intern_norm_ids[i];
+            }
+        }
+        assigned_intern_targets = TRUE;
+    }
+
     fname_count = parent_count = path_count = size_count = date_count = mtime_count = 0;
     attr_count = 0;
     ext_count = 0;
     content_count = author_count = camera_count = lens_count = artist_count = album_count = title_count = 0;
+
+    #define RESTORE_INTERN_TARGETS()                                                   \
+        do {                                                                           \
+            if(assigned_intern_targets){                                               \
+                for(size_t i_restore = 0; i_restore < intern_active; ++i_restore){     \
+                    const DbStringInternRequest* req_restore = request_refs[i_restore];\
+                    if(req_restore->target && intern_target_backup){                   \
+                        *(req_restore->target) = intern_target_backup[i_restore];      \
+                    }                                                                  \
+                    if(req_restore->normalized_target && intern_norm_backup){          \
+                        *(req_restore->normalized_target) =                           \
+                            intern_norm_backup[i_restore];                             \
+                    }                                                                  \
+                }                                                                      \
+                assigned_intern_targets = FALSE;                                       \
+            }                                                                          \
+        } while(0)
 
     for(; success && processed<count; ++processed){
         const DbRecord* r = &recs[processed];
@@ -2763,6 +2863,7 @@ retry_batch:
             goto cleanup;
         }
         Sleep(1);
+        RESTORE_INTERN_TARGETS();
         goto retry_batch;
     }
 
@@ -2781,6 +2882,7 @@ retry_batch:
             goto cleanup;
         }
         Sleep(1);
+        RESTORE_INTERN_TARGETS();
         goto retry_batch;
     }
 
@@ -2790,9 +2892,15 @@ retry_batch:
     d->last_write_progress = count;
     set_error(d, DB_ERROR_NONE,0,NULL);
     result = TRUE;
+    assigned_intern_targets = FALSE;
+    commit_succeeded = TRUE;
     goto cleanup;
 
 cleanup:
+    if(!commit_succeeded){
+        RESTORE_INTERN_TARGETS();
+    }
+    #undef RESTORE_INTERN_TARGETS
     free(fname_entries);
     free(parent_entries);
     free(path_entries);
@@ -2808,7 +2916,26 @@ cleanup:
     free(artist_entries);
     free(album_entries);
     free(title_entries);
+    free(request_refs);
+    free(intern_strings);
+    free(intern_needs_norm);
+    free(intern_ids);
+    free(intern_norm_ids);
+    free(intern_target_backup);
+    free(intern_norm_backup);
     return result;
+}
+
+BOOL db_put_records(Db* db_, DbRecord* recs, size_t count){
+    return db_put_records_internal(db_, recs, count, NULL, 0);
+}
+
+BOOL db_put_records_with_strings(Db* db_,
+                                 DbRecord* recs,
+                                 size_t count,
+                                 const DbStringInternRequest* strings,
+                                 size_t string_count){
+    return db_put_records_internal(db_, recs, count, strings, string_count);
 }
 
 static BOOL db_delete_record(DbImpl* d, uint64_t id, const DbRecord* r){
