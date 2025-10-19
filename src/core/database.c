@@ -108,6 +108,7 @@ static inline BOOL bloom_has(const uint8_t* bloom, uint32_t h, uint32_t mask);
 static void set_error(DbImpl* d, DbErrorCode code, int detail, const char* msg);
 static void set_mdb_error(DbImpl* d, int rc);
 static void set_sys_error(DbImpl* d, DWORD err);
+static uint32_t build_bloom_from_context(NameBloomContext* ctx, uint8_t* bloom);
 
 static inline size_t string_cache_partition_capacity(size_t partition){
     size_t cap = CACHE_PARTITION_BASE;
