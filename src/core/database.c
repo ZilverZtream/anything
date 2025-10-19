@@ -1770,7 +1770,7 @@ static void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, c
     }
     DbImpl* d = (DbImpl*)db_;
     size_t task_cap = 0;
-    InternTask stack_tasks[8];
+    InternTask stack_tasks[8] = {0};
     BOOL tasks_from_tls = FALSE;
     InternTask* tasks = acquire_task_buffer(count, stack_tasks, ARRAYSIZE(stack_tasks), &task_cap, &tasks_from_tls);
     InternTask** unique = NULL;
