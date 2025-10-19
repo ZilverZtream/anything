@@ -60,7 +60,6 @@ file(GLOB PLATFORM_UNIX_SOURCES "src/platform/scanner_linux.c" "src/platform/wsl
 
 # Group shared sources used by the main executable and plugins
 set(ANYTHING_CORE_SOURCES
-    ${CORE_APP_SOURCES}
     ${CORE_ENGINE_SOURCES}
     ${CORE_SYSTEM_SOURCES}
     ${SERVICE_SOURCES}
@@ -105,7 +104,7 @@ endif()
 # Define Executable Targets
 # =============================================================================
 
-add_executable(anything)
+add_executable(anything src/app/anything.c)
 
 add_executable(anything_ui)
 
