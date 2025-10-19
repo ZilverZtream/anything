@@ -74,20 +74,6 @@ typedef struct CompressedTrigram {
     uint32_t* string_ids;      // delta-encoded string IDs
 } CompressedTrigram;
 
-typedef enum {
-    DB_ERROR_NONE = 0,
-    DB_ERROR_INVALID_ARGUMENT,
-    DB_ERROR_MEMORY,
-    DB_ERROR_LMDB,
-    DB_ERROR_OS
-} DbErrorCode;
-
-typedef struct DbError {
-    DbErrorCode code;
-    int         detail;
-    char        message[256];
-} DbError;
-
 BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** out_db);
 const DbHeader* db_open_readonly(const wchar_t* path, Db** out_db);
 void db_close(Db* db);
