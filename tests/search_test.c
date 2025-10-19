@@ -1,4 +1,7 @@
 #define _GNU_SOURCE
+#ifdef _WIN32
+#define _CRT_INTERNAL_NONSTDC_NAMES 1
+#endif
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -7,6 +10,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+
+#ifdef _WIN32
+static time_t timegm(struct tm* tm){
+    return _mkgmtime(tm);
+}
+#endif
 
 #ifndef _WIN32
 #include <strings.h>
