@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <errno.h>
+#include <libpst/libpst.h>
 #define Sleep(ms) usleep((ms)*1000)
 #define _stricmp strcasecmp
 #define _strnicmp strncasecmp
@@ -324,7 +325,16 @@ void live_updates_push_progress(uint64_t processed_count, BOOL done){
 #include "anything/metadata.h"
 
 // ---- MPMC queue implementation ----
-typedef enum { CONTENT_NONE, CONTENT_TEXT, CONTENT_IFILTER, CONTENT_EMAIL, CONTENT_EPUB, CONTENT_PST } ContentMode;
+typedef enum {
+    CONTENT_NONE,
+    CONTENT_TEXT,
+    CONTENT_IFILTER,
+    CONTENT_EMAIL,
+    CONTENT_EPUB
+#ifndef _WIN32
+    , CONTENT_PST
+#endif
+} ContentMode;
 
 static ContentMode get_content_mode(const wchar_t* name){
     const wchar_t* ext = wcsrchr(name, L'.');
@@ -356,8 +366,10 @@ static ContentMode get_content_mode(const wchar_t* name){
     if(_wcsicmp(ext,L"epub")==0)
         return CONTENT_EPUB;
 
+#ifndef _WIN32
     if(_wcsicmp(ext,L"pst")==0)
         return CONTENT_PST;
+#endif
 
     return CONTENT_NONE;
 }
@@ -837,6 +849,7 @@ static void append_utf8_line(char** buf, size_t* len, size_t* cap, const char* s
     (*buf)[*len]=0;
 }
 
+#ifndef _WIN32
 static void walk_pst_tree(pst_file* pf, pst_desc_tree* node, char** buf, size_t* len, size_t* cap){
     for(pst_desc_tree* cur=node; cur; cur=cur->next){
         pst_item* item = pst_parse_item(pf, cur, NULL);
@@ -882,6 +895,7 @@ static wchar_t* extract_pst_content(const wchar_t* path, wchar_t** author_out, w
     }
     return wbuf;
 }
+#endif
 
 static uint16_t exif_rd16(const uint8_t* p, int be){
     return be ? (uint16_t)(p[0]<<8 | p[1]) : (uint16_t)(p[1]<<8 | p[0]);
@@ -1097,8 +1111,10 @@ static BOOL index_file_content(const wchar_t* parent,
         wbuf = extract_email_content(path, &author_local, &title_local);
     } else if(mode == CONTENT_EPUB){
         wbuf = extract_epub_content(path, &author_local, &title_local);
+#ifndef _WIN32
     } else if(mode == CONTENT_PST){
         wbuf = extract_pst_content(path, &author_local, &title_local);
+#endif
     }
 
     if(!wbuf){

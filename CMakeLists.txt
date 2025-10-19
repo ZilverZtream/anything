@@ -29,7 +29,10 @@ find_package(unofficial-gumbo CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(libzip CONFIG REQUIRED)
-find_package(libpst CONFIG REQUIRED)
+
+if(UNIX)
+    find_package(libpst CONFIG REQUIRED)
+endif()
 
 if(UNIX AND NOT APPLE)
     find_package(e2fsprogs CONFIG REQUIRED)
@@ -85,8 +88,11 @@ target_link_libraries(anything_core PUBLIC
     CURL::libcurl
     cjson
     libzip::zip
-    libpst::libpst
 )
+
+if(UNIX)
+    target_link_libraries(anything_core PUBLIC libpst::libpst)
+endif()
 
 if(UNIX AND NOT APPLE)
     target_link_libraries(anything_core PUBLIC e2fsprogs::ext2fs)
