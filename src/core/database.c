@@ -2557,23 +2557,6 @@ retry_batch:
         bloom_committed_before = d->bloom_committed_tail;
     }
 
-    MDB_txn* batch_txn = NULL;
-    int rc = mdb_txn_begin(d->env, parent_txn, 0, &batch_txn);
-    if(rc){
-        d->dirty = dirty_before;
-        set_mdb_error(d, rc);
-        d->header_cache = header_before;
-        d->bloom_offset = bloom_offset_before;
-        result = FALSE;
-        goto cleanup;
-    }
-
-    DbHeader header_tmp = header_before;
-    size_t processed = 0;
-    BOOL success = TRUE;
-
-    d->wtxn = batch_txn;
-
     if(intern_active){
         db_intern_wstrings_batched(db_,
                                    intern_strings,
@@ -2592,6 +2575,23 @@ retry_batch:
         }
         assigned_intern_targets = TRUE;
     }
+
+    MDB_txn* batch_txn = NULL;
+    int rc = mdb_txn_begin(d->env, parent_txn, 0, &batch_txn);
+    if(rc){
+        d->dirty = dirty_before;
+        set_mdb_error(d, rc);
+        d->header_cache = header_before;
+        d->bloom_offset = bloom_offset_before;
+        result = FALSE;
+        goto cleanup;
+    }
+
+    DbHeader header_tmp = header_before;
+    size_t processed = 0;
+    BOOL success = TRUE;
+
+    d->wtxn = batch_txn;
 
     fname_count = parent_count = path_count = size_count = date_count = mtime_count = 0;
     attr_count = 0;
