@@ -11,6 +11,67 @@
 #include <limits.h>
 #pragma comment(lib, "shlwapi.lib")
 
+typedef struct {
+    uint64_t key;
+    uint64_t value;
+} IndexEntry64;
+
+typedef struct {
+    uint32_t key;
+    uint64_t value;
+} IndexEntry32;
+
+typedef struct {
+    char key[32];
+    uint8_t len;
+    uint64_t value;
+} ExtensionEntry;
+
+typedef struct {
+    MDB_env* env;
+    MDB_dbi  dbi_meta;
+    MDB_dbi  dbi_strings;
+    MDB_dbi  dbi_strrev;
+    MDB_dbi  dbi_records;
+    MDB_dbi  dbi_fname_index;
+    MDB_dbi  dbi_parent_index;
+    MDB_dbi  dbi_size_index;      // key: uint64 size        → rec_id (dups)
+    MDB_dbi  dbi_date_index;      // key: uint64 day         → rec_id (dups)
+    MDB_dbi  dbi_mtime_index;     // key: uint64 modified    → rec_id (dups)
+    MDB_dbi  dbi_attr_index;      // key: uint32 attributes  → rec_id (dups)
+    MDB_dbi  dbi_extension_index; // key: utf8 ext   → rec_id (dups)
+    MDB_dbi  dbi_path_hierarchy;  // key: parent_id  → rec_id (dups)
+    MDB_dbi  dbi_trigram_index;   // key: 3 bytes    → string_id (dups)
+    MDB_dbi  dbi_content_index;   // key: content_str_id → rec_id (dups)
+    MDB_dbi  dbi_author_index;    // key: author_str_id  → rec_id (dups)
+    MDB_dbi  dbi_camera_index;    // key: camera_str_id  → rec_id (dups)
+    MDB_dbi  dbi_lens_index;      // key: lens_str_id    → rec_id (dups)
+    MDB_dbi  dbi_artist_index;    // key: artist_str_id  → rec_id (dups)
+    MDB_dbi  dbi_album_index;     // key: album_str_id   → rec_id (dups)
+    MDB_dbi  dbi_title_index;     // key: title_str_id   → rec_id (dups)
+    MDB_txn* wtxn;
+    DbError  last_error;
+    size_t   map_init;
+    size_t   map_max;
+    HANDLE   bloom_file;
+    HANDLE   bloom_mapping;
+    uint8_t* bloom_map_view;
+    size_t   bloom_map_capacity;
+    volatile LONG64 bloom_tail;
+    uint64_t bloom_committed_tail;
+    uint64_t bloom_file_size;
+    uint64_t bloom_offset;
+    BOOL     dirty;
+    DbHeader header_cache;
+    IndexLoadState load_state;
+    size_t   last_write_progress;
+    BOOL     bulk_mode;
+    DWORD    bulk_sync_interval_ms;
+    ULONGLONG bulk_last_sync_tick;
+    size_t   bulk_unsynced_commits;
+    size_t   bulk_sync_commit_limit;
+} DbImpl;
+
 #ifndef _strdup
 #define _strdup strdup
 #endif
@@ -1211,51 +1272,6 @@ uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom){
 
 #define ALIGN_UP(x,a)   (((x)+(a)-1) & ~((a)-1))
 
-typedef struct {
-    MDB_env* env;
-    MDB_dbi  dbi_meta;
-    MDB_dbi  dbi_strings;
-    MDB_dbi  dbi_strrev;
-    MDB_dbi  dbi_records;
-    MDB_dbi  dbi_fname_index;
-    MDB_dbi  dbi_parent_index;
-    MDB_dbi  dbi_size_index;      // key: uint64 size        → rec_id (dups)
-    MDB_dbi  dbi_date_index;      // key: uint64 day         → rec_id (dups)
-    MDB_dbi  dbi_mtime_index;     // key: uint64 modified    → rec_id (dups)
-    MDB_dbi  dbi_attr_index;      // key: uint32 attributes  → rec_id (dups)
-    MDB_dbi  dbi_extension_index; // key: utf8 ext   → rec_id (dups)
-    MDB_dbi  dbi_path_hierarchy;  // key: parent_id  → rec_id (dups)
-    MDB_dbi  dbi_trigram_index;   // key: 3 bytes    → string_id (dups)
-    MDB_dbi  dbi_content_index;  // key: content_str_id → rec_id (dups)
-    MDB_dbi  dbi_author_index;   // key: author_str_id  → rec_id (dups)
-    MDB_dbi  dbi_camera_index;   // key: camera_str_id  → rec_id (dups)
-    MDB_dbi  dbi_lens_index;     // key: lens_str_id    → rec_id (dups)
-    MDB_dbi  dbi_artist_index;   // key: artist_str_id  → rec_id (dups)
-    MDB_dbi  dbi_album_index;    // key: album_str_id   → rec_id (dups)
-    MDB_dbi  dbi_title_index;    // key: title_str_id   → rec_id (dups)
-    MDB_txn* wtxn;
-    DbError  last_error;
-    size_t   map_init;
-    size_t   map_max;
-    HANDLE   bloom_file;
-    HANDLE   bloom_mapping;
-    uint8_t* bloom_map_view;
-    size_t   bloom_map_capacity;
-    volatile LONG64 bloom_tail;
-    uint64_t bloom_committed_tail;
-    uint64_t bloom_file_size;
-    uint64_t bloom_offset;
-    BOOL     dirty;
-    DbHeader header_cache;
-    IndexLoadState load_state;
-    size_t   last_write_progress;
-    BOOL     bulk_mode;
-    DWORD    bulk_sync_interval_ms;
-    ULONGLONG bulk_last_sync_tick;
-    size_t   bulk_unsynced_commits;
-    size_t   bulk_sync_commit_limit;
-} DbImpl;
-
 static const size_t BLOOM_BUFFER_CHUNK = 1u << 20; // 1 MB
 
 static const size_t DEFAULT_BULK_SYNC_COMMIT_LIMIT = 4096;
@@ -1282,10 +1298,6 @@ static void db_mark_synced(Db* db_){
     d->bulk_unsynced_commits = 0;
     d->bulk_last_sync_tick = GetTickCount64();
 }
-
-typedef struct { uint64_t key; uint64_t value; } IndexEntry64;
-typedef struct { uint32_t key; uint64_t value; } IndexEntry32;
-typedef struct { char key[32]; uint8_t len; uint64_t value; } ExtensionEntry;
 
 static void set_error(DbImpl* d, DbErrorCode code, int detail, const char* msg){
     if(!d) return;
