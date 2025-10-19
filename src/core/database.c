@@ -593,60 +593,137 @@ static BOOL string_value_update(DbImpl* d, uint64_t id, const MDB_val* current, 
     return TRUE;
 }
 
-static BOOL bloom_buffer_ensure(DbImpl* d, size_t additional){
-    if(!d) return FALSE;
-    size_t needed = d->bloom_buffer_len + additional;
-    if(needed <= d->bloom_buffer_cap) return TRUE;
-    size_t newcap = d->bloom_buffer_cap ? d->bloom_buffer_cap : BLOOM_BUFFER_CHUNK;
-    while(newcap < needed){
-        newcap += BLOOM_BUFFER_CHUNK;
-    }
-    uint8_t* tmp = (uint8_t*)realloc(d->bloom_buffer, newcap);
-    if(!tmp){
-        set_error(d, DB_ERROR_OS, 0, "out of memory");
-        return FALSE;
-    }
-    d->bloom_buffer = tmp;
-    d->bloom_buffer_cap = newcap;
-    return TRUE;
+static size_t bloom_storage_align(size_t size){
+    size_t chunk = BLOOM_BUFFER_CHUNK;
+    if(chunk == 0) return size;
+    size_t rem = size % chunk;
+    if(rem == 0) return size;
+    size_t aligned = size + (chunk - rem);
+    if(aligned < size) return size;
+    return aligned;
 }
 
-static BOOL bloom_buffer_append(DbImpl* d, const uint8_t* data, size_t size){
-    if(!d || !data || size == 0) return TRUE;
-    if(!bloom_buffer_ensure(d, size)) return FALSE;
-    memcpy(d->bloom_buffer + d->bloom_buffer_len, data, size);
-    d->bloom_buffer_len += size;
-    d->bloom_offset = d->bloom_file_size + d->bloom_buffer_len;
-    return TRUE;
+static size_t bloom_storage_estimate(const DbImpl* d){
+    if(!d) return BLOOM_BUFFER_CHUNK;
+    uint64_t strings = d->header_cache.string_count;
+    uint64_t batches = (strings + 999ull) / 1000ull;
+    uint64_t estimate = batches * 100ull;
+    if(estimate < BLOOM_BUFFER_CHUNK) estimate = BLOOM_BUFFER_CHUNK;
+    if(estimate < d->bloom_file_size) estimate = d->bloom_file_size;
+    if(estimate > SIZE_MAX) estimate = SIZE_MAX;
+    return bloom_storage_align((size_t)estimate);
 }
 
-static BOOL bloom_buffer_flush(DbImpl* d){
+static BOOL bloom_storage_remap(DbImpl* d, size_t new_cap){
     if(!d || !d->bloom_file) return FALSE;
-    if(d->bloom_buffer_len == 0) return TRUE;
-    LARGE_INTEGER li; li.QuadPart = (LONGLONG)d->bloom_file_size;
-    if(!SetFilePointerEx(d->bloom_file, li, NULL, FILE_BEGIN)){
+    if(new_cap == 0) new_cap = BLOOM_BUFFER_CHUNK;
+    LARGE_INTEGER li; li.QuadPart = (LONGLONG)new_cap;
+    if(!SetFilePointerEx(d->bloom_file, li, NULL, FILE_BEGIN) || !SetEndOfFile(d->bloom_file)){
         set_sys_error(d, GetLastError());
         return FALSE;
     }
-    size_t written = 0;
-    uint64_t original_size = d->bloom_file_size;
-    while(written < d->bloom_buffer_len){
-        size_t remaining = d->bloom_buffer_len - written;
-        DWORD chunk = (DWORD)((remaining < BLOOM_BUFFER_CHUNK) ? remaining : BLOOM_BUFFER_CHUNK);
-        DWORD wr = 0;
-        if(!WriteFile(d->bloom_file, d->bloom_buffer + written, chunk, &wr, NULL) || wr != chunk){
-            set_sys_error(d, GetLastError());
-            LARGE_INTEGER rollback; rollback.QuadPart = (LONGLONG)original_size;
-            SetFilePointerEx(d->bloom_file, rollback, NULL, FILE_BEGIN);
-            SetEndOfFile(d->bloom_file);
+    HANDLE mapping = CreateFileMappingW(d->bloom_file, NULL, PAGE_READWRITE, li.HighPart, li.LowPart, NULL);
+    if(!mapping){
+        set_sys_error(d, GetLastError());
+        return FALSE;
+    }
+    uint8_t* view = (uint8_t*)MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0);
+    if(!view){
+        set_sys_error(d, GetLastError());
+        CloseHandle(mapping);
+        return FALSE;
+    }
+    if(d->bloom_map_view) UnmapViewOfFile(d->bloom_map_view);
+    if(d->bloom_mapping) CloseHandle(d->bloom_mapping);
+    d->bloom_mapping = mapping;
+    d->bloom_map_view = view;
+    d->bloom_map_capacity = new_cap;
+    return TRUE;
+}
+
+static BOOL bloom_storage_ensure(DbImpl* d, size_t additional){
+    if(!d) return FALSE;
+    uint64_t current_tail = (uint64_t)InterlockedCompareExchange64(&d->bloom_tail, 0, 0);
+    uint64_t needed = current_tail + additional;
+    if(needed <= d->bloom_map_capacity) return TRUE;
+    size_t new_cap = d->bloom_map_capacity ? d->bloom_map_capacity : bloom_storage_estimate(d);
+    if(new_cap < d->bloom_file_size) new_cap = (size_t)bloom_storage_align((size_t)d->bloom_file_size);
+    while(new_cap < needed){
+        size_t next = new_cap + BLOOM_BUFFER_CHUNK;
+        if(next < new_cap){
+            next = SIZE_MAX;
+        }
+        new_cap = next;
+        if(new_cap == SIZE_MAX) break;
+    }
+    if(new_cap < needed) new_cap = (size_t)needed;
+    new_cap = bloom_storage_align(new_cap);
+    return bloom_storage_remap(d, new_cap);
+}
+
+static BOOL bloom_storage_append(DbImpl* d, const uint8_t* data, size_t size, uint64_t* out_offset){
+    if(!d) return FALSE;
+    if(!data || size == 0){
+        if(out_offset) *out_offset = 0;
+        return TRUE;
+    }
+    uint64_t current_tail = (uint64_t)InterlockedCompareExchange64(&d->bloom_tail, 0, 0);
+    if(current_tail > UINT64_MAX - size){
+        set_error(d, DB_ERROR_OS, 0, "bloom file too large");
+        return FALSE;
+    }
+    if(!bloom_storage_ensure(d, size)) return FALSE;
+    uint64_t offset = (uint64_t)InterlockedExchangeAdd64(&d->bloom_tail, (LONG64)size);
+    if(offset > UINT64_MAX - size){
+        set_error(d, DB_ERROR_OS, 0, "bloom file too large");
+        return FALSE;
+    }
+    if(offset + size > d->bloom_map_capacity){
+        size_t extra = (size_t)((offset + size) - d->bloom_map_capacity);
+        if(!bloom_storage_ensure(d, extra)) return FALSE;
+    }
+    if(!d->bloom_map_view){
+        if(!bloom_storage_remap(d, bloom_storage_align((size_t)(offset + size)))){
             return FALSE;
         }
-        written += wr;
-        d->bloom_file_size += wr;
     }
-    d->bloom_buffer_len = 0;
-    d->bloom_offset = d->bloom_file_size;
+    memcpy(d->bloom_map_view + offset, data, size);
+    MemoryBarrier();
+    uint64_t new_size = offset + size;
+    if(new_size > d->bloom_file_size) d->bloom_file_size = new_size;
+    if(new_size > d->bloom_offset) d->bloom_offset = new_size;
+    if(out_offset) *out_offset = offset;
     return TRUE;
+}
+
+static BOOL bloom_storage_flush(DbImpl* d){
+    if(!d) return FALSE;
+    if(!d->bloom_map_view) return TRUE;
+    uint64_t committed = d->bloom_committed_tail;
+    uint64_t tail = (uint64_t)InterlockedCompareExchange64(&d->bloom_tail, 0, 0);
+    if(tail <= committed) return TRUE;
+    SIZE_T len = (SIZE_T)(tail - committed);
+    if(len == 0) return TRUE;
+    if(!FlushViewOfFile(d->bloom_map_view + committed, len)){
+        set_sys_error(d, GetLastError());
+        return FALSE;
+    }
+    d->bloom_committed_tail = tail;
+    return TRUE;
+}
+
+static void bloom_storage_release(DbImpl* d){
+    if(!d) return;
+    if(d->bloom_map_view){
+        FlushViewOfFile(d->bloom_map_view, 0);
+        UnmapViewOfFile(d->bloom_map_view);
+        d->bloom_map_view = NULL;
+    }
+    if(d->bloom_mapping){
+        CloseHandle(d->bloom_mapping);
+        d->bloom_mapping = NULL;
+    }
+    d->bloom_map_capacity = 0;
 }
 
 static BOOL ensure_bloom_for_string(DbImpl* d, uint64_t str_id, MDB_val* value, NameBloomContext* ctx, StringMeta* existing_meta, uint64_t* bloom_offset_tmp){
@@ -659,6 +736,7 @@ static BOOL ensure_bloom_for_string(DbImpl* d, uint64_t str_id, MDB_val* value, 
             return TRUE;
         }
         if(existing_meta->bloom_pending){
+            bloom_generator_request(str_id);
             return TRUE;
         }
     }
@@ -707,6 +785,7 @@ static BOOL ensure_bloom_for_string(DbImpl* d, uint64_t str_id, MDB_val* value, 
         d->dirty = TRUE;
     }
     if(existing_meta) *existing_meta = placeholder;
+    bloom_generator_request(str_id);
     return TRUE;
 }
 
@@ -785,12 +864,8 @@ BOOL db_apply_generated_bloom(Db* db_, const BloomResultItem* result){
     meta.bloom_pending = 0;
 
     if(result->bloom_data && result->bloom_data_len > 0){
-        if(d->bloom_offset > UINT64_MAX - result->bloom_data_len){
-            set_error(d, DB_ERROR_OS, 0, "bloom file too large");
-            return FALSE;
-        }
-        uint64_t bloom_offset = d->bloom_offset;
-        if(!bloom_buffer_append(d, result->bloom_data, result->bloom_data_len)){
+        uint64_t bloom_offset = 0;
+        if(!bloom_storage_append(d, result->bloom_data, result->bloom_data_len, &bloom_offset)){
             return FALSE;
         }
         meta.bloom_offset = bloom_offset;
@@ -1170,9 +1245,11 @@ typedef struct {
     size_t   map_init;
     size_t   map_max;
     HANDLE   bloom_file;
-    uint8_t* bloom_buffer;
-    size_t   bloom_buffer_len;
-    size_t   bloom_buffer_cap;
+    HANDLE   bloom_mapping;
+    uint8_t* bloom_map_view;
+    size_t   bloom_map_capacity;
+    volatile LONG64 bloom_tail;
+    uint64_t bloom_committed_tail;
     uint64_t bloom_file_size;
     uint64_t bloom_offset;
     BOOL     dirty;
@@ -1330,20 +1407,60 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
     if(d->bloom_file==INVALID_HANDLE_VALUE){ set_sys_error(d, GetLastError()); mdb_env_close(d->env); free(d); return FALSE; }
     LARGE_INTEGER sz; sz.QuadPart = 0; GetFileSizeEx(d->bloom_file, &sz); d->bloom_offset = sz.QuadPart; SetFilePointerEx(d->bloom_file, sz, NULL, FILE_BEGIN);
     d->bloom_file_size = d->bloom_offset;
-    d->bloom_buffer = (uint8_t*)malloc(BLOOM_BUFFER_CHUNK);
-    if(!d->bloom_buffer){ CloseHandle(d->bloom_file); mdb_env_close(d->env); free(d); return FALSE; }
-    d->bloom_buffer_cap = BLOOM_BUFFER_CHUNK;
-    d->bloom_buffer_len = 0;
+    d->bloom_mapping = NULL;
+    d->bloom_map_view = NULL;
+    d->bloom_map_capacity = 0;
+    d->bloom_tail = (LONG64)d->bloom_file_size;
+    d->bloom_committed_tail = d->bloom_file_size;
+    if(!bloom_storage_remap(d, bloom_storage_estimate(d))){
+        if(d->bloom_map_view) UnmapViewOfFile(d->bloom_map_view);
+        if(d->bloom_mapping) CloseHandle(d->bloom_mapping);
+        CloseHandle(d->bloom_file);
+        mdb_env_close(d->env);
+        free(d);
+        return FALSE;
+    }
     d->bulk_mode = FALSE;
     d->bulk_sync_interval_ms = 0;
     d->bulk_last_sync_tick = GetTickCount64();
     d->bulk_unsynced_commits = 0;
     d->bulk_sync_commit_limit = DEFAULT_BULK_SYNC_COMMIT_LIMIT;
     MDB_txn* txn;
-    if((rc = mdb_txn_begin(d->env, NULL, 0, &txn))){ set_mdb_error(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
-    if((rc = open_core_dbs(txn, d, TRUE))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
-    if((rc = open_metadata_dbs(txn, d, TRUE))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
-    if((rc = open_content_dbs(txn, d, TRUE))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
+    if((rc = mdb_txn_begin(d->env, NULL, 0, &txn))){
+        set_mdb_error(d,rc);
+        bloom_storage_release(d);
+        if(d->bloom_file && d->bloom_file!=INVALID_HANDLE_VALUE){ CloseHandle(d->bloom_file); d->bloom_file = INVALID_HANDLE_VALUE; }
+        mdb_env_close(d->env);
+        free(d);
+        return FALSE;
+    }
+    if((rc = open_core_dbs(txn, d, TRUE))){
+        set_mdb_error(d,rc);
+        mdb_txn_abort(txn);
+        bloom_storage_release(d);
+        if(d->bloom_file && d->bloom_file!=INVALID_HANDLE_VALUE){ CloseHandle(d->bloom_file); d->bloom_file = INVALID_HANDLE_VALUE; }
+        mdb_env_close(d->env);
+        free(d);
+        return FALSE;
+    }
+    if((rc = open_metadata_dbs(txn, d, TRUE))){
+        set_mdb_error(d,rc);
+        mdb_txn_abort(txn);
+        bloom_storage_release(d);
+        if(d->bloom_file && d->bloom_file!=INVALID_HANDLE_VALUE){ CloseHandle(d->bloom_file); d->bloom_file = INVALID_HANDLE_VALUE; }
+        mdb_env_close(d->env);
+        free(d);
+        return FALSE;
+    }
+    if((rc = open_content_dbs(txn, d, TRUE))){
+        set_mdb_error(d,rc);
+        mdb_txn_abort(txn);
+        bloom_storage_release(d);
+        if(d->bloom_file && d->bloom_file!=INVALID_HANDLE_VALUE){ CloseHandle(d->bloom_file); d->bloom_file = INVALID_HANDLE_VALUE; }
+        mdb_env_close(d->env);
+        free(d);
+        return FALSE;
+    }
     // initialize header
     DbHeader hdr = {0};
     hdr.created_time = hdr.updated_time = now_filetime();
@@ -1351,8 +1468,23 @@ BOOL db_create(const wchar_t* path, size_t map_init_mb, size_t map_max_mb, Db** 
     hdr.generation = 0;
     hdr.journal_seq = 0;
     MDB_val k,v; const char* H="header"; to_mdb_val(H, strlen(H), &k); to_mdb_val(&hdr, sizeof(hdr), &v);
-    if((rc = mdb_put(txn, d->dbi_meta, &k, &v, 0))){ set_mdb_error(d,rc); mdb_txn_abort(txn); mdb_env_close(d->env); free(d); return FALSE; }
-    if((rc = mdb_txn_commit(txn))){ set_mdb_error(d,rc); mdb_env_close(d->env); free(d); return FALSE; }
+    if((rc = mdb_put(txn, d->dbi_meta, &k, &v, 0))){
+        set_mdb_error(d,rc);
+        mdb_txn_abort(txn);
+        bloom_storage_release(d);
+        if(d->bloom_file && d->bloom_file!=INVALID_HANDLE_VALUE){ CloseHandle(d->bloom_file); d->bloom_file = INVALID_HANDLE_VALUE; }
+        mdb_env_close(d->env);
+        free(d);
+        return FALSE;
+    }
+    if((rc = mdb_txn_commit(txn))){
+        set_mdb_error(d,rc);
+        bloom_storage_release(d);
+        if(d->bloom_file && d->bloom_file!=INVALID_HANDLE_VALUE){ CloseHandle(d->bloom_file); d->bloom_file = INVALID_HANDLE_VALUE; }
+        mdb_env_close(d->env);
+        free(d);
+        return FALSE;
+    }
     d->header_cache = hdr;
     d->load_state = INDEX_CONTENT_LOADED;
     *out_db = (Db*)d;
@@ -1381,9 +1513,11 @@ const DbHeader* db_open_readonly(const wchar_t* path, Db** out_db){
     mdb_txn_abort(txn);
     d->load_state = INDEX_CORE_LOADED;
     d->bloom_file = INVALID_HANDLE_VALUE;
-    d->bloom_buffer = NULL;
-    d->bloom_buffer_len = 0;
-    d->bloom_buffer_cap = 0;
+    d->bloom_mapping = NULL;
+    d->bloom_map_view = NULL;
+    d->bloom_map_capacity = 0;
+    d->bloom_tail = 0;
+    d->bloom_committed_tail = 0;
     d->bloom_file_size = 0;
     d->bloom_offset = 0;
     d->bulk_sync_commit_limit = DEFAULT_BULK_SYNC_COMMIT_LIMIT;
@@ -1395,9 +1529,9 @@ void db_close(Db* db_){
     if(!db_) return;
     DbImpl* d = (DbImpl*)db_;
     if(d->wtxn){ mdb_txn_abort(d->wtxn); d->wtxn=NULL; }
+    bloom_storage_release(d);
     if(d->env){ mdb_env_close(d->env); }
     if(d->bloom_file && d->bloom_file!=INVALID_HANDLE_VALUE){ CloseHandle(d->bloom_file); }
-    if(d->bloom_buffer){ free(d->bloom_buffer); d->bloom_buffer=NULL; d->bloom_buffer_cap=0; d->bloom_buffer_len=0; }
     free(d);
 }
 
@@ -1482,7 +1616,7 @@ BOOL db_commit_write_ex(Db* db_, BOOL force_sync){
         to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
         mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
     }
-    if(!bloom_buffer_flush(d)){
+    if(!bloom_storage_flush(d)){
         mdb_txn_abort(d->wtxn);
         d->wtxn = NULL;
         return FALSE;
@@ -2193,8 +2327,9 @@ BOOL db_put_records(Db* db_, const DbRecord* recs, size_t count){
     size_t attempt = 0;
     DbHeader header_before = d->header_cache;
     uint64_t bloom_offset_before = d->bloom_offset;
+    uint64_t bloom_tail_before = (uint64_t)InterlockedCompareExchange64(&d->bloom_tail, 0, 0);
     uint64_t bloom_file_size_before = d->bloom_file_size;
-    size_t bloom_buffer_len_before = d->bloom_buffer_len;
+    uint64_t bloom_committed_before = d->bloom_committed_tail;
     BOOL dirty_before = d->dirty;
     MDB_txn* parent_txn = d->wtxn;
     d->last_write_progress = 0;
@@ -2221,11 +2356,9 @@ retry_batch:
         d->dirty = dirty_before;
         d->header_cache = header_before;
         d->bloom_offset = bloom_offset_before;
-        LARGE_INTEGER li; li.QuadPart = (LONGLONG)bloom_offset_before;
-        SetFilePointerEx(d->bloom_file, li, NULL, FILE_BEGIN);
-        SetEndOfFile(d->bloom_file);
+        InterlockedExchange64(&d->bloom_tail, (LONG64)bloom_tail_before);
         d->bloom_file_size = bloom_file_size_before;
-        d->bloom_buffer_len = bloom_buffer_len_before;
+        d->bloom_committed_tail = bloom_committed_before;
         result = FALSE;
         goto cleanup;
     }
@@ -2242,18 +2375,10 @@ retry_batch:
     }
 
     DbHeader header_tmp = header_before;
-    uint64_t bloom_offset_tmp = bloom_offset_before;
     size_t processed = 0;
     BOOL success = TRUE;
 
     d->wtxn = batch_txn;
-
-    LARGE_INTEGER bloom_seek;
-    bloom_seek.QuadPart = (LONGLONG)bloom_offset_tmp;
-    if(!SetFilePointerEx(d->bloom_file, bloom_seek, NULL, FILE_BEGIN)){
-        set_sys_error(d, GetLastError());
-        success = FALSE;
-    }
 
     fname_count = parent_count = path_count = size_count = date_count = mtime_count = 0;
     attr_count = 0;
@@ -2311,7 +2436,7 @@ retry_batch:
                 set_error(d, DB_ERROR_OS, 0, "failed to prepare bloom context");
                 break;
             }
-            if(!ensure_bloom_for_string(d, r->normalized_name_str_id, &normv, &norm_ctx, &norm_meta, &bloom_offset_tmp)){
+            if(!ensure_bloom_for_string(d, r->normalized_name_str_id, &normv, &norm_ctx, &norm_meta, NULL)){
                 success = FALSE;
                 name_bloom_context_release(&norm_ctx);
                 break;
@@ -2325,7 +2450,7 @@ retry_batch:
                 set_error(d, DB_ERROR_OS, 0, "failed to prepare bloom context");
                 break;
             }
-            if(!ensure_bloom_for_string(d, r->name_str_id, &namev, &name_ctx, &name_meta, &bloom_offset_tmp)){
+            if(!ensure_bloom_for_string(d, r->name_str_id, &namev, &name_ctx, &name_meta, NULL)){
                 success = FALSE;
                 name_bloom_context_release(&name_ctx);
                 break;
@@ -2359,7 +2484,7 @@ retry_batch:
                     set_error(d, DB_ERROR_OS, 0, "failed to prepare bloom context");
                     break;
                 }
-                if(!ensure_bloom_for_string(d, r->content_str_id, &cvstr, &content_ctx, &content_meta, &bloom_offset_tmp)){
+                if(!ensure_bloom_for_string(d, r->content_str_id, &cvstr, &content_ctx, &content_meta, NULL)){
                     success = FALSE;
                     name_bloom_context_release(&content_ctx);
                     break;
@@ -2514,11 +2639,9 @@ retry_batch:
 
     if(!success){
         mdb_txn_abort(batch_txn);
-        LARGE_INTEGER li; li.QuadPart = (LONGLONG)bloom_offset_before;
-        SetFilePointerEx(d->bloom_file, li, NULL, FILE_BEGIN);
-        SetEndOfFile(d->bloom_file);
         d->bloom_file_size = bloom_file_size_before;
-        d->bloom_buffer_len = bloom_buffer_len_before;
+        d->bloom_committed_tail = bloom_committed_before;
+        InterlockedExchange64(&d->bloom_tail, (LONG64)bloom_tail_before);
         d->header_cache = header_before;
         d->bloom_offset = bloom_offset_before;
         d->dirty = dirty_before;
@@ -2534,11 +2657,9 @@ retry_batch:
     rc = mdb_txn_commit(batch_txn);
     if(rc){
         set_mdb_error(d, rc);
-        LARGE_INTEGER li; li.QuadPart = (LONGLONG)bloom_offset_before;
-        SetFilePointerEx(d->bloom_file, li, NULL, FILE_BEGIN);
-        SetEndOfFile(d->bloom_file);
         d->bloom_file_size = bloom_file_size_before;
-        d->bloom_buffer_len = bloom_buffer_len_before;
+        d->bloom_committed_tail = bloom_committed_before;
+        InterlockedExchange64(&d->bloom_tail, (LONG64)bloom_tail_before);
         d->header_cache = header_before;
         d->bloom_offset = bloom_offset_before;
         d->dirty = dirty_before;
@@ -2552,7 +2673,7 @@ retry_batch:
     }
 
     d->header_cache = header_tmp;
-    d->bloom_offset = bloom_offset_tmp;
+    d->bloom_offset = (uint64_t)InterlockedCompareExchange64(&d->bloom_tail, 0, 0);
     d->dirty = TRUE;
     d->last_write_progress = count;
     set_error(d, DB_ERROR_NONE,0,NULL);

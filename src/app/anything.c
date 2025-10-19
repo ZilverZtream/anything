@@ -149,14 +149,26 @@ static int WideCharToMultiByte(unsigned int cp, unsigned int flags, const wchar_
 #endif
 #endif
 
+#define BLOOM_GENERATOR_MIN_THREADS 2
+#define BLOOM_GENERATOR_MAX_THREADS 4
+#define BLOOM_GENERATOR_BATCH_MIN 128
+#define BLOOM_GENERATOR_BATCH_TARGET 1024
+#define BLOOM_GENERATOR_BATCH_MAX 4096
+
+typedef struct BloomThreadParam {
+    int index;
+} BloomThreadParam;
+
 static MPMCQueue g_live_updates;
 MPMCQueue g_bloom_gen_queue;
 MPMCQueue g_bloom_completion_queue;
 #ifdef _WIN32
-static HANDLE g_bloom_generator_thread = NULL;
+static HANDLE g_bloom_generator_threads[BLOOM_GENERATOR_MAX_THREADS] = {0};
 #else
-static pthread_t g_bloom_generator_thread = 0;
+static pthread_t g_bloom_generator_threads[BLOOM_GENERATOR_MAX_THREADS] = {0};
 #endif
+static BloomThreadParam g_bloom_thread_params[BLOOM_GENERATOR_MAX_THREADS];
+static unsigned g_bloom_thread_count = 0;
 static volatile BOOL g_bloom_shutdown = FALSE;
 static wchar_t g_bloom_db_path[MAX_LONG_PATH];
 static BOOL g_live_inited = FALSE;
@@ -1362,103 +1374,169 @@ static BOOL writer_apply_content_result(WriterCtx* ctx,
     return TRUE;
 }
 
+static int compare_uint64(const void* a, const void* b){
+    uint64_t av = *(const uint64_t*)a;
+    uint64_t bv = *(const uint64_t*)b;
+    if(av < bv) return -1;
+    if(av > bv) return 1;
+    return 0;
+}
+
 #ifdef _WIN32
 static unsigned __stdcall BloomGeneratorThread(void* param){
 #else
 static void* BloomGeneratorThread(void* param){
 #endif
-    (void)param;
+    BloomThreadParam* thread_param = (BloomThreadParam*)param;
+    (void)thread_param;
     MDB_env* env = NULL;
     if(mdb_env_create(&env) != 0){
+#ifdef _WIN32
         return 0;
+#else
+        return NULL;
+#endif
     }
     mdb_env_set_maxdbs(env, 64);
     char utf8[MAX_PATH * 3];
     to_utf8(g_bloom_db_path, utf8, sizeof(utf8));
     if(mdb_env_open(env, utf8, MDB_RDONLY, 0664) != 0){
         mdb_env_close(env);
+#ifdef _WIN32
         return 0;
+#else
+        return NULL;
+#endif
     }
 
     MDB_txn* txn = NULL;
     MDB_dbi dbi_strings = 0;
     if(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn) != 0){
         mdb_env_close(env);
+#ifdef _WIN32
         return 0;
+#else
+        return NULL;
+#endif
     }
     if(mdb_dbi_open(txn, "strings", 0, &dbi_strings) != 0){
         mdb_txn_abort(txn);
         mdb_env_close(env);
+#ifdef _WIN32
         return 0;
+#else
+        return NULL;
+#endif
     }
     mdb_txn_commit(txn);
     txn = NULL;
 
+    uint64_t batch[BLOOM_GENERATOR_BATCH_MAX];
+
     while(!g_bloom_shutdown){
-        void* item_ptr = NULL;
-        if(!MPMC_Pop(&g_bloom_gen_queue, &item_ptr)){
-            Sleep(100);
+        size_t count = 0;
+        while(count < BLOOM_GENERATOR_BATCH_MAX && !g_bloom_shutdown){
+            void* item_ptr = NULL;
+            if(MPMC_Pop(&g_bloom_gen_queue, &item_ptr)){
+                uint64_t string_id = (uint64_t)(uintptr_t)item_ptr;
+                if(string_id){
+                    batch[count++] = string_id;
+                }
+                if(count >= BLOOM_GENERATOR_BATCH_TARGET){
+                    break;
+                }
+                continue;
+            }
+            if(count >= BLOOM_GENERATOR_BATCH_MIN){
+                break;
+            }
+            if(count == 0){
+                Sleep(2);
+            } else {
+                Sleep(0);
+            }
+        }
+        if(count == 0){
             continue;
         }
-        uint64_t string_id = (uint64_t)(uintptr_t)item_ptr;
-        if(string_id == 0) continue;
+
+        qsort(batch, count, sizeof(uint64_t), compare_uint64);
+        size_t unique = 0;
+        for(size_t i=0; i<count; ++i){
+            if(i > 0 && batch[i] == batch[i-1]) continue;
+            batch[unique++] = batch[i];
+        }
+        count = unique;
+        if(count == 0){
+            continue;
+        }
 
         if(mdb_txn_begin(env, NULL, MDB_RDONLY, &txn) != 0){
-            Sleep(10);
+            Sleep(5);
             continue;
         }
-        MDB_val key = {.mv_data = &string_id, .mv_size = sizeof(string_id)};
-        MDB_val val;
-        int rc = mdb_get(txn, dbi_strings, &key, &val);
-        if(rc != 0){
-            mdb_txn_abort(txn);
-            txn = NULL;
-            continue;
+
+        for(size_t i=0; i<count && !g_bloom_shutdown; ++i){
+            uint64_t string_id = batch[i];
+            MDB_val key = {.mv_data = &string_id, .mv_size = sizeof(string_id)};
+            MDB_val val;
+            int rc = mdb_get(txn, dbi_strings, &key, &val);
+            if(rc != 0){
+                continue;
+            }
+            MDB_val text_val;
+            StringMeta current_meta;
+            db_string_value_parse(&val, &text_val, &current_meta, NULL);
+            BOOL meta_valid = current_meta.magic0 == STRING_META_MAGIC0 && current_meta.magic1 == STRING_META_MAGIC1;
+            if(meta_valid && !current_meta.bloom_pending && current_meta.hash_count > 0 && current_meta.bloom_length > 0){
+                continue;
+            }
+            size_t text_len = text_val.mv_size;
+            char* text_copy = (char*)malloc(text_len + 1);
+            if(!text_copy){
+                continue;
+            }
+            if(text_len > 0){
+                memcpy(text_copy, text_val.mv_data, text_len);
+            }
+            text_copy[text_len] = '\0';
+
+            uint8_t* bloom_data = NULL;
+            size_t bloom_len = 0;
+            StringMeta new_meta;
+            if(!db_generate_bloom_blob(text_copy, text_len, &new_meta, &bloom_data, &bloom_len)){
+                free(text_copy);
+                if(bloom_data) free(bloom_data);
+                continue;
+            }
+            free(text_copy);
+
+            BloomResultItem* result = (BloomResultItem*)malloc(sizeof(BloomResultItem));
+            if(!result){
+                if(bloom_data) free(bloom_data);
+                continue;
+            }
+            result->string_id = string_id;
+            result->new_meta = new_meta;
+            result->bloom_data = bloom_data;
+            result->bloom_data_len = bloom_len;
+
+            BOOL queued = FALSE;
+            while(!queued){
+                if(MPMC_Push(&g_bloom_completion_queue, result)){
+                    queued = TRUE;
+                } else if(g_bloom_shutdown){
+                    if(result->bloom_data) free(result->bloom_data);
+                    free(result);
+                    queued = TRUE;
+                } else {
+                    Sleep(1);
+                }
+            }
         }
-        MDB_val text_val;
-        StringMeta current_meta;
-        db_string_value_parse(&val, &text_val, &current_meta, NULL);
-        size_t text_len = text_val.mv_size;
-        if(text_len < 5){
-            mdb_txn_abort(txn);
-            txn = NULL;
-            continue;
-        }
-        char* text_copy = (char*)malloc(text_len + 1);
-        if(!text_copy){
-            mdb_txn_abort(txn);
-            txn = NULL;
-            continue;
-        }
-        memcpy(text_copy, text_val.mv_data, text_len);
-        text_copy[text_len] = '\0';
+
         mdb_txn_abort(txn);
         txn = NULL;
-
-        uint8_t* bloom_data = NULL;
-        size_t bloom_len = 0;
-        StringMeta new_meta;
-        if(!db_generate_bloom_blob(text_copy, text_len, &new_meta, &bloom_data, &bloom_len)){
-            free(text_copy);
-            if(bloom_data) free(bloom_data);
-            continue;
-        }
-        free(text_copy);
-
-        BloomResultItem* result = (BloomResultItem*)malloc(sizeof(BloomResultItem));
-        if(!result){
-            if(bloom_data) free(bloom_data);
-            continue;
-        }
-        result->string_id = string_id;
-        result->new_meta = new_meta;
-        result->bloom_data = bloom_data;
-        result->bloom_data_len = bloom_len;
-
-        while(!MPMC_Push(&g_bloom_completion_queue, result)){
-            if(g_bloom_shutdown) break;
-            Sleep(1);
-        }
     }
 
     if(txn) mdb_txn_abort(txn);
@@ -1472,68 +1550,96 @@ static void* BloomGeneratorThread(void* param){
 
 void bloom_generator_init(const wchar_t* dbPath){
     if(!dbPath) return;
-    if(g_bloom_generator_thread) return;
+    if(g_bloom_thread_count > 0) return;
     wcscpy_s(g_bloom_db_path, MAX_LONG_PATH, dbPath);
-    if(!MPMC_Init(&g_bloom_gen_queue, 1 << 12)) return;
-    if(!MPMC_Init(&g_bloom_completion_queue, 1 << 12)){
+    if(!MPMC_Init(&g_bloom_gen_queue, 1 << 14)) return;
+    if(!MPMC_Init(&g_bloom_completion_queue, 1 << 13)){
         MPMC_Destroy(&g_bloom_gen_queue);
         return;
     }
     g_bloom_shutdown = FALSE;
+    memset(g_bloom_generator_threads, 0, sizeof(g_bloom_generator_threads));
+    memset(g_bloom_thread_params, 0, sizeof(g_bloom_thread_params));
 #ifdef _WIN32
-    uintptr_t thread_handle = _beginthreadex(NULL, 0, BloomGeneratorThread, NULL, 0, NULL);
-    if(thread_handle == 0){
-        MPMC_Destroy(&g_bloom_gen_queue);
-        MPMC_Destroy(&g_bloom_completion_queue);
-        return;
-    }
-    g_bloom_generator_thread = (HANDLE)thread_handle;
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    size_t cpu_count = sysinfo.dwNumberOfProcessors ? (size_t)sysinfo.dwNumberOfProcessors : BLOOM_GENERATOR_MIN_THREADS;
 #else
-    if(pthread_create(&g_bloom_generator_thread, NULL, BloomGeneratorThread, NULL) != 0){
-        g_bloom_generator_thread = 0;
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    size_t cpu_count = (cpus > 0) ? (size_t)cpus : BLOOM_GENERATOR_MIN_THREADS;
+#endif
+    size_t desired = cpu_count / 2;
+    if(desired < BLOOM_GENERATOR_MIN_THREADS) desired = BLOOM_GENERATOR_MIN_THREADS;
+    if(desired > BLOOM_GENERATOR_MAX_THREADS) desired = BLOOM_GENERATOR_MAX_THREADS;
+    unsigned started = 0;
+    for(size_t i=0; i<desired; ++i){
+        g_bloom_thread_params[i].index = (int)i;
+#ifdef _WIN32
+        uintptr_t handle = _beginthreadex(NULL, 0, BloomGeneratorThread, &g_bloom_thread_params[i], 0, NULL);
+        if(handle == 0){
+            break;
+        }
+        g_bloom_generator_threads[started++] = (HANDLE)handle;
+#else
+        if(pthread_create(&g_bloom_generator_threads[started], NULL, BloomGeneratorThread, &g_bloom_thread_params[started]) != 0){
+            break;
+        }
+        started++;
+#endif
+    }
+    g_bloom_thread_count = started;
+    if(g_bloom_thread_count == 0){
+        g_bloom_shutdown = TRUE;
         MPMC_Destroy(&g_bloom_gen_queue);
         MPMC_Destroy(&g_bloom_completion_queue);
-        return;
     }
-#endif
 }
 
 void bloom_generator_shutdown(void){
     g_bloom_shutdown = TRUE;
 #ifdef _WIN32
-    if(g_bloom_generator_thread){
-        WaitForSingleObject(g_bloom_generator_thread, INFINITE);
-        CloseHandle(g_bloom_generator_thread);
-        g_bloom_generator_thread = NULL;
-    }
-#else
-    if(g_bloom_generator_thread){
-        pthread_join(g_bloom_generator_thread, NULL);
-        g_bloom_generator_thread = 0;
-    }
-#endif
-    void* item = NULL;
-    while(MPMC_Pop(&g_bloom_completion_queue, &item)){
-        BloomResultItem* result = (BloomResultItem*)item;
-        if(result){
-            if(result->bloom_data) free(result->bloom_data);
-            free(result);
+    for(unsigned i=0; i<g_bloom_thread_count; ++i){
+        if(g_bloom_generator_threads[i]){
+            WaitForSingleObject(g_bloom_generator_threads[i], INFINITE);
+            CloseHandle(g_bloom_generator_threads[i]);
+            g_bloom_generator_threads[i] = NULL;
         }
     }
-    while(MPMC_Pop(&g_bloom_gen_queue, &item)){
-        // discard
+#else
+    for(unsigned i=0; i<g_bloom_thread_count; ++i){
+        if(g_bloom_generator_threads[i]){
+            pthread_join(g_bloom_generator_threads[i], NULL);
+            g_bloom_generator_threads[i] = 0;
+        }
+    }
+#endif
+    g_bloom_thread_count = 0;
+    if(g_bloom_completion_queue.cells){
+        void* item = NULL;
+        while(MPMC_Pop(&g_bloom_completion_queue, &item)){
+            BloomResultItem* result = (BloomResultItem*)item;
+            if(result){
+                if(result->bloom_data) free(result->bloom_data);
+                free(result);
+            }
+        }
+    }
+    if(g_bloom_gen_queue.cells){
+        void* item = NULL;
+        while(MPMC_Pop(&g_bloom_gen_queue, &item)){
+            // discard pending requests
+        }
     }
     MPMC_Destroy(&g_bloom_gen_queue);
     MPMC_Destroy(&g_bloom_completion_queue);
 }
 
 void bloom_generator_request(uint64_t string_id){
-#ifdef _WIN32
-    if(!g_bloom_generator_thread || string_id == 0) return;
-#else
-    if(g_bloom_generator_thread == 0 || string_id == 0) return;
-#endif
-    MPMC_Push(&g_bloom_gen_queue, (void*)(uintptr_t)string_id);
+    if(g_bloom_thread_count == 0 || string_id == 0) return;
+    while(!MPMC_Push(&g_bloom_gen_queue, (void*)(uintptr_t)string_id)){
+        if(g_bloom_shutdown) return;
+        Sleep(1);
+    }
 }
 
 static BOOL writer_drain_bloom_results(WriterCtx* ctx){
