@@ -48,6 +48,8 @@ file(GLOB CORE_ENTERPRISE_SOURCES "src/enterprise/*.c")
 file(GLOB SERVICE_SOURCES "src/services/*.c")
 file(GLOB UI_SOURCES "src/ui/*.cpp")
 file(GLOB PLATFORM_WIN_SOURCES "src/platform/ntfs.c" "src/platform/scanner_win.cpp" "src/platform/wsl.c")
+file(GLOB PLATFORM_APPLE_SOURCES "src/platform/apfs.c" "src/platform/macvm.c" "src/platform/scanner_macos.c")
+file(GLOB PLATFORM_UNIX_SOURCES "src/platform/scanner_linux.c")
 
 # Group shared sources used by the main executable and plugins
 set(ANYTHING_CORE_SOURCES
@@ -68,6 +70,10 @@ add_library(anything_core STATIC ${ANYTHING_CORE_SOURCES})
 
 if(WIN32)
     target_sources(anything_core PRIVATE ${PLATFORM_WIN_SOURCES})
+elseif(APPLE)
+    target_sources(anything_core PRIVATE ${PLATFORM_APPLE_SOURCES})
+elseif(UNIX)
+    target_sources(anything_core PRIVATE ${PLATFORM_UNIX_SOURCES})
 endif()
 
 target_link_libraries(anything_core PUBLIC
@@ -124,7 +130,6 @@ macro(add_anything_plugin name sources)
     add_library(${name} MODULE ${sources})
     target_link_libraries(${name} PRIVATE
         anything_core
-        unofficial::lmdb::lmdb
         cjson
         CURL::libcurl
     )
