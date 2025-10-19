@@ -1,3 +1,5 @@
+#pragma once
+
 #ifndef CLOUD_H
 #define CLOUD_H
 #include "anything/anything.h"

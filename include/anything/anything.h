@@ -1,3 +1,4 @@
+#pragma once
 
 #ifndef ANYTHING_H
 #define ANYTHING_H

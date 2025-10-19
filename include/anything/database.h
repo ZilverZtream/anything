@@ -1,3 +1,5 @@
+#pragma once
+
 #ifndef DATABASE_H
 #define DATABASE_H
 #ifdef _WIN32
