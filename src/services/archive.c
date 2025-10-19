@@ -1,9 +1,7 @@
 // archive.c - index files inside archive containers using libarchive
-#include "anything/archive.h"
-#include "anything/util.h"
+#include "core/pch.h"
 #include <archive.h>
 #include <archive_entry.h>
-#include <string.h>
 #include <ctype.h>
 
 // Resolve and validate archive entry paths to avoid directory traversal.

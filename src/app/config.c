@@ -1,7 +1,4 @@
-#include "anything/config.h"
-#include <wchar.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include "core/pch.h"
 
 AppConfig g_config;
 

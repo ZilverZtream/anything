@@ -1,8 +1,4 @@
-#include "anything/enterprise.h"
-#include "anything/util.h"
-#include "anything/anything.h"
-#include <stdio.h>
-#include <windows.h>
+#include "core/pch.h"
 #include <aclapi.h>
 
 #ifdef ENTERPRISE

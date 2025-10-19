@@ -1,12 +1,10 @@
 
 // anything.c — Orchestrator
 #define _CRT_SECURE_NO_WARNINGS
+#include "core/pch.h"
+
 #ifdef _WIN32
-#include <windows.h>
-#include <shlwapi.h>
 #include <intrin.h>
-#include <objbase.h>
-#include <filter.h>
 #include <process.h>
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "ole32.lib")
@@ -16,29 +14,11 @@
 #else
 #include <unistd.h>
 #endif
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <wchar.h>
 #ifdef __APPLE__
 #include <CoreServices/CoreServices.h>
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
-#include "anything/anything.h"
-#include "anything/database.h"
-#include "anything/util.h"
-#include "../../third_party/lmdb/lmdb.h"
-#include "anything/archive.h"
-#include "anything/plugin.h"
-#include "anything/scanner.h"
-#include "anything/enterprise.h"
-#include "anything/config.h"
-
-#include <stdbool.h>
-#include <zip.h>
-#include <libpst/libpst.h>
 #include <ctype.h>
 #ifndef _WIN32
 #include <strings.h>

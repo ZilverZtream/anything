@@ -1,3 +1,4 @@
+#include "core/pch.h"
 #include "apfs.h"
 #ifdef __APPLE__
 #include <sys/snapshot.h>

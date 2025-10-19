@@ -1,3 +1,5 @@
+#include "core/pch.h"
+
 // Stub translation unit for the anything executable.
 // The actual implementation (including wmain) lives in the anything_core
 // static library so that plugins can link against the shared functionality.

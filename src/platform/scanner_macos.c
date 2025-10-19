@@ -1,5 +1,5 @@
 #ifdef __APPLE__
-#include "anything/scanner.h"
+#include "core/pch.h"
 #include "apfs.h"
 #include <CoreServices/CoreServices.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -17,8 +17,6 @@
 #include <sched.h>
 #include <ftw.h>
 #include <zip.h>
-#include <libpst/libpst.h>
-#include <stdint.h>
 
 #ifndef FILE_ATTRIBUTE_DIRECTORY
 #define FILE_ATTRIBUTE_DIRECTORY 0x10

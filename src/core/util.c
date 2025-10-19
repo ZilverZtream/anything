@@ -1,10 +1,5 @@
 
-#include "anything/util.h"
-#include "anything/anything.h"
-#include <shlwapi.h>
-#include <string.h>
-#include <wchar.h>
-#include <stdlib.h>
+#include "core/pch.h"
 #include <malloc.h>
 #include <immintrin.h>
 #include <stdio.h>

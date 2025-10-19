@@ -1,11 +1,8 @@
 // macvm.c - scanner for macOS virtualization disk images (Docker, Parallels, VMware)
+#include "core/pch.h"
 #include "macvm.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <errno.h>
-#include "anything/util.h"
 #ifdef _WIN32
 #define strcasecmp _stricmp
 #else

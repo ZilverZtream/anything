@@ -1,16 +1,11 @@
-#include "anything/plugin.h"
-#include <stdio.h>
+#include "core/pch.h"
 
 #ifdef _WIN32
-#include <windows.h>
 typedef HMODULE PluginModule;
 #else
 #include <dlfcn.h>
 #include <dirent.h>
-#include <string.h>
-#include <wchar.h>
 #include <limits.h>
-#include <stdlib.h>
 typedef void* PluginModule;
 #endif
 

@@ -1,12 +1,7 @@
 #ifdef _WIN32
-#include <stdlib.h>
-#include <windows.h>
-#include <shlwapi.h>
+#include "core/pch.h"
 #include <shobjidl.h>
 #include <gdiplus.h>
-#include <synchapi.h>
-#include <objbase.h>
-#include "anything/scanner.h"
 #pragma comment(lib, "gdiplus.lib")
 
 typedef enum { FS_NTFS, FS_GENERIC, FS_NETWORK } ScannerKind;

@@ -1,9 +1,4 @@
-#include "anything/metadata.h"
-#include "anything/util.h"
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdint.h>
+#include "core/pch.h"
 
 static uint16_t rd16(const uint8_t* p, int be){
     return be ? (uint16_t)(p[0]<<8 | p[1]) : (uint16_t)(p[1]<<8 | p[0]);

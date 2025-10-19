@@ -1,15 +1,13 @@
- #ifdef HAS_IMGUI
- #include <imgui.h>
+#include "core/pch.h"
+
+#ifdef HAS_IMGUI
+#include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 #include <GLFW/glfw3.h>
 #include "stb_image.h"
 #include "TextEditor.h"
 #ifdef _WIN32
-#include <windows.h>
-#include <intrin.h>
-#include <shlwapi.h>
-#include <shellapi.h>
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
 #else
@@ -23,20 +21,15 @@
 #include <objc/runtime.h>
 #include <objc/message.h>
 #endif // __APPLE__
-#include <wchar.h>
- #include <algorithm>
- #include <vector>
- #include <string>
+#include <algorithm>
+#include <vector>
+#include <string>
 #include <unordered_set>
 #include <cctype>
 #include <ctime>
 #include <cmath>
 #include <limits>
-#include <limits.h>
 #include <inttypes.h>
-#include <ctype.h>
-#include <string.h>
-#include <stdlib.h>
 #include <thread>
 #include <utility>
 #include <memory>
@@ -46,9 +39,6 @@
 #include <cstring>
 extern "C" {
 #include "../../third_party/lmdb/lmdb.h"
-#include "anything/database.h"
-#include "anything/util.h"
-#include "anything/anything.h"
 }
 #endif
 #include <stdio.h>

@@ -1,15 +1,8 @@
 
 // exfat.c — Multi-threaded generic scanner with simple work stealing
 #define _CRT_SECURE_NO_WARNINGS
-#include <windows.h>
-#include <wchar.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include "core/pch.h"
 #include <process.h>
-#include "anything/anything.h"
-#include "anything/util.h"
 
 typedef struct DirTask {
     wchar_t path[MAX_LONG_PATH];
