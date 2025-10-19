@@ -476,14 +476,37 @@ static void tokenlist_free(TokenList* t){
     free(t->items); t->items=NULL; t->n=t->cap=0;
 }
 
+typedef struct IdVec {
+    uint64_t* ids;
+    size_t n, cap;
+} IdVec;
+static void idvec_init(IdVec* v){ v->ids=NULL; v->n=v->cap=0; }
+static void idvec_reserve(IdVec* v, size_t need){
+    if(need <= v->cap) return;
+    size_t cap = v->cap ? v->cap : 512;
+    while(cap < need) cap <<= 1;
+    uint64_t* ni = (uint64_t*)realloc(v->ids, cap * sizeof(uint64_t));
+    if(!ni) return;
+    v->ids = ni;
+    v->cap = cap;
+}
+static void idvec_push(IdVec* v, uint64_t x){
+    if(v->n==v->cap){
+        size_t newcap = v->cap? v->cap*2:512;
+        uint64_t* ni = (uint64_t*)realloc(v->ids,newcap*sizeof(uint64_t));
+        if(!ni) return;
+        v->ids = ni;
+        v->cap = newcap;
+    }
+    v->ids[v->n++]=x;
+}
+static void idvec_free(IdVec* v){ free(v->ids); v->ids=NULL; v->n=v->cap=0; }
+
 // Parallel search helpers
 typedef SearchQuery Query;
 typedef struct { uint64_t dummy; } Result;
 
 // Forward declarations for helpers defined later in this file.
-typedef struct IdVec IdVec;
-static void idvec_init(IdVec* v);
-static void idvec_free(IdVec* v);
 static void galloping_intersect(IdVec* a, const IdVec* b);
 static void union_inplace(IdVec* a, const IdVec* b);
 static void difference_inplace(IdVec* a, const IdVec* b);
@@ -1147,32 +1170,6 @@ static void free_search_query(SearchQuery* q){
     if(q->ext_pattern) free(q->ext_pattern);
     if(q->path_filter) free(q->path_filter);
 }
-
-typedef struct {
-    uint64_t* ids;
-    size_t n, cap;
-} IdVec;
-static void idvec_init(IdVec* v){ v->ids=NULL; v->n=v->cap=0; }
-static void idvec_reserve(IdVec* v, size_t need){
-    if(need <= v->cap) return;
-    size_t cap = v->cap ? v->cap : 512;
-    while(cap < need) cap <<= 1;
-    uint64_t* ni = (uint64_t*)realloc(v->ids, cap * sizeof(uint64_t));
-    if(!ni) return;
-    v->ids = ni;
-    v->cap = cap;
-}
-static void idvec_push(IdVec* v, uint64_t x){
-    if(v->n==v->cap){
-        size_t newcap = v->cap? v->cap*2:512;
-        uint64_t* ni = (uint64_t*)realloc(v->ids,newcap*sizeof(uint64_t));
-        if(!ni) return;
-        v->ids = ni;
-        v->cap = newcap;
-    }
-    v->ids[v->n++]=x;
-}
-static void idvec_free(IdVec* v){ free(v->ids); v->ids=NULL; v->n=v->cap=0; }
 
 // Result cache — last query & rec_ids
 #define CACHE_VERSION 3
