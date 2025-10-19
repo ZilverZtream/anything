@@ -2434,9 +2434,9 @@ retry_batch:
         }
         // extension_index & trigrams from name
         // Fetch UTF-8 name by id
-        MDB_val namev;
+        MDB_val namev = (MDB_val){0};
         StringMeta name_meta; BOOL name_has_meta = FALSE;
-        MDB_val normv;
+        MDB_val normv = (MDB_val){0};
         StringMeta norm_meta; BOOL norm_has_meta = FALSE;
         BOOL have_name = success && str_by_id_with_retry(d, r->name_str_id, &namev, 5, &name_meta, &name_has_meta);
         BOOL have_norm = success && r->normalized_name_str_id &&
@@ -2737,7 +2737,7 @@ static BOOL db_delete_record(DbImpl* d, uint64_t id, const DbRecord* r){
     MDB_val ak,av; to_mdb_val(&r->attributes, sizeof(r->attributes), &ak); to_mdb_val(&id, sizeof(id), &av);
     mdb_del(d->wtxn, d->dbi_attr_index, &ak, &av);
 
-    MDB_val namev;
+    MDB_val namev = (MDB_val){0};
     BOOL have_name = str_by_id_with_retry(d, r->name_str_id, &namev, 5, NULL, NULL);
     if(have_name){
         char ext[32]; split_extension_utf8((const char*)namev.mv_data, ext, sizeof(ext));
@@ -2746,7 +2746,7 @@ static BOOL db_delete_record(DbImpl* d, uint64_t id, const DbRecord* r){
             mdb_del(d->wtxn, d->dbi_extension_index, &ek, &ev);
         }
     }
-    MDB_val normv;
+    MDB_val normv = (MDB_val){0};
     if(r->normalized_name_str_id && str_by_id_with_retry(d, r->normalized_name_str_id, &normv, 5, NULL, NULL)){
         remove_trigrams(d, (const char*)normv.mv_data, r->normalized_name_str_id);
     } else if(have_name){
