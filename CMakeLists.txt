@@ -64,6 +64,7 @@ set(ANYTHING_CORE_SOURCES
     ${CORE_SYSTEM_SOURCES}
     ${SERVICE_SOURCES}
     ${CORE_ENTERPRISE_SOURCES}
+    src/app/config.c
 )
 
 # =============================================================================
