@@ -102,6 +102,8 @@ typedef struct {
 
 static const size_t BLOOM_BUFFER_CHUNK = 1u << 20; // 1 MB
 
+typedef struct NameBloomContext NameBloomContext;
+
 static size_t bloom_packbits_compress(const uint8_t* src, size_t len, uint8_t* dst, size_t dst_cap);
 static inline void bloom_set(uint8_t* bloom, uint32_t h, uint32_t mask);
 static inline BOOL bloom_has(const uint8_t* bloom, uint32_t h, uint32_t mask);
@@ -419,7 +421,7 @@ typedef struct {
     uint32_t  trigram_buf[TLS_FILENAME_CAP];
 } BloomThreadBuffers;
 
-typedef struct {
+typedef struct NameBloomContext {
     const char* original;
     size_t      original_len;
     char*       lower;

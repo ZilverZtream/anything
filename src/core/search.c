@@ -25,6 +25,10 @@
 #define MDB_DBI_INVALID ((MDB_dbi)~(unsigned)0)
 #endif
 
+typedef struct SearchQuery SearchQuery;
+typedef struct IdVec IdVec;
+typedef enum TermType TermType;
+
 static const uint8_t* bloom_readonly_base = NULL;
 static size_t g_bloom_size = 0;
 #define BLOOM_CACHE_CAP 1000
@@ -458,7 +462,7 @@ static BOOL string_contains_lower_term(const MDB_val* text, const char* lower_te
     return match;
 }
 
-typedef struct {
+typedef struct SearchQuery {
     char* name_pattern;
     char* content_pattern;
     char* author_pattern;
@@ -476,7 +480,7 @@ typedef struct {
 } SearchQuery;
 
 typedef enum { TOK_TERM, TOK_AND, TOK_OR, TOK_NOT, TOK_LPAREN, TOK_RPAREN } TokType;
-typedef enum { TERM_NAME, TERM_AUTHOR, TERM_CAMERA, TERM_LENS, TERM_ARTIST, TERM_ALBUM, TERM_TITLE, TERM_EXT, TERM_CONTENT } TermType;
+typedef enum TermType { TERM_NAME, TERM_AUTHOR, TERM_CAMERA, TERM_LENS, TERM_ARTIST, TERM_ALBUM, TERM_TITLE, TERM_EXT, TERM_CONTENT } TermType;
 typedef struct { TokType type; TermType ttype; char* text; } Token;
 typedef struct { Token* items; int n, cap; } TokenList;
 static void tokenlist_init(TokenList* t){ t->items=NULL; t->n=t->cap=0; }
