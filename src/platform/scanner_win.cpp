@@ -150,8 +150,8 @@ wchar_t* GenerateThumbnail(const wchar_t* path){
     }
     SIZE sz = {256,256};
     HBITMAP hbmp;
-    HRESULT hr = factory->lpVtbl->GetImage(factory, sz, SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT, &hbmp);
-    factory->lpVtbl->Release(factory);
+    HRESULT hr = factory->GetImage(sz, SIIGBF_BIGGERSIZEOK | SIIGBF_RESIZETOFIT, &hbmp);
+    factory->Release();
     if(FAILED(hr)){
         return NULL;
     }
