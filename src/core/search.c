@@ -19,6 +19,13 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <limits.h>
+
+// Provide Win32-style critical section wrappers on POSIX systems
+typedef pthread_mutex_t CRITICAL_SECTION;
+static void InitializeCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_init(cs,NULL); }
+static void DeleteCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_destroy(cs); }
+static void EnterCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_lock(cs); }
+static void LeaveCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_unlock(cs); }
 #endif
 
 #ifndef MDB_DBI_INVALID
@@ -210,15 +217,6 @@ static double to_ms(uint64_t dt){ static double freq = 0; if(freq==0){ LARGE_INT
 #else
 static inline uint64_t ticks(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (uint64_t)ts.tv_sec*1000000000ull + ts.tv_nsec; }
 static double to_ms(uint64_t dt){ return (double)dt / 1000000.0; }
-#endif
-
-#ifndef _WIN32
-// Provide Win32-style critical section wrappers on POSIX systems
-typedef pthread_mutex_t CRITICAL_SECTION;
-static void InitializeCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_init(cs,NULL); }
-static void DeleteCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_destroy(cs); }
-static void EnterCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_lock(cs); }
-static void LeaveCriticalSection(CRITICAL_SECTION* cs){ pthread_mutex_unlock(cs); }
 #endif
 
 // ---- Lightweight IdMap --------------------------------------------------
