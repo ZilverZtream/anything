@@ -1,3 +1,5 @@
+#pragma once
+
 #ifndef ARCHIVE_H
 #define ARCHIVE_H
 #include "anything/anything.h"

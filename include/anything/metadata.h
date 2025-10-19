@@ -1,3 +1,5 @@
+#pragma once
+
 #ifndef METADATA_H
 #define METADATA_H
 #include "anything/anything.h"
