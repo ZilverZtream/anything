@@ -271,6 +271,7 @@ BOOL db_begin_write(Db* db);
 BOOL db_commit_write_ex(Db* db, BOOL force_sync);
 BOOL db_commit_write(Db* db);
 void db_abort_write(Db* db);
+void db_string_cache_clear(void);
 
 BOOL db_get_index_state(Db* db, IndexState* out);
 BOOL db_set_index_state(Db* db, const IndexState* st);
