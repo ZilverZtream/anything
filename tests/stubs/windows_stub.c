@@ -1,4 +1,4 @@
-#include "windows.h"
+#include "windows_stub.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
