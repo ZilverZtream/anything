@@ -148,6 +148,30 @@ typedef struct ContentResultItem {
     BOOL       needs_archive_index;
 } ContentResultItem;
 
+// ---- MPMC lock-free queue (Vyukov) ----
+typedef struct MPMCCell {
+    volatile LONG64 seq;
+    void*           data;
+    char            pad[CACHE_LINE_SIZE - sizeof(LONG64) - sizeof(void*)];
+} MPMCCell;
+
+typedef struct MPMCQueue {
+    LONG64      mask;
+    MPMCCell*   cells;
+    volatile LONG64 head;
+    char        pad1[CACHE_LINE_SIZE - sizeof(LONG64)];
+    volatile LONG64 tail;
+    char        pad2[CACHE_LINE_SIZE - sizeof(LONG64)];
+    void      (*on_push)(void*);
+    void*       on_push_ctx;
+} MPMCQueue;
+
+BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size);
+void MPMC_Destroy(MPMCQueue* q);
+BOOL MPMC_Push(MPMCQueue* q, void* data);
+BOOL MPMC_Pop(MPMCQueue* q, void** out);
+void MPMC_SetOnPush(MPMCQueue* q, void (*cb)(void*), void* ctx);
+
 typedef struct ContentThreadPool {
     MPMCQueue work_queue;
     MPMCQueue result_queue;
@@ -190,30 +214,6 @@ BOOL work_item_pool_init(size_t capacity);
 void work_item_pool_destroy(void);
 DbWorkItem* acquire_work_item(void);
 void release_work_item(DbWorkItem* item);
-
-// ---- MPMC lock-free queue (Vyukov) ----
-typedef struct MPMCCell {
-    volatile LONG64 seq;
-    void*           data;
-    char            pad[CACHE_LINE_SIZE - sizeof(LONG64) - sizeof(void*)];
-} MPMCCell;
-
-typedef struct MPMCQueue {
-    LONG64      mask;
-    MPMCCell*   cells;
-    volatile LONG64 head;
-    char        pad1[CACHE_LINE_SIZE - sizeof(LONG64)];
-    volatile LONG64 tail;
-    char        pad2[CACHE_LINE_SIZE - sizeof(LONG64)];
-    void      (*on_push)(void*);
-    void*       on_push_ctx;
-} MPMCQueue;
-
-BOOL MPMC_Init(MPMCQueue* q, LONG pow2_size);
-void MPMC_Destroy(MPMCQueue* q);
-BOOL MPMC_Push(MPMCQueue* q, void* data);
-BOOL MPMC_Pop(MPMCQueue* q, void** out);
-void MPMC_SetOnPush(MPMCQueue* q, void (*cb)(void*), void* ctx);
 
 // ---- Generic scanner (multi-threaded with work stealing) ----
 typedef struct GenericScanner GenericScanner;
