@@ -66,24 +66,6 @@ static int _snwprintf(wchar_t* dst, size_t cch, const wchar_t* fmt, ...){
     va_end(ap);
     return r;
 }
-#ifdef _WIN32
-static LONG64 atomic_inc64(volatile LONG64* v){ return InterlockedIncrement64(v); }
-static LONG64 atomic_dec64(volatile LONG64* v){ return InterlockedDecrement64(v); }
-static LONG64 atomic_load64(volatile LONG64* v){ return *v; }
-#ifndef FILTER_E_END_OF_CHUNKS
-#define FILTER_E_END_OF_CHUNKS ((HRESULT)0x80041780L)
-#endif
-#ifndef FILTER_E_NO_MORE_TEXT
-#define FILTER_E_NO_MORE_TEXT ((HRESULT)0x80041781L)
-#endif
-#ifndef FILTER_E_NO_TEXT
-#define FILTER_E_NO_TEXT ((HRESULT)0x80041782L)
-#endif
-#else
-static LONG64 atomic_inc64(volatile LONG64* v){ return __sync_add_and_fetch(v, 1); }
-static LONG64 atomic_dec64(volatile LONG64* v){ return __sync_sub_and_fetch(v, 1); }
-static LONG64 atomic_load64(volatile LONG64* v){ return __sync_add_and_fetch(v, 0); }
-#endif
 #ifdef __APPLE__
 static void utf8_to_wide(const char* src, wchar_t* dst, size_t dstlen){
     if(!dstlen) return;
@@ -145,6 +127,25 @@ static int WideCharToMultiByte(unsigned int cp, unsigned int flags, const wchar_
 #endif
 #endif
 
+#ifdef _WIN32
+static LONG64 atomic_inc64(volatile LONG64* v){ return InterlockedIncrement64(v); }
+static LONG64 atomic_dec64(volatile LONG64* v){ return InterlockedDecrement64(v); }
+static LONG64 atomic_load64(volatile LONG64* v){ return *v; }
+#ifndef FILTER_E_END_OF_CHUNKS
+#define FILTER_E_END_OF_CHUNKS ((HRESULT)0x80041780L)
+#endif
+#ifndef FILTER_E_NO_MORE_TEXT
+#define FILTER_E_NO_MORE_TEXT ((HRESULT)0x80041781L)
+#endif
+#ifndef FILTER_E_NO_TEXT
+#define FILTER_E_NO_TEXT ((HRESULT)0x80041782L)
+#endif
+#else
+static LONG64 atomic_inc64(volatile LONG64* v){ return __sync_add_and_fetch(v, 1); }
+static LONG64 atomic_dec64(volatile LONG64* v){ return __sync_sub_and_fetch(v, 1); }
+static LONG64 atomic_load64(volatile LONG64* v){ return __sync_add_and_fetch(v, 0); }
+#endif
+
 #define BLOOM_GENERATOR_MIN_THREADS 2
 #define BLOOM_GENERATOR_MAX_THREADS 4
 #define BLOOM_GENERATOR_BATCH_MIN 128
@@ -189,6 +190,13 @@ typedef struct WriterCtx {
     int content_threads;
     wchar_t db_path[MAX_PATH];
 } WriterCtx;
+
+typedef struct ScanDriveThreadArgs {
+    wchar_t root[8];
+    WriterCtx* ctx;
+    BOOL use_ntfs;
+    int threads;
+} ScanDriveThreadArgs;
 
 static const size_t MAP_GROWTH_INCREMENT = 1ull * 1024ull * 1024ull * 1024ull; // 1 GB
 
@@ -2655,7 +2663,7 @@ static BOOL parse_args(int argc, wchar_t** argv, Args* a){
 }
 
 static DWORD WINAPI scan_drive_thread(void* p){
-    struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = p;
+    ScanDriveThreadArgs* in = (ScanDriveThreadArgs*)p;
     (void)in->use_ntfs; // selection now handled internally
     FileScanner* fs = FileScanner_Start(in->root, in->threads, &in->ctx->queue, &in->ctx->cancel);
     if(fs){
@@ -2791,7 +2799,7 @@ int wmain(int argc, wchar_t** argv){
             wchar_t root[8]; swprintf(root, 8, L"%c:\\", L'A'+i);
             UINT type = GetDriveTypeW(root);
             if(type==DRIVE_FIXED || type==DRIVE_REMOVABLE){
-                struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = (struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; }*)malloc(sizeof(*in));
+                ScanDriveThreadArgs* in = (ScanDriveThreadArgs*)malloc(sizeof(*in));
                 wcscpy_s(in->root, 8, root);
                 in->ctx=&ctx; in->use_ntfs=args.use_ntfs; in->threads=args.threads;
                 uintptr_t dh = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))scan_drive_thread,in,0,NULL);
@@ -2807,7 +2815,7 @@ int wmain(int argc, wchar_t** argv){
             if(memcmp(current_sigs[di], st.drive_signatures[di], 32) == 0) need_scan = FALSE;
         }
         if(need_scan){
-            struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; } *in = (struct { wchar_t root[8]; WriterCtx* ctx; BOOL use_ntfs; int threads; }*)malloc(sizeof(*in));
+            ScanDriveThreadArgs* in = (ScanDriveThreadArgs*)malloc(sizeof(*in));
             wcscpy_s(in->root, 8, args.rootPath);
             in->ctx=&ctx; in->use_ntfs=args.use_ntfs; in->threads=args.threads;
             uintptr_t dh = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))scan_drive_thread,in,0,NULL);
