@@ -1,22 +1,10 @@
 
 // database.c — LMDB store with multiple indices and trigram index
 #define _CRT_SECURE_NO_WARNINGS
-#include <windows.h>
-#include <wchar.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <shlwapi.h>
+#include "core/pch.h"
 #include <immintrin.h>
 #include <limits.h>
 #pragma comment(lib, "shlwapi.lib")
-
-#include "anything/database.h"
-#include "anything/anything.h"
-#include "anything/util.h"
-#include "../../third_party/lmdb/lmdb.h"
 
 #ifndef _strdup
 #define _strdup strdup

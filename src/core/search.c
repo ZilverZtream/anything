@@ -1,22 +1,14 @@
 
 // search.c — fast query using trigram index + filters
 #define _CRT_SECURE_NO_WARNINGS
-#include <windows.h>
+#include "core/pch.h"
 #include <process.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <wchar.h>
-#include <shlwapi.h>
 #include <inttypes.h>
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
 #pragma comment(lib, "shlwapi.lib")
-
-#include "anything/database.h"
 
 #ifndef _WIN32
 #include <pthread.h>

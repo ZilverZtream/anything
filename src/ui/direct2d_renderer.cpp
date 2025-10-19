@@ -1,3 +1,4 @@
+#include "core/pch.h"
 #include "direct2d_renderer.h"
 
 #ifdef _WIN32

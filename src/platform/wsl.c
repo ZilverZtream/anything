@@ -1,12 +1,6 @@
 // wsl.c - robust WSL filesystem scanner that reads ext4.vhdx directly
+#include "core/pch.h"
 #include "wsl.h"
-#include "anything/util.h"
-
-#include <windows.h>
-#include <winreg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <errno.h>
 
 #include <ext2fs/ext2fs.h>

@@ -1,9 +1,7 @@
 #if defined(__linux__) || defined(__APPLE__)
 #define _XOPEN_SOURCE 700
 #endif
-#include "anything/scanner.h"
-#include <stdlib.h>
-#include <stdint.h>
+#include "core/pch.h"
 
 #ifdef _WIN32
 

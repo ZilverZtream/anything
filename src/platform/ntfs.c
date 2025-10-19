@@ -1,17 +1,8 @@
 
 // ntfs.c — Real NTFS USN journal scan + tail
 #define _CRT_SECURE_NO_WARNINGS
-#include <windows.h>
-#include <winioctl.h>
-#include <wchar.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "core/pch.h"
 #include <process.h>
-#include "anything/anything.h"
-#include "anything/util.h"
 
 typedef struct AdaptiveThreadPool {
     int min_threads;

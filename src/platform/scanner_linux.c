@@ -1,6 +1,6 @@
 #if defined(__linux__) || defined(__ANDROID__)
 #define _XOPEN_SOURCE 700
-#include "anything/scanner.h"
+#include "core/pch.h"
 #include <pthread.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>

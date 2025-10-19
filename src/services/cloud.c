@@ -1,18 +1,11 @@
 // cloud.c - basic cloud drive implementations using public APIs
-#include "anything/cloud.h"
-#include "anything/util.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "core/pch.h"
 #include <time.h>
 #include <curl/curl.h>
 #include "../../third_party/cJSON/cJSON.h"
 #ifdef _WIN32
-#include <windows.h>
-#include <wincrypt.h>
 #include <malloc.h>
 #else
-#include <wchar.h>
 #include <sched.h>
 #include <malloc.h>
 #include <sys/mman.h>
