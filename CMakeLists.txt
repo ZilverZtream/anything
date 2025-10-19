@@ -101,6 +101,7 @@ endif()
 # =============================================================================
 
 add_executable(anything)
+target_sources(anything PRIVATE "src/app/anything_main_stub.c")
 
 add_executable(anything_ui)
 
