@@ -44,7 +44,6 @@ typedef struct {
 #define CACHE_PARTITION_BASE (STRING_CACHE_SIZE / CACHE_PARTITIONS)
 #define CACHE_PARTITION_REMAINDER (STRING_CACHE_SIZE % CACHE_PARTITIONS)
 #define PARTITION_STRIDE 512u
-#define PARTITION_MASK (PARTITION_STRIDE - 1u)
 
 static inline size_t string_cache_partition_capacity(size_t partition){
     size_t cap = CACHE_PARTITION_BASE;
@@ -73,7 +72,7 @@ static uint64_t string_cache_lookup(const char* s, uint64_t h){
     StringCache* cache = g_string_cache[partition];
     size_t idx = base_idx;
     for(size_t probe = 0; probe < PARTITION_STRIDE; ++probe){
-        size_t next_idx = (base_idx + ((probe + 1) * (probe + 1))) & PARTITION_MASK;
+        size_t next_idx = (base_idx + ((probe + 1) * (probe + 1))) % partition_cap;
         if(idx >= partition_cap){
             idx = next_idx;
             continue;
@@ -115,7 +114,7 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
     LONG64 stamp = InterlockedIncrement64(&g_string_cache_clock);
     StringCache* cache = g_string_cache[partition];
     for(size_t probe = 0; probe < PARTITION_STRIDE; ++probe){
-        size_t next_idx = (base_idx + ((probe + 1) * (probe + 1))) & PARTITION_MASK;
+        size_t next_idx = (base_idx + ((probe + 1) * (probe + 1))) % partition_cap;
         if(idx >= partition_cap){
             idx = next_idx;
             continue;
