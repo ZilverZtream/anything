@@ -31,7 +31,7 @@
 #if __has_include(<zip.h>)
 #include <zip.h>
 #endif
-#if __has_include(<libpst/libpst.h>)
+#if !defined(_WIN32) && __has_include(<libpst/libpst.h>)
 #include <libpst/libpst.h>
 #endif
 #ifdef _WIN32
@@ -42,7 +42,9 @@
 #else
 #include <lmdb.h>
 #include <zip.h>
+#ifndef _WIN32
 #include <libpst/libpst.h>
+#endif
 #ifdef _WIN32
 #include <filter.h>
 #endif
