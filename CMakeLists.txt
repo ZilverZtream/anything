@@ -65,8 +65,6 @@ set(ANYTHING_CORE_SOURCES
     ${CORE_ENTERPRISE_SOURCES}
 )
 
-list(REMOVE_ITEM ANYTHING_CORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/app/anything_main_stub.c")
-
 # =============================================================================
 # Shared Core Library
 # =============================================================================
@@ -102,9 +100,11 @@ endif()
 # Define Executable Targets
 # =============================================================================
 
-add_executable(anything src/app/anything_main_stub.c)
+add_executable(anything)
 
-add_executable(anything_ui
+add_executable(anything_ui)
+
+target_sources(anything_ui PRIVATE
     ${UI_SOURCES}
     "third_party/cJSON/cJSON.c"
 )
