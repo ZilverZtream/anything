@@ -25,6 +25,31 @@
 #define MDB_DBI_INVALID ((MDB_dbi)~(unsigned)0)
 #endif
 
+static const uint8_t* bloom_readonly_base = NULL;
+static size_t g_bloom_size = 0;
+#define BLOOM_CACHE_CAP 1000
+
+typedef struct {
+    uint64_t string_id;
+    uint64_t bloom_offset;
+    uint32_t bloom_length;
+    uint8_t  bloom_log2;
+    uint8_t  hash_count;
+    size_t   bloom_bytes;
+    uint8_t* data;
+    uint64_t stamp;
+    BOOL     in_use;
+} BloomCacheEntry;
+
+static BloomCacheEntry g_bloom_cache[BLOOM_CACHE_CAP];
+static size_t g_bloom_cache_count = 0;
+static uint64_t g_bloom_cache_clock = 0;
+static BOOL g_bloom_cache_initialized = FALSE;
+static CRITICAL_SECTION g_bloom_cache_mu;
+// Global database path for caching term results
+static wchar_t g_db_path[MAX_LONG_PATH]={0};
+static uint64_t g_db_generation = 0;
+
 static inline size_t bloom_log2_to_bytes(uint8_t log2){
     if(log2 >= 8 && log2 <= 20){
         return (size_t)1u << log2;
@@ -323,30 +348,6 @@ static HANDLE bloom_mapping = NULL;
 #else
 static int bloom_fd = -1;
 #endif
-static const uint8_t* bloom_readonly_base = NULL;
-static size_t g_bloom_size = 0;
-#define BLOOM_CACHE_CAP 1000
-
-typedef struct {
-    uint64_t string_id;
-    uint64_t bloom_offset;
-    uint32_t bloom_length;
-    uint8_t  bloom_log2;
-    uint8_t  hash_count;
-    size_t   bloom_bytes;
-    uint8_t* data;
-    uint64_t stamp;
-    BOOL     in_use;
-} BloomCacheEntry;
-
-static BloomCacheEntry g_bloom_cache[BLOOM_CACHE_CAP];
-static size_t g_bloom_cache_count = 0;
-static uint64_t g_bloom_cache_clock = 0;
-static BOOL g_bloom_cache_initialized = FALSE;
-static CRITICAL_SECTION g_bloom_cache_mu;
-// Global database path for caching term results
-static wchar_t g_db_path[MAX_LONG_PATH]={0};
-static uint64_t g_db_generation = 0;
 
 // Magic marker and version for cache files so we can detect incompatible
 // formats and upgrade transparently.
