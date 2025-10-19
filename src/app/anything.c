@@ -3,6 +3,13 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "core/pch.h"
 
+// Define platform-agnostic constants before any conditional compilation to
+// ensure they are always available regardless of the active branch.
+#define MAX_INDEXED_CONTENT   ((size_t)1024 * 1024)        // 1MB
+#define MAX_TOTAL_EPUB_SIZE   ((size_t)4 * 1024 * 1024)    // 4MB safety cap for aggregated EPUB text
+#define MAX_EPUB_HTML_FILES   ((size_t)2048)
+#define CP_UTF8 65001
+
 #ifdef _WIN32
 #include <intrin.h>
 #include <process.h>
@@ -77,11 +84,6 @@ static LONG64 atomic_inc64(volatile LONG64* v){ return __sync_add_and_fetch(v, 1
 static LONG64 atomic_dec64(volatile LONG64* v){ return __sync_sub_and_fetch(v, 1); }
 static LONG64 atomic_load64(volatile LONG64* v){ return __sync_add_and_fetch(v, 0); }
 #endif
-#define CP_UTF8 65001
-
-#define MAX_INDEXED_CONTENT   ((size_t)1024 * 1024)        // 1MB
-#define MAX_TOTAL_EPUB_SIZE   ((size_t)4 * 1024 * 1024)    // 4MB safety cap for aggregated EPUB text
-#define MAX_EPUB_HTML_FILES   ((size_t)2048)
 #ifdef __APPLE__
 static void utf8_to_wide(const char* src, wchar_t* dst, size_t dstlen){
     if(!dstlen) return;
