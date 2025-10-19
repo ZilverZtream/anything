@@ -2,16 +2,18 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>
 #include <stdlib.h>
 #include <wchar.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
 
+#ifndef _WIN32
+#include <strings.h>
 #define _stricmp strcasecmp
 #define _strnicmp strncasecmp
 #define _strdup strdup
+#endif
 
 #include "anything/util.h"
 

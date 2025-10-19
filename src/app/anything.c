@@ -63,12 +63,24 @@ static int _snwprintf(wchar_t* dst, size_t cch, const wchar_t* fmt, ...){
 static LONG64 atomic_inc64(volatile LONG64* v){ return InterlockedIncrement64(v); }
 static LONG64 atomic_dec64(volatile LONG64* v){ return InterlockedDecrement64(v); }
 static LONG64 atomic_load64(volatile LONG64* v){ return *v; }
+#ifndef FILTER_E_END_OF_CHUNKS
+#define FILTER_E_END_OF_CHUNKS ((HRESULT)0x80041780L)
+#endif
+#ifndef FILTER_E_NO_MORE_TEXT
+#define FILTER_E_NO_MORE_TEXT ((HRESULT)0x80041781L)
+#endif
+#ifndef FILTER_E_NO_TEXT
+#define FILTER_E_NO_TEXT ((HRESULT)0x80041782L)
+#endif
 #else
 static LONG64 atomic_inc64(volatile LONG64* v){ return __sync_add_and_fetch(v, 1); }
 static LONG64 atomic_dec64(volatile LONG64* v){ return __sync_sub_and_fetch(v, 1); }
 static LONG64 atomic_load64(volatile LONG64* v){ return __sync_add_and_fetch(v, 0); }
 #endif
 #define CP_UTF8 65001
+#define MAX_INDEXED_CONTENT (1024*1024) // 1MB
+#define MAX_TOTAL_EPUB_SIZE (4*1024*1024) // 4MB safety cap for aggregated EPUB text
+#define MAX_EPUB_HTML_FILES 2048
 #ifdef __APPLE__
 static void utf8_to_wide(const char* src, wchar_t* dst, size_t dstlen){
     if(!dstlen) return;
@@ -484,10 +496,6 @@ static BOOL is_archive_file(const wchar_t* name){
     return FALSE;
 }
 
-#define MAX_INDEXED_CONTENT (1024*1024) // 1MB
-#define MAX_TOTAL_EPUB_SIZE (4*1024*1024) // 4MB safety cap for aggregated EPUB text
-#define MAX_EPUB_HTML_FILES 2048
-
 static wchar_t* extract_with_filter(const wchar_t* path){
 #ifdef _WIN32
     bool do_uninit = false;
@@ -504,7 +512,11 @@ static wchar_t* extract_with_filter(const wchar_t* path){
     HRESULT hr = LoadIFilter(path, NULL, NULL, 0, 0, 0, &filter);
     if(FAILED(hr)) goto cleanup;
 
+#ifdef __cplusplus
     hr = filter->Init(IFILTER_INIT_APPLY_INDEX_ATTRIBUTES, 0, NULL, NULL);
+#else
+    hr = filter->lpVtbl->Init(filter, IFILTER_INIT_APPLY_INDEX_ATTRIBUTES, 0, NULL, NULL);
+#endif
     if(FAILED(hr)) goto cleanup;
 
     cap = 4096;
@@ -514,7 +526,11 @@ static wchar_t* extract_with_filter(const wchar_t* path){
     for(;;){
         WCHAR buf[1024];
         ULONG cch = (ULONG)(sizeof(buf) / sizeof(buf[0]));
+#ifdef __cplusplus
         hr = filter->GetText(&cch, buf);
+#else
+        hr = filter->lpVtbl->GetText(filter, &cch, buf);
+#endif
         if(hr == S_FALSE || hr == FILTER_E_END_OF_CHUNKS ||
            hr == FILTER_E_NO_MORE_TEXT || hr == FILTER_E_NO_TEXT || cch == 0){
             break;
@@ -549,7 +565,11 @@ cleanup:
         out = NULL;
     }
     if(filter){
+#ifdef __cplusplus
         filter->Release();
+#else
+        filter->lpVtbl->Release(filter);
+#endif
     }
     if(do_uninit){
         CoUninitialize();
@@ -601,6 +621,15 @@ static wchar_t* alloc_wide_from_utf8(const char* value){
         return NULL;
     }
     return wtmp;
+}
+
+static wchar_t* dup_wstring_local(const wchar_t* s){
+    if(!s) return NULL;
+#ifdef _WIN32
+    return _wcsdup(s);
+#else
+    return wcsdup(s);
+#endif
 }
 
 static void assign_utf8_if_empty(const char* value, wchar_t** target){
@@ -1294,6 +1323,44 @@ static ContentResultItem* content_process_item(ContentWorkItem* wi, CancelToken*
     return result;
 }
 
+typedef struct BatchInternRequest {
+    wchar_t*   str;
+    uint64_t*  target;
+    uint64_t*  normalized_target;
+} BatchInternRequest;
+
+static BOOL writer_add_intern_request(BatchInternRequest** reqs, size_t* count, size_t* capacity, wchar_t* str, uint64_t* target, uint64_t* normalized_target){
+    if(!str || !target){
+        if(str) free(str);
+        return TRUE;
+    }
+    if(*count == *capacity){
+        size_t newcap = *capacity ? (*capacity * 2) : 64;
+        BatchInternRequest* tmp = (BatchInternRequest*)realloc(*reqs, sizeof(BatchInternRequest) * newcap);
+        if(!tmp){
+            free(str);
+            return FALSE;
+        }
+        *reqs = tmp;
+        *capacity = newcap;
+    }
+    (*reqs)[*count].str = str;
+    (*reqs)[*count].target = target;
+    (*reqs)[*count].normalized_target = normalized_target;
+    (*count)++;
+    return TRUE;
+}
+
+static void writer_release_intern_requests(BatchInternRequest* reqs, size_t count){
+    if(!reqs) return;
+    for(size_t i=0;i<count;i++){
+        if(reqs[i].str){
+            free(reqs[i].str);
+            reqs[i].str = NULL;
+        }
+    }
+}
+
 static BOOL writer_apply_content_result(WriterCtx* ctx,
                                         ContentResultItem* result,
                                         DbRecord** buf,
@@ -1799,53 +1866,6 @@ static BOOL writer_signal_wait(WriterSignal* sig, DWORD timeout_ms, BOOL* timed_
     if(timed_out) *timed_out = to;
     return TRUE;
 #endif
-}
-
-typedef struct BatchInternRequest {
-    wchar_t*   str;
-    uint64_t*  target;
-    uint64_t*  normalized_target;
-} BatchInternRequest;
-
-static wchar_t* dup_wstring_local(const wchar_t* s){
-    if(!s) return NULL;
-#ifdef _WIN32
-    return _wcsdup(s);
-#else
-    return wcsdup(s);
-#endif
-}
-
-static BOOL writer_add_intern_request(BatchInternRequest** reqs, size_t* count, size_t* capacity, wchar_t* str, uint64_t* target, uint64_t* normalized_target){
-    if(!str || !target){
-        if(str) free(str);
-        return TRUE;
-    }
-    if(*count == *capacity){
-        size_t newcap = *capacity ? (*capacity * 2) : 64;
-        BatchInternRequest* tmp = (BatchInternRequest*)realloc(*reqs, sizeof(BatchInternRequest) * newcap);
-        if(!tmp){
-            free(str);
-            return FALSE;
-        }
-        *reqs = tmp;
-        *capacity = newcap;
-    }
-    (*reqs)[*count].str = str;
-    (*reqs)[*count].target = target;
-    (*reqs)[*count].normalized_target = normalized_target;
-    (*count)++;
-    return TRUE;
-}
-
-static void writer_release_intern_requests(BatchInternRequest* reqs, size_t count){
-    if(!reqs) return;
-    for(size_t i=0;i<count;i++){
-        if(reqs[i].str){
-            free(reqs[i].str);
-            reqs[i].str = NULL;
-        }
-    }
 }
 
 typedef struct WriterCtx WriterCtx;

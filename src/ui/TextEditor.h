@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef HAS_IMGUI
+#error "TextEditor requires HAS_IMGUI to be defined"
+#endif
+
 #include <string>
 #include <vector>
 #include <array>
