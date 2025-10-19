@@ -316,14 +316,14 @@ static void scan(void){
 }
 #endif
 
-static void shutdown(void){ }
+static void plugin_shutdown(void){ }
 
 static AnythingPlugin g_plugin = {
     ANYTHING_PLUGIN_API_VERSION,
     L"Code Parser Plugin",
     init,
     scan,
-    shutdown
+    plugin_shutdown
 };
 
 __declspec(dllexport) AnythingPlugin* Anything_GetPlugin(void){ return &g_plugin; }
