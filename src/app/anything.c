@@ -180,6 +180,11 @@ typedef struct WriterCtx {
     size_t backlog_tail;
     size_t backlog_count;
     size_t backlog_capacity;
+#ifdef _WIN32
+    CRITICAL_SECTION backlog_lock;
+#else
+    pthread_mutex_t backlog_mutex;
+#endif
     DWORD push_timeout_ms;
     int    min_batch_size;
     int    max_batch_size;
@@ -2003,19 +2008,73 @@ static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch
     return overall_success;
 }
 
+static BOOL writer_backlog_init(WriterCtx* ctx){
+    if(!ctx) return FALSE;
+#ifdef _WIN32
+    InitializeCriticalSection(&ctx->backlog_lock);
+    return TRUE;
+#else
+    return pthread_mutex_init(&ctx->backlog_mutex, NULL) == 0;
+#endif
+}
+
+static void writer_backlog_destroy(WriterCtx* ctx){
+    if(!ctx) return;
+#ifdef _WIN32
+    DeleteCriticalSection(&ctx->backlog_lock);
+#else
+    pthread_mutex_destroy(&ctx->backlog_mutex);
+#endif
+}
+
+static void writer_backlog_lock(WriterCtx* ctx){
+    if(!ctx) return;
+#ifdef _WIN32
+    EnterCriticalSection(&ctx->backlog_lock);
+#else
+    pthread_mutex_lock(&ctx->backlog_mutex);
+#endif
+}
+
+static void writer_backlog_unlock(WriterCtx* ctx){
+    if(!ctx) return;
+#ifdef _WIN32
+    LeaveCriticalSection(&ctx->backlog_lock);
+#else
+    pthread_mutex_unlock(&ctx->backlog_mutex);
+#endif
+}
+
+static size_t writer_backlog_count(WriterCtx* ctx){
+    if(!ctx) return 0;
+    size_t count = 0;
+    writer_backlog_lock(ctx);
+    count = ctx->backlog_count;
+    writer_backlog_unlock(ctx);
+    return count;
+}
+
 static BOOL writer_backlog_push(WriterCtx* ctx, DbWorkItem* wi){
     if(!ctx) return FALSE;
-    if(ctx->backlog_count == ctx->backlog_capacity){
-        size_t newcap = ctx->backlog_capacity ? ctx->backlog_capacity * 2 : 64;
+    BOOL ok = FALSE;
+    writer_backlog_lock(ctx);
+    size_t count = ctx->backlog_count;
+    size_t capacity = ctx->backlog_capacity;
+    if(count == capacity){
+        size_t newcap = capacity ? capacity * 2 : 64;
         DbWorkItem** items = (DbWorkItem**)malloc(sizeof(DbWorkItem*) * newcap);
-        if(!items) return FALSE;
-        if(ctx->backlog_count){
-            for(size_t i=0;i<ctx->backlog_count;i++){
-                size_t idx = (ctx->backlog_head + i) % ctx->backlog_capacity;
-                items[i] = ctx->backlog[idx];
+        if(!items){
+            goto done;
+        }
+        if(count){
+            if(capacity){
+                for(size_t i = 0; i < count; ++i){
+                    size_t idx = (ctx->backlog_head + i) % capacity;
+                    items[i] = ctx->backlog[idx];
+                }
             }
             ctx->backlog_head = 0;
-            ctx->backlog_tail = ctx->backlog_count;
+            ctx->backlog_tail = count;
         } else {
             ctx->backlog_head = 0;
             ctx->backlog_tail = 0;
@@ -2023,39 +2082,65 @@ static BOOL writer_backlog_push(WriterCtx* ctx, DbWorkItem* wi){
         free(ctx->backlog);
         ctx->backlog = items;
         ctx->backlog_capacity = newcap;
+        capacity = newcap;
+    }
+    if(ctx->backlog_capacity == 0){
+        goto done;
     }
     ctx->backlog[ctx->backlog_tail] = wi;
     ctx->backlog_tail = (ctx->backlog_tail + 1) % ctx->backlog_capacity;
-    ctx->backlog_count++;
-    return TRUE;
+    ctx->backlog_count = count + 1;
+    ok = TRUE;
+done:
+    writer_backlog_unlock(ctx);
+    return ok;
 }
 
-static DbWorkItem* writer_backlog_peek(const WriterCtx* ctx){
-    if(!ctx || ctx->backlog_count == 0) return NULL;
-    return ctx->backlog[ctx->backlog_head];
-}
-
-static void writer_backlog_pop(WriterCtx* ctx){
-    if(!ctx || ctx->backlog_count == 0) return;
-    ctx->backlog_head = (ctx->backlog_head + 1) % ctx->backlog_capacity;
-    ctx->backlog_count--;
+static DbWorkItem* writer_backlog_take(WriterCtx* ctx){
+    if(!ctx) return NULL;
+    DbWorkItem* wi = NULL;
+    writer_backlog_lock(ctx);
+    if(ctx->backlog_count > 0 && ctx->backlog_capacity > 0){
+        wi = ctx->backlog[ctx->backlog_head];
+        ctx->backlog[ctx->backlog_head] = NULL;
+        ctx->backlog_head = (ctx->backlog_head + 1) % ctx->backlog_capacity;
+        ctx->backlog_count--;
+    }
+    writer_backlog_unlock(ctx);
+    return wi;
 }
 
 static void writer_backlog_free(WriterCtx* ctx){
     if(!ctx) return;
+    DbWorkItem** items = NULL;
+    size_t count = 0;
+    size_t head = 0;
+    size_t capacity = 0;
+    writer_backlog_lock(ctx);
     if(ctx->backlog_count){
-        for(size_t i=0;i<ctx->backlog_count;i++){
-            size_t idx = (ctx->backlog_head + i) % ctx->backlog_capacity;
-            DbWorkItem* wi = ctx->backlog[idx];
-            if(wi) release_work_item(wi);
-        }
+        items = ctx->backlog;
+        count = ctx->backlog_count;
+        head = ctx->backlog_head;
+        capacity = ctx->backlog_capacity;
+    } else {
+        free(ctx->backlog);
     }
-    free(ctx->backlog);
     ctx->backlog = NULL;
     ctx->backlog_capacity = 0;
     ctx->backlog_count = 0;
     ctx->backlog_head = 0;
     ctx->backlog_tail = 0;
+    writer_backlog_unlock(ctx);
+    if(items){
+        if(capacity){
+            for(size_t i = 0; i < count; ++i){
+                size_t idx = (head + i) % capacity;
+                DbWorkItem* wi = items[idx];
+                if(wi) release_work_item(wi);
+            }
+        }
+        free(items);
+    }
 }
 
 static BOOL push_with_backoff(MPMCQueue* q, void* data, DWORD timeout_ms, const char* owner){
@@ -2293,12 +2378,7 @@ static BOOL writer_enqueue(WriterCtx* ctx, DbWorkItem* wi, const char* stage){
 
 static DbWorkItem* writer_take_backlog(WriterCtx* ctx){
     if(!ctx) return NULL;
-    while(ctx->backlog_count){
-        DbWorkItem* wi = writer_backlog_peek(ctx);
-        writer_backlog_pop(ctx);
-        if(wi) return wi;
-    }
-    return NULL;
+    return writer_backlog_take(ctx);
 }
 
 static DWORD WINAPI DbWriterThread(void* p){
@@ -2357,7 +2437,7 @@ static DWORD WINAPI DbWriterThread(void* p){
                     }
                     continue;
                 }
-                if(ctx->done && ctx->backlog_count == 0){
+                if(ctx->done && writer_backlog_count(ctx) == 0){
                     LONG64 pending = ctx->content_pool ? content_pool_pending(ctx->content_pool) : 0;
                     if(pending == 0) break;
                 }
@@ -2378,7 +2458,7 @@ static DWORD WINAPI DbWriterThread(void* p){
             }
             if(item == NULL){
                 LONG64 pending = ctx->content_pool ? content_pool_pending(ctx->content_pool) : 0;
-                if(ctx->backlog_count == 0 && pending == 0) break;
+                if(writer_backlog_count(ctx) == 0 && pending == 0) break;
                 ctx->done = TRUE;
                 continue;
             }
@@ -2779,6 +2859,13 @@ int wmain(int argc, wchar_t** argv){
         db_close(db);
         return 1;
     }
+    if(!writer_backlog_init(&ctx)){
+        fwprintf(stderr, L"Failed to initialize writer backlog lock\n");
+        MPMC_Destroy(&ctx.queue);
+        work_item_pool_destroy();
+        db_close(db);
+        return 1;
+    }
     ctx.min_batch_size = 100;
     ctx.max_batch_size = 10000;
     if(ctx.batch_size < ctx.min_batch_size) ctx.batch_size = ctx.min_batch_size;
@@ -2788,6 +2875,7 @@ int wmain(int argc, wchar_t** argv){
     ctx.consecutive_idle_waits = 0;
     if(!writer_signal_init(&ctx.data_signal)){
         fwprintf(stderr, L"Failed to initialize writer signal\n");
+        writer_backlog_destroy(&ctx);
         MPMC_Destroy(&ctx.queue);
         work_item_pool_destroy();
         db_close(db);
@@ -2805,6 +2893,7 @@ int wmain(int argc, wchar_t** argv){
     if(!writer){
         fwprintf(stderr, L"Failed to start DbWriterThread\n");
         bloom_generator_shutdown();
+        writer_backlog_destroy(&ctx);
         writer_signal_destroy(&ctx.data_signal);
         MPMC_Destroy(&ctx.queue);
         work_item_pool_destroy();
@@ -2905,6 +2994,7 @@ int wmain(int argc, wchar_t** argv){
             (unsigned long long)header->string_count,
             (unsigned long long)(header->map_size_bytes/1024/1024));
     }
+    writer_backlog_destroy(&ctx);
     writer_signal_destroy(&ctx.data_signal);
     Plugin_UnloadAll();
     bloom_generator_shutdown();
