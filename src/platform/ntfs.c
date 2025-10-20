@@ -16,6 +16,8 @@ typedef struct AdaptiveThreadPool {
     void* worker_arg;
 } AdaptiveThreadPool;
 
+typedef struct USNScanner USNScanner;
+
 static void pool_init(AdaptiveThreadPool* pool, int min_t, int max_t,
                       LPTHREAD_START_ROUTINE worker, void* arg){
     pool->min_threads = min_t;
@@ -201,6 +203,31 @@ static BOOL frnmap_ensure_slot_committed(FrnMap* m, size_t index){
     (void)m; (void)index;
 #endif
     return TRUE;
+}
+
+static BOOL should_pause_for_backpressure(USNScanner* s){
+    if(!s || !s->outq){
+        return FALSE;
+    }
+    LONG64 mask = s->outq->mask;
+    size_t capacity = (size_t)(mask + 1);
+    if(capacity == 0){
+        return FALSE;
+    }
+    LONG64 head = s->outq->head;
+    LONG64 tail = s->outq->tail;
+    size_t count = 0;
+    if(tail > head){
+        LONG64 diff = tail - head;
+        if(diff < 0){
+            diff = 0;
+        }
+        count = (size_t)diff;
+        if(count > capacity){
+            count = capacity;
+        }
+    }
+    return count > (capacity * 4 / 5);
 }
 
 static BOOL frnmap_allocate_slots(FrnMap* m, size_t slot_count){
@@ -983,6 +1010,9 @@ static DWORD WINAPI map_emit_worker(void* p){
         if(!outq_push_blocking(s->outq, wi, s->cancel)){
             release_work_item(wi);
             break;
+        }
+        if(should_pause_for_backpressure(s)){
+            Sleep(10);
         }
     }
     return 0;
