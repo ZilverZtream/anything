@@ -1430,9 +1430,12 @@ static BOOL writer_reset_after_txn_failure(WriterCtx* ctx,
 
     if(intern_requests && intern_count && *intern_requests){
         writer_release_intern_requests(*intern_requests, *intern_count);
+        *intern_requests = NULL;
     }
     if(intern_count) *intern_count = 0;
-    if(in_batch) *in_batch = 0;
+    if(in_batch){
+        *in_batch = 0;
+    }
     if(batch_requires_sync) *batch_requires_sync = FALSE;
     ctx->consecutive_full_batches = 0;
 
