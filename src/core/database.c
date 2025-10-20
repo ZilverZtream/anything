@@ -2564,18 +2564,17 @@ static BOOL db_put_records_internal(Db* db_,
                                        intern_any_norm ? intern_norm_ids : NULL)){
             result = FALSE;
             goto cleanup;
-        } else {
-            for(size_t i = 0; i < intern_active; ++i){
-                const DbStringInternRequest* req = request_refs[i];
-                if(req->target){
-                    *(req->target) = intern_ids[i];
-                }
-                if(req->normalized_target && intern_norm_ids){
-                    *(req->normalized_target) = intern_norm_ids[i];
-                }
-            }
-            assigned_intern_targets = TRUE;
         }
+        for(size_t i = 0; i < intern_active; ++i){
+            const DbStringInternRequest* req = request_refs[i];
+            if(req->target){
+                *(req->target) = intern_ids[i];
+            }
+            if(req->normalized_target && intern_norm_ids){
+                *(req->normalized_target) = intern_norm_ids[i];
+            }
+        }
+        assigned_intern_targets = TRUE;
     }
 
     MDB_txn* batch_txn = NULL;
