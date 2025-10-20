@@ -2563,6 +2563,7 @@ static BOOL db_put_records_internal(Db* db_,
                                        intern_ids,
                                        intern_any_norm ? intern_norm_ids : NULL)){
             result = FALSE;
+            goto cleanup;
         } else {
             for(size_t i = 0; i < intern_active; ++i){
                 const DbStringInternRequest* req = request_refs[i];
@@ -2575,10 +2576,6 @@ static BOOL db_put_records_internal(Db* db_,
             }
             assigned_intern_targets = TRUE;
         }
-    }
-
-    if(!result){
-        goto cleanup;
     }
 
     MDB_txn* batch_txn = NULL;
