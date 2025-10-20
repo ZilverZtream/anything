@@ -1415,6 +1415,33 @@ static void writer_release_intern_requests(BatchInternRequest* reqs, size_t coun
     }
 }
 
+static BOOL writer_reset_after_txn_failure(WriterCtx* ctx,
+                                           DbRecord** buf,
+                                           size_t* buf_capacity,
+                                           size_t* in_batch,
+                                           BOOL* batch_requires_sync,
+                                           BatchInternRequest** intern_requests,
+                                           size_t* intern_count){
+    (void)buf;
+    (void)buf_capacity;
+    if(!ctx || !ctx->db) return FALSE;
+
+    db_abort_write(ctx->db);
+
+    if(intern_requests && intern_count && *intern_requests){
+        writer_release_intern_requests(*intern_requests, *intern_count);
+    }
+    if(intern_count) *intern_count = 0;
+    if(in_batch) *in_batch = 0;
+    if(batch_requires_sync) *batch_requires_sync = FALSE;
+    ctx->consecutive_full_batches = 0;
+
+    if(!db_begin_write(ctx->db)){
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static BOOL writer_apply_content_result(WriterCtx* ctx,
                                         ContentResultItem* result,
                                         DbRecord** buf,
@@ -2303,21 +2330,33 @@ static DWORD WINAPI DbWriterThread(void* p){
 
     for(;;){
         if(!writer_drain_bloom_results(ctx)){
-            success = FALSE;
-            goto cleanup;
+            if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                              &intern_requests, &intern_count)){
+                success = FALSE;
+                goto cleanup;
+            }
+            continue;
         }
         writer_drain_backlog(ctx);
         if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
                                            &intern_requests, &intern_count, &intern_capacity)){
-            success = FALSE;
-            goto cleanup;
+            if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                              &intern_requests, &intern_count)){
+                success = FALSE;
+                goto cleanup;
+            }
+            continue;
         }
         void* item = NULL;
         if(!MPMC_Pop(&ctx->queue, &item)){
             if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
                                                &intern_requests, &intern_count, &intern_capacity)){
-                success = FALSE;
-                goto cleanup;
+                if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                                  &intern_requests, &intern_count)){
+                    success = FALSE;
+                    goto cleanup;
+                }
+                continue;
             }
             if(ctx->done && ctx->backlog_count == 0){
                 LONG64 pending = ctx->content_pool ? content_pool_pending(ctx->content_pool) : 0;
@@ -2499,8 +2538,22 @@ static DWORD WINAPI DbWriterThread(void* p){
         }
 
         if(in_batch >= (size_t)ctx->batch_size){
-            if(!put_batch_with_growth(ctx, buf, in_batch, intern_requests, intern_count)) { success = FALSE; goto cleanup; }
-            if(!db_commit_write_ex(ctx->db, batch_requires_sync)) { success = FALSE; goto cleanup; }
+            if(!put_batch_with_growth(ctx, buf, in_batch, intern_requests, intern_count)) {
+                if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                                  &intern_requests, &intern_count)){
+                    success = FALSE;
+                    goto cleanup;
+                }
+                continue;
+            }
+            if(!db_commit_write_ex(ctx->db, batch_requires_sync)) {
+                if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                                  &intern_requests, &intern_count)){
+                    success = FALSE;
+                    goto cleanup;
+                }
+                continue;
+            }
             writer_release_intern_requests(intern_requests, intern_count);
             intern_count = 0;
             if(!db_begin_write(ctx->db))  { success = FALSE; goto cleanup; }
@@ -2523,32 +2576,58 @@ static DWORD WINAPI DbWriterThread(void* p){
         while(content_pool_pending(ctx->content_pool) > 0){
             if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
                                                &intern_requests, &intern_count, &intern_capacity)){
-                success = FALSE;
-                goto cleanup;
+                if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                                  &intern_requests, &intern_count)){
+                    success = FALSE;
+                    goto cleanup;
+                }
+                continue;
             }
             if(!writer_drain_bloom_results(ctx)){
-                success = FALSE;
-                goto cleanup;
+                if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                                  &intern_requests, &intern_count)){
+                    success = FALSE;
+                    goto cleanup;
+                }
+                continue;
             }
             Sleep(1);
         }
         if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
                                            &intern_requests, &intern_count, &intern_capacity)){
-            success = FALSE;
-            goto cleanup;
+            if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                              &intern_requests, &intern_count)){
+                success = FALSE;
+                goto cleanup;
+            }
         }
         if(!writer_drain_bloom_results(ctx)){
-            success = FALSE;
-            goto cleanup;
+            if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                              &intern_requests, &intern_count)){
+                success = FALSE;
+                goto cleanup;
+            }
         }
     }
 
     if(in_batch){
-        if(!put_batch_with_growth(ctx, buf, in_batch, intern_requests, intern_count)) { success = FALSE; goto cleanup; }
-        if(!db_commit_write_ex(ctx->db, batch_requires_sync)) { success = FALSE; goto cleanup; }
-        writer_release_intern_requests(intern_requests, intern_count);
-        intern_count = 0;
-        ctx->consecutive_full_batches = 0;
+        if(!put_batch_with_growth(ctx, buf, in_batch, intern_requests, intern_count)) {
+            if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                              &intern_requests, &intern_count)){
+                success = FALSE;
+                goto cleanup;
+            }
+        } else if(!db_commit_write_ex(ctx->db, batch_requires_sync)) {
+            if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                              &intern_requests, &intern_count)){
+                success = FALSE;
+                goto cleanup;
+            }
+        } else {
+            writer_release_intern_requests(intern_requests, intern_count);
+            intern_count = 0;
+            ctx->consecutive_full_batches = 0;
+        }
     } else {
         writer_release_intern_requests(intern_requests, intern_count);
         intern_count = 0;
@@ -2556,8 +2635,11 @@ static DWORD WINAPI DbWriterThread(void* p){
     }
 
     if(!writer_drain_bloom_results(ctx)){
-        success = FALSE;
-        goto cleanup;
+        if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                          &intern_requests, &intern_count)){
+            success = FALSE;
+            goto cleanup;
+        }
     }
 
 cleanup:
