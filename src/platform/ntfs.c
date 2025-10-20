@@ -3,6 +3,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "core/pch.h"
 #include <process.h>
+#include <limits.h>
 
 typedef struct AdaptiveThreadPool {
     int min_threads;
@@ -15,19 +16,6 @@ typedef struct AdaptiveThreadPool {
     void* worker_arg;
 } AdaptiveThreadPool;
 
-static void adjust_thread_count(AdaptiveThreadPool* pool){
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if(pool->work_queue_size > pool->current_threads * 10 &&
-       pool->current_threads < pool->max_threads){
-        HANDLE h = (HANDLE)_beginthreadex(NULL,0,pool->worker,pool->worker_arg,0,NULL);
-        if(h){
-            pool->threads[pool->current_threads++] = h;
-        }
-    }
-    pool->last_adjustment = now;
-}
-
 static void pool_init(AdaptiveThreadPool* pool, int min_t, int max_t,
                       LPTHREAD_START_ROUTINE worker, void* arg){
     pool->min_threads = min_t;
@@ -36,7 +24,6 @@ static void pool_init(AdaptiveThreadPool* pool, int min_t, int max_t,
     pool->threads = (HANDLE*)calloc(max_t, sizeof(HANDLE));
     pool->worker = worker;
     pool->worker_arg = arg;
-    pool->work_queue_size = 0;
     QueryPerformanceCounter(&pool->last_adjustment);
     for(int i=0;i<min_t;i++){
         HANDLE h = (HANDLE)_beginthreadex(NULL,0,worker,arg,0,NULL);
@@ -51,6 +38,31 @@ static void pool_destroy(AdaptiveThreadPool* pool){
     pool->threads = NULL;
     pool->current_threads = 0;
 }
+
+static BOOL outq_push_blocking(MPMCQueue* q, DbWorkItem* wi, CancelToken* cancel){
+    if(!q || !wi){
+        return FALSE;
+    }
+    int tries = 0;
+    for(;;){
+        if(MPMC_Push(q, wi)){
+            return TRUE;
+        }
+        if(is_cancelled(cancel)){
+            return FALSE;
+        }
+        ++tries;
+        if(tries < 100){
+            SwitchToThread();
+        } else if(tries < 1000){
+            Sleep(1);
+        } else {
+            Sleep(5);
+        }
+    }
+}
+
+static DWORD WINAPI map_emit_worker(void* p);
 
 // Minimal FRN map (open addressing)
 
@@ -101,6 +113,7 @@ typedef struct FrnMap {
 #define FRN_ARENA_ALIGN_CHARS 2
 #define FRN_MMAP_MIN_CHARS (size_t)((64ULL*1024ULL)/sizeof(wchar_t))
 #define FRNMAP_COMMIT_GRANULARITY (size_t)(64ULL*1024ULL)
+#define USN_EMIT_CHUNK_SIZE 4096
 
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -604,6 +617,8 @@ typedef struct USNScanner {
     ParentPathCacheEntry parent_cache[USN_PARENT_CACHE];
     size_t parent_cache_count;
     uint64_t parent_cache_clock;
+    volatile LONG emit_budget;
+    LONG emit_chunk;
 } USNScanner;
 
 static BOOL volume_from_root(const wchar_t* root, wchar_t* volprefix, size_t cch){
@@ -741,12 +756,9 @@ static BOOL frn_emit_resolved(USNScanner* s, const wchar_t* parent, const wchar_
     wi->hash_ready = FALSE;
     wi->stage = INDEX_NAMES_ONLY;
     wi->op = WI_ADD;
-    while(!MPMC_Push(s->outq, wi)){
-        if(is_cancelled(s->cancel)){
-            release_work_item(wi);
-            return FALSE;
-        }
-        SwitchToThread();
+    if(!outq_push_blocking(s->outq, wi, s->cancel)){
+        release_work_item(wi);
+        return FALSE;
     }
     return TRUE;
 }
@@ -823,7 +835,9 @@ static void emit_direct_batched(USNScanner* s, PendingEmit* batch, size_t count)
         if(!resolved){
             continue;
         }
-        frn_emit_resolved(s, parent, item->name, item->attrs);
+        if(!frn_emit_resolved(s, parent, item->name, item->attrs)){
+            return;
+        }
     }
 }
 
@@ -849,51 +863,113 @@ static void usn_queue_streaming_emit(USNScanner* s, const USN_RECORD_V2* r){
     slot->attrs = r->FileAttributes;
 }
 
+static LONG usn_remaining_map_items(const USNScanner* s){
+    if(!s || !s->map.cap){
+        return 0;
+    }
+    size_t cap = s->map.cap;
+    LONG progress = InterlockedCompareExchange(&s->next_idx, 0, 0);
+    size_t consumed = progress < 0 ? 0 : (size_t)progress + 1;
+    if(consumed >= cap){
+        return 0;
+    }
+    size_t remaining = cap - consumed;
+    if(remaining > (size_t)LONG_MAX){
+        remaining = (size_t)LONG_MAX;
+    }
+    return (LONG)remaining;
+}
+
+static BOOL usn_schedule_map_emit_wave(USNScanner* s){
+    if(!s){
+        return FALSE;
+    }
+    LONG remaining = usn_remaining_map_items(s);
+    if(remaining <= 0){
+        return FALSE;
+    }
+    LONG chunk = s->emit_chunk > 0 ? s->emit_chunk : USN_EMIT_CHUNK_SIZE;
+    if(chunk <= 0){
+        chunk = USN_EMIT_CHUNK_SIZE;
+    }
+    if(remaining < chunk){
+        chunk = remaining;
+    }
+    s->emit_budget = chunk;
+    s->pool.work_queue_size = chunk;
+    pool_init(&s->pool, 2, 2, map_emit_worker, s);
+    if(s->pool.current_threads <= 0){
+        pool_destroy(&s->pool);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static void usn_check_async_emit_done(USNScanner* s){
     if(!s || !s->map_emit_async || s->map_freed){
         return;
     }
     if(s->pool.current_threads <= 0){
-        pool_destroy(&s->pool);
         frnmap_free(&s->map);
         s->map_emit_async = FALSE;
         s->map_freed = TRUE;
         return;
     }
     DWORD wait = WaitForMultipleObjects(s->pool.current_threads, s->pool.threads, TRUE, 0);
-    if(wait == WAIT_OBJECT_0){
-        pool_destroy(&s->pool);
-        frnmap_free(&s->map);
-        s->map_emit_async = FALSE;
-        s->map_freed = TRUE;
+    if(wait == WAIT_TIMEOUT || wait == WAIT_FAILED){
+        return;
     }
+    pool_destroy(&s->pool);
+    LONG remaining = usn_remaining_map_items(s);
+    if(remaining > 0){
+        Sleep(10);
+        if(usn_schedule_map_emit_wave(s)){
+            return;
+        }
+        remaining = usn_remaining_map_items(s);
+        if(remaining > 0){
+            return;
+        }
+    }
+    frnmap_free(&s->map);
+    s->map_emit_async = FALSE;
+    s->map_freed = TRUE;
 }
 
 static DWORD WINAPI map_emit_worker(void* p){
     USNScanner* s = (USNScanner*)p;
     for(;;){
-        LONG idx = InterlockedIncrement(&s->next_idx) - 1;
-        if(idx >= (LONG)s->map.cap) break;
+        if(is_cancelled(s->cancel)){
+            break;
+        }
+        LONG budget = InterlockedDecrement(&s->emit_budget);
+        if(budget < 0){
+            InterlockedIncrement(&s->emit_budget);
+            break;
+        }
+        LONG idx = InterlockedIncrement(&s->next_idx);
+        if(idx >= (LONG)s->map.cap){
+            break;
+        }
         if(!frnmap_ensure_slot_committed(&s->map, (size_t)idx) || !s->map.slots[idx].frn){
-            InterlockedDecrement(&s->pool.work_queue_size);
             continue;
         }
         FrnEntry* e = &s->map.slots[idx];
         wchar_t rel[MAX_LONG_PATH];
         if(!frn_build_path(&s->map, e->parent, rel, MAX_LONG_PATH)){
-            InterlockedDecrement(&s->pool.work_queue_size);
             continue;
         }
         wchar_t parent[MAX_LONG_PATH];
         swprintf(parent, MAX_LONG_PATH, L"%c:%s", s->volRoot[0], rel);
         DbWorkItem* wi = acquire_work_item();
         if(!wi){
-            InterlockedDecrement(&s->pool.work_queue_size);
-            adjust_thread_count(&s->pool);
-            if(is_cancelled(s->cancel)) break;
+            if(is_cancelled(s->cancel)){
+                break;
+            }
             continue;
         }
-        wi->content = NULL; wi->preview = NULL;
+        wi->content = NULL;
+        wi->preview = NULL;
         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
         wcscpy_s(wi->name, MAX_PATH, e->name);
         wi->file_size = 0;
@@ -904,10 +980,10 @@ static DWORD WINAPI map_emit_worker(void* p){
         wi->hash_ready = FALSE;
         wi->stage = INDEX_NAMES_ONLY;
         wi->op = WI_ADD;
-        while(!MPMC_Push(s->outq, wi)) { SwitchToThread(); }
-        InterlockedDecrement(&s->pool.work_queue_size);
-        adjust_thread_count(&s->pool);
-        if(is_cancelled(s->cancel)) break;
+        if(!outq_push_blocking(s->outq, wi, s->cancel)){
+            release_work_item(wi);
+            break;
+        }
     }
     return 0;
 }
@@ -920,8 +996,12 @@ static void usn_emit_buffered_results(USNScanner* s){
         return;
     }
     s->next_idx = -1;
-    s->pool.work_queue_size = (LONG)s->map.cap;
-    pool_init(&s->pool, 1, s->max_threads, map_emit_worker, s);
+    if(s->emit_chunk <= 0){
+        s->emit_chunk = USN_EMIT_CHUNK_SIZE;
+    }
+    if(!usn_schedule_map_emit_wave(s)){
+        return;
+    }
     s->map_emit_async = TRUE;
     s->map_freed = FALSE;
 }
@@ -1007,7 +1087,7 @@ static DWORD WINAPI usn_thread(void* p){
             wprintf(L"USN enumeration finished (empty page) at iteration %d\n", iteration);
             break;
         }
-        if(!retried_full && using_journal_window && (bytes < 64*1024 || s->map.count < 10000)){
+        if(!retried_full && using_journal_window && (bytes < 64*1024 || s->map.count < 100000)){
             wprintf(L"Initial USN enumeration page too small (%lu bytes, %zu records); retrying full MFT scan.\n",
                     (unsigned long)bytes, s->map.count);
             frnmap_free(&s->map);
@@ -1058,7 +1138,7 @@ static DWORD WINAPI usn_thread(void* p){
                         live_updates_push_progress((uint64_t)s->map.count, FALSE);
                         last_progress_emit = s->map.count;
                     }
-                    if(s->map.count > 10000){
+                    if(s->map.count > 100000){
                         mode = FRN_MODE_STREAMING;
                         s->map.streaming = TRUE;
                         s->streaming_mode = TRUE;
@@ -1086,23 +1166,24 @@ static DWORD WINAPI usn_thread(void* p){
     }
     usn_flush_pending_emits(s);
     if(s->map_emit_async && !s->map_freed){
-        if(s->pool.current_threads > 0){
-            WaitForMultipleObjects(s->pool.current_threads, s->pool.threads, TRUE, INFINITE);
+        while(s->map_emit_async && !s->map_freed){
+            usn_check_async_emit_done(s);
+            if(s->map_emit_async && !s->map_freed){
+                Sleep(10);
+            }
         }
-        pool_destroy(&s->pool);
-        frnmap_free(&s->map);
-        s->map_emit_async = FALSE;
-        s->map_freed = TRUE;
     } else if(!s->map.streaming && s->map.cap && s->map.slots){
-        s->next_idx = -1;
-        s->pool.work_queue_size = (LONG)s->map.cap;
-        pool_init(&s->pool, 1, s->max_threads, map_emit_worker, s);
-        if(s->pool.current_threads > 0){
-            WaitForMultipleObjects(s->pool.current_threads, s->pool.threads, TRUE, INFINITE);
+        usn_emit_buffered_results(s);
+        while(s->map_emit_async && !s->map_freed){
+            usn_check_async_emit_done(s);
+            if(s->map_emit_async && !s->map_freed){
+                Sleep(10);
+            }
         }
-        pool_destroy(&s->pool);
-        frnmap_free(&s->map);
-        s->map_freed = TRUE;
+        if(!s->map_freed && s->map.cap && s->map.slots){
+            frnmap_free(&s->map);
+            s->map_freed = TRUE;
+        }
     } else if(!s->map_freed && s->map.cap && s->map.slots){
         frnmap_free(&s->map);
         s->map_freed = TRUE;
@@ -1119,6 +1200,9 @@ NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue
     if(!s) return NULL;
     s->outq = outQueue; s->cancel = cancelToken;
     s->journal_info_valid = FALSE;
+    s->emit_chunk = USN_EMIT_CHUNK_SIZE;
+    s->emit_budget = 0;
+    s->next_idx = -1;
 
     size_t root_cch = sizeof(s->volRoot) / sizeof(s->volRoot[0]);
     size_t prefix_cch = sizeof(s->volPrefix) / sizeof(s->volPrefix[0]);
@@ -1305,7 +1389,15 @@ static DWORD WINAPI tail_thread(void* p){
                         wi->hash_ready = FALSE;
                         wi->stage = INDEX_NAMES_ONLY;
                         wi->op = WI_DELETE;
-                        while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }
+                        if(!outq_push_blocking(t->outq, wi, t->cancel)){
+                            release_work_item(wi);
+                            if(is_cancelled(t->cancel)){
+                                VirtualFree(buf,0,MEM_RELEASE);
+                                return 0;
+                            }
+                            pRec += r->RecordLength;
+                            continue;
+                        }
                     }
                 }
             } else {
@@ -1346,7 +1438,15 @@ static DWORD WINAPI tail_thread(void* p){
                         }
                         wi->stage = INDEX_METADATA_LIGHT;
                         wi->op = WI_ADD;
-                        while(!MPMC_Push(t->outq, wi)) { SwitchToThread(); }
+                        if(!outq_push_blocking(t->outq, wi, t->cancel)){
+                            release_work_item(wi);
+                            if(is_cancelled(t->cancel)){
+                                VirtualFree(buf,0,MEM_RELEASE);
+                                return 0;
+                            }
+                            pRec += r->RecordLength;
+                            continue;
+                        }
                     }
                 }
             }
