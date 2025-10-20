@@ -293,6 +293,9 @@ static void frnmap_release_node(FrnMap* m, NameArena* arena){
     m->arena_free_list = arena;
 }
 static void frnmap_init(FrnMap* m, size_t cap){
+    if(cap > (1<<18)) {
+        cap = (1<<18);
+    }
     m->cap = 1; while(m->cap < cap*2) m->cap <<= 1;
     m->slots = NULL;
     m->slots_bytes = 0;
@@ -514,6 +517,10 @@ static BOOL frnmap_resize(FrnMap* m){
 }
 static FrnEntry* frnmap_put(FrnMap* m, uint64_t frn, uint64_t parent, const wchar_t* name, uint32_t attrs){
     if(m->streaming){
+        return FRNMAP_STREAMING_SENTINEL;
+    }
+    if(m->cap > (1<<20)) {
+        m->streaming = TRUE;
         return FRNMAP_STREAMING_SENTINEL;
     }
     if(m->count*2 >= m->cap){
@@ -1039,6 +1046,14 @@ static void usn_emit_buffered_results(USNScanner* s){
 static DWORD WINAPI usn_thread(void* p){
     USNScanner* s = (USNScanner*)p;
     FrnMode mode = FRN_MODE_BUILDING;
+    BOOL start_in_streaming = FALSE;
+    if(s->volRoot[0] == L'C' || s->volRoot[0] == L'c'){
+        mode = FRN_MODE_STREAMING;
+        s->streaming_mode = TRUE;
+        s->map.streaming = TRUE;
+        start_in_streaming = TRUE;
+        wprintf(L"Starting C:\\ scan in streaming mode (unbuffered)\n");
+    }
     size_t last_progress_emit = 0;
     DWORD fatal_error = ERROR_SUCCESS;
     BOOL start_signaled = FALSE;
@@ -1073,6 +1088,9 @@ static DWORD WINAPI usn_thread(void* p){
             (unsigned long long)med.HighUsn);
     DWORD bytes;
     frnmap_init(&s->map, 1<<18);
+    if(start_in_streaming){
+        s->map.streaming = TRUE;
+    }
     int iteration = 0;
     BOOL retried_full = using_journal_window ? FALSE : TRUE;
     for(;;){
@@ -1168,7 +1186,7 @@ static DWORD WINAPI usn_thread(void* p){
                         live_updates_push_progress((uint64_t)s->map.count, FALSE);
                         last_progress_emit = s->map.count;
                     }
-                    if(s->map.count > 100000){
+                    if(s->map.count > 10000){
                         mode = FRN_MODE_STREAMING;
                         s->map.streaming = TRUE;
                         s->streaming_mode = TRUE;
