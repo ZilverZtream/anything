@@ -1856,16 +1856,17 @@ static InternTask* acquire_task_buffer(size_t count, InternTask* stack_buf, size
 }
 
 
-void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const uint8_t* need_normalized_flags, size_t count, uint64_t* out_ids, uint64_t* out_normalized_ids){
+BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const uint8_t* need_normalized_flags, size_t count, uint64_t* out_ids, uint64_t* out_normalized_ids){
     if(!db_ || !out_ids || !strings || count == 0){
         if(out_normalized_ids){
             for(size_t i = 0; i < count; ++i){
                 out_normalized_ids[i] = 0;
             }
         }
-        return;
+        return TRUE;
     }
     DbImpl* d = (DbImpl*)db_;
+    BOOL result = TRUE;
     size_t task_cap = 0;
     InternTask stack_tasks[8] = {0};
     BOOL tasks_from_tls = FALSE;
@@ -1888,7 +1889,7 @@ void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
                 out_normalized_ids[i] = 0;
             }
         }
-        return;
+        return TRUE;
     }
     size_t total_utf8_bytes = 0;
     for(size_t i = 0; i < count; ++i){
@@ -2051,6 +2052,7 @@ void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         if(t->id) continue;
         if(!d->wtxn && !db_begin_write(db_)){
             d->header_cache.string_count = original_count;
+            result = FALSE;
             goto cleanup;
         }
         uint64_t new_id = d->header_cache.string_count + 1;
@@ -2061,6 +2063,7 @@ void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         if(!storage){
             d->header_cache.string_count = original_count;
             set_error(d, DB_ERROR_OS, 0, "out of memory");
+            result = FALSE;
             goto cleanup;
         }
         memcpy(storage, t->utf8, t->utf8_len);
@@ -2072,6 +2075,7 @@ void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         if(rc){
             d->header_cache.string_count = original_count;
             set_mdb_error(d, rc);
+            result = FALSE;
             goto cleanup;
         }
         MDB_val revkey = {.mv_data = t->utf8, .mv_size = t->utf8_len};
@@ -2080,6 +2084,7 @@ void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         if(rc){
             d->header_cache.string_count = original_count;
             set_mdb_error(d, rc);
+            result = FALSE;
             goto cleanup;
         }
         t->id = new_id;
@@ -2156,6 +2161,7 @@ void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
             if(leader->normalized_id) continue;
             if(!d->wtxn && !db_begin_write(db_)){
                 d->header_cache.string_count = original_count;
+                result = FALSE;
                 goto cleanup;
             }
             uint64_t new_id = d->header_cache.string_count + 1;
@@ -2166,6 +2172,7 @@ void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
             if(!storage){
                 d->header_cache.string_count = original_count;
                 set_error(d, DB_ERROR_OS, 0, "out of memory");
+                result = FALSE;
                 goto cleanup;
             }
             memcpy(storage, leader->normalized_utf8, leader->normalized_len);
@@ -2177,6 +2184,7 @@ void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
             if(rc){
                 d->header_cache.string_count = original_count;
                 set_mdb_error(d, rc);
+                result = FALSE;
                 goto cleanup;
             }
             MDB_val revkey = {.mv_data = leader->normalized_utf8, .mv_size = leader->normalized_len};
@@ -2185,6 +2193,7 @@ void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
             if(rc){
                 d->header_cache.string_count = original_count;
                 set_mdb_error(d, rc);
+                result = FALSE;
                 goto cleanup;
             }
             leader->normalized_id = new_id;
@@ -2206,6 +2215,7 @@ void db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         if(rc){
             d->header_cache.string_count = original_count;
             set_mdb_error(d, rc);
+            result = FALSE;
             goto cleanup;
         }
     }
@@ -2224,6 +2234,7 @@ cleanup:
     }
     if(arena) free(arena);
     if(tasks && !tasks_from_tls && tasks != stack_tasks) free(tasks);
+    return result;
 }
 
 
@@ -2232,7 +2243,9 @@ uint64_t db_intern_wstring(Db* db_, const wchar_t* s){
     uint64_t result = 0;
     const wchar_t* array[1] = { s };
     uint64_t ids[1] = { 0 };
-    db_intern_wstrings_batched(db_, array, NULL, 1, ids, NULL);
+    if(!db_intern_wstrings_batched(db_, array, NULL, 1, ids, NULL)){
+        return 0;
+    }
     result = ids[0];
     return result;
 }
@@ -2543,12 +2556,15 @@ static BOOL db_put_records_internal(Db* db_,
     }
 
     if(intern_active){
-        db_intern_wstrings_batched(db_,
-                                   intern_strings,
-                                   intern_needs_norm,
-                                   intern_active,
-                                   intern_ids,
-                                   intern_any_norm ? intern_norm_ids : NULL);
+        if(!db_intern_wstrings_batched(db_,
+                                       intern_strings,
+                                       intern_needs_norm,
+                                       intern_active,
+                                       intern_ids,
+                                       intern_any_norm ? intern_norm_ids : NULL)){
+            result = FALSE;
+            goto cleanup;
+        }
         for(size_t i = 0; i < intern_active; ++i){
             const DbStringInternRequest* req = request_refs[i];
             if(req->target){
@@ -3000,7 +3016,9 @@ BOOL db_delete_path(Db* db_, const wchar_t* parent, const wchar_t* name){
     uint8_t need_norm[1] = { 1 };
     uint64_t name_ids[1] = { 0 };
     uint64_t norm_ids[1] = { 0 };
-    db_intern_wstrings_batched(db_, name_array, need_norm, 1, name_ids, norm_ids);
+    if(!db_intern_wstrings_batched(db_, name_array, need_norm, 1, name_ids, norm_ids)){
+        return FALSE;
+    }
     uint64_t name_id = name_ids[0];
     uint64_t norm_id = norm_ids[0] ? norm_ids[0] : name_id;
     if(!parent_id || !name_id) return TRUE;
@@ -3038,7 +3056,10 @@ BOOL db_get_record_by_path(Db* db_, const wchar_t* parent, const wchar_t* name, 
     uint8_t need_norm[1] = { 1 };
     uint64_t name_ids[1] = { 0 };
     uint64_t norm_ids[1] = { 0 };
-    db_intern_wstrings_batched(db_, name_array, need_norm, 1, name_ids, norm_ids);
+    if(!db_intern_wstrings_batched(db_, name_array, need_norm, 1, name_ids, norm_ids)){
+        if(own_txn) mdb_txn_abort(txn);
+        return FALSE;
+    }
     uint64_t name_id = name_ids[0];
     uint64_t norm_id = norm_ids[0] ? norm_ids[0] : name_id;
     if(!parent_id || !name_id){ if(own_txn) mdb_txn_abort(txn); return FALSE; }
