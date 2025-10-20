@@ -2439,8 +2439,6 @@ static BOOL db_put_records_internal(Db* db_,
     if(!d->wtxn){ if(!db_begin_write(db_)) return FALSE; }
     if(count == 0){ set_error(d, DB_ERROR_NONE, 0, NULL); return TRUE; }
 
-    const size_t MAX_BATCH_RETRIES = 3;
-    size_t attempt = 0;
     DbHeader header_before = d->header_cache;
     uint64_t bloom_offset_before = d->bloom_offset;
     uint64_t bloom_tail_before = (uint64_t)InterlockedCompareExchange64(&d->bloom_tail, 0, 0);
@@ -2526,19 +2524,6 @@ static BOOL db_put_records_internal(Db* db_,
             }
         }
     }
-
-retry_batch:
-    if(attempt++ >= MAX_BATCH_RETRIES){
-        d->dirty = dirty_before;
-        d->header_cache = header_before;
-        d->bloom_offset = bloom_offset_before;
-        InterlockedExchange64(&d->bloom_tail, (LONG64)bloom_tail_before);
-        d->bloom_file_size = bloom_file_size_before;
-        d->bloom_committed_tail = bloom_committed_before;
-        result = FALSE;
-        goto cleanup;
-    }
-
     if(d->dirty){
         if(!db_commit_write_ex(db_, FALSE)){
             result = FALSE;
@@ -2876,13 +2861,8 @@ retry_batch:
         d->bloom_offset = bloom_offset_before;
         d->dirty = dirty_before;
         d->last_write_progress = processed;
-        if(d->last_error.code == DB_ERROR_LMDB && d->last_error.detail == MDB_MAP_FULL){
-            result = FALSE;
-            goto cleanup;
-        }
-        Sleep(1);
-        RESTORE_INTERN_TARGETS();
-        goto retry_batch;
+        result = FALSE;
+        goto cleanup;
     }
 
     rc = mdb_txn_commit(batch_txn);
@@ -2895,13 +2875,8 @@ retry_batch:
         d->bloom_offset = bloom_offset_before;
         d->dirty = dirty_before;
         d->last_write_progress = processed;
-        if(d->last_error.code == DB_ERROR_LMDB && d->last_error.detail == MDB_MAP_FULL){
-            result = FALSE;
-            goto cleanup;
-        }
-        Sleep(1);
-        RESTORE_INTERN_TARGETS();
-        goto retry_batch;
+        result = FALSE;
+        goto cleanup;
     }
 
     d->header_cache = header_tmp;
