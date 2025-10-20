@@ -2073,6 +2073,7 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         int rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
         free(storage);
         if(rc){
+            fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (strings) with error: %s\n", mdb_strerror(rc));
             d->header_cache.string_count = original_count;
             set_mdb_error(d, rc);
             result = FALSE;
@@ -2082,6 +2083,7 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
         rc = mdb_put(d->wtxn, d->dbi_strrev, &revkey, &revid, 0);
         if(rc){
+            fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (strrev) with error: %s\n", mdb_strerror(rc));
             d->header_cache.string_count = original_count;
             set_mdb_error(d, rc);
             result = FALSE;
@@ -2182,6 +2184,7 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
             int rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
             free(storage);
             if(rc){
+                fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (normalized strings) with error: %s\n", mdb_strerror(rc));
                 d->header_cache.string_count = original_count;
                 set_mdb_error(d, rc);
                 result = FALSE;
@@ -2191,6 +2194,7 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
             MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
             rc = mdb_put(d->wtxn, d->dbi_strrev, &revkey, &revid, 0);
             if(rc){
+                fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (normalized strrev) with error: %s\n", mdb_strerror(rc));
                 d->header_cache.string_count = original_count;
                 set_mdb_error(d, rc);
                 result = FALSE;
@@ -2213,6 +2217,7 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
         int rc = mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
         if(rc){
+            fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (header update) with error: %s\n", mdb_strerror(rc));
             d->header_cache.string_count = original_count;
             set_mdb_error(d, rc);
             result = FALSE;
@@ -2562,9 +2567,14 @@ static BOOL db_put_records_internal(Db* db_,
                                        intern_active,
                                        intern_ids,
                                        intern_any_norm ? intern_norm_ids : NULL)){
+            fprintf(stderr, "!!! db_intern_wstrings_batched returned false. Propagating failure.\n");
+            // If this fails, the parent transaction is poisoned.
+            // Go DIRECTLY to cleanup to preserve the original error code.
             result = FALSE;
             goto cleanup;
         }
+
+        // This code now ONLY runs on success.
         for(size_t i = 0; i < intern_active; ++i){
             const DbStringInternRequest* req = request_refs[i];
             if(req->target){
@@ -2580,6 +2590,7 @@ static BOOL db_put_records_internal(Db* db_,
     MDB_txn* batch_txn = NULL;
     int rc = mdb_txn_begin(d->env, parent_txn, 0, &batch_txn);
     if(rc){
+        fprintf(stderr, "!!! mdb_txn_begin for child failed with error: %s\n", mdb_strerror(rc));
         d->dirty = dirty_before;
         set_mdb_error(d, rc);
         d->header_cache = header_before;
