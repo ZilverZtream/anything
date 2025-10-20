@@ -1961,7 +1961,6 @@ static void writer_queue_on_push(void* param){
 
 static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch,
                                  BatchInternRequest* intern_requests, size_t intern_count){
-    int bad_txn_retries = 0;
     const DbStringInternRequest* db_strings = intern_count > 0
                                              ? (const DbStringInternRequest*)intern_requests
                                              : NULL;
@@ -1991,13 +1990,6 @@ static BOOL put_batch_with_growth(WriterCtx* ctx, DbRecord* buf, size_t in_batch
             if(!db_begin_write(ctx->db)) break;
             ctx->grow_attempts++;
             continue; // retry put
-        } else if(err->code == DB_ERROR_LMDB && err->detail == MDB_BAD_TXN && bad_txn_retries++ < 3){
-            db_abort_write(ctx->db);
-            db_string_cache_clear();
-            if(!db_begin_write(ctx->db)){
-                break;
-            }
-            continue; // retry after refreshing transaction
         } else {
             size_t progress = db_last_write_progress(ctx->db);
             fprintf(stderr, "db_put_records failed after %zu/%zu records: %s (code=%d)\n",
