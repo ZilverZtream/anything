@@ -2034,10 +2034,14 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
             set_mdb_error(d, rc);
         }
     }
+    int max_raw_key = mdb_env_get_maxkeysize(d->env);
     if(rtxn){
         for(size_t i = 0; i < unique_count; ++i){
             InternTask* t = unique[i];
             if(t->id) continue;
+            if(t->utf8_len == 0 || t->utf8_len > (size_t)max_raw_key){
+                continue;
+            }
             MDB_val k = {.mv_data = t->utf8, .mv_size = t->utf8_len};
             MDB_val v;
             if(mdb_get(rtxn, d->dbi_strrev, &k, &v) == 0){
@@ -2079,15 +2083,17 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
             result = FALSE;
             goto cleanup;
         }
-        MDB_val revkey = {.mv_data = t->utf8, .mv_size = t->utf8_len};
-        MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-        rc = mdb_put(d->wtxn, d->dbi_strrev, &revkey, &revid, 0);
-        if(rc){
-            fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (strrev) with error: %s\n", mdb_strerror(rc));
-            d->header_cache.string_count = original_count;
-            set_mdb_error(d, rc);
-            result = FALSE;
-            goto cleanup;
+        if(t->utf8_len > 0 && t->utf8_len <= (size_t)max_raw_key){
+            MDB_val revkey = {.mv_data = t->utf8, .mv_size = t->utf8_len};
+            MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
+            rc = mdb_put(d->wtxn, d->dbi_strrev, &revkey, &revid, 0);
+            if(rc){
+                fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (strrev) with error: %s\n", mdb_strerror(rc));
+                d->header_cache.string_count = original_count;
+                set_mdb_error(d, rc);
+                result = FALSE;
+                goto cleanup;
+            }
         }
         t->id = new_id;
         string_cache_insert(t->utf8, t->utf8_hash, t->id);
