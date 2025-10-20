@@ -971,15 +971,15 @@ static DWORD WINAPI usn_thread(void* p){
         iteration++;
         if(!DeviceIoControl(s->hVol, FSCTL_ENUM_USN_DATA, &med, sizeof(med), buf, 16*1024*1024, &bytes, NULL)){
             DWORD e = GetLastError();
-            wprintf(L"DeviceIoControl failed on iteration %d with error %lu\n", iteration, (unsigned long)e);
             if(e == ERROR_HANDLE_EOF){
-                wprintf(L"  \u2192 Reached end of journal (enumerated all records)\n");
+                wprintf(L"USN enumeration finished (EOF) at iteration %d\n", iteration);
                 if(!start_signaled){
                     usn_notify_start(s, TRUE, ERROR_SUCCESS);
                     start_signaled = TRUE;
                 }
                 break;
             }
+            wprintf(L"DeviceIoControl failed on iteration %d with error %lu\n", iteration, (unsigned long)e);
             if(e == ERROR_JOURNAL_NOT_ACTIVE){
                 wprintf(L"  \u2192 Journal not active\n");
             } else if(e == ERROR_ACCESS_DENIED){
