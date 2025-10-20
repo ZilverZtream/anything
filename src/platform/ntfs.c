@@ -947,17 +947,15 @@ static DWORD WINAPI usn_thread(void* p){
     // shared with V0, so use the older structure for broader compatibility.
     MFT_ENUM_DATA_V0 med = {0};
     med.StartFileReferenceNumber = 0;
+    BOOL using_journal_window = FALSE;
     if(s->journal_info_valid){
-        med.LowUsn = s->journal_info.FirstUsn;
-        med.HighUsn = s->journal_info.NextUsn;
         wprintf(L"Journal ID: 0x%llx, FirstUsn: 0x%llx, NextUsn: 0x%llx\n",
                 (unsigned long long)s->journal_info.UsnJournalID,
                 (unsigned long long)s->journal_info.FirstUsn,
                 (unsigned long long)s->journal_info.NextUsn);
-    } else {
-        med.LowUsn = 0;
-        med.HighUsn = MAXLONGLONG;
     }
+    med.LowUsn = 0;
+    med.HighUsn = MAXLONGLONG;
     wprintf(L"Starting NTFS enumeration on volume %ls\n", s->volRoot);
     wprintf(L"Initial MFT start: %llu, USN range: %llu to %llu\n",
             (unsigned long long)med.StartFileReferenceNumber,
@@ -966,6 +964,7 @@ static DWORD WINAPI usn_thread(void* p){
     DWORD bytes;
     frnmap_init(&s->map, 1<<20);
     int iteration = 0;
+    BOOL retried_full = using_journal_window ? FALSE : TRUE;
     for(;;){
         if(is_cancelled(s->cancel)) break;
         iteration++;
@@ -1003,6 +1002,29 @@ static DWORD WINAPI usn_thread(void* p){
         if(!start_signaled){
             usn_notify_start(s, TRUE, ERROR_SUCCESS);
             start_signaled = TRUE;
+        }
+        if(bytes <= sizeof(USN)){
+            wprintf(L"USN enumeration finished (empty page) at iteration %d\n", iteration);
+            break;
+        }
+        if(!retried_full && using_journal_window && (bytes < 64*1024 || s->map.count < 10000)){
+            wprintf(L"Initial USN enumeration page too small (%lu bytes, %zu records); retrying full MFT scan.\n",
+                    (unsigned long)bytes, s->map.count);
+            frnmap_free(&s->map);
+            frnmap_init(&s->map, 1<<20);
+            mode = FRN_MODE_BUILDING;
+            s->map.streaming = FALSE;
+            s->streaming_mode = FALSE;
+            s->map_emit_async = FALSE;
+            s->map_freed = FALSE;
+            last_progress_emit = 0;
+            med.StartFileReferenceNumber = 0;
+            med.LowUsn = 0;
+            med.HighUsn = MAXLONGLONG;
+            using_journal_window = FALSE;
+            retried_full = TRUE;
+            iteration = 0;
+            continue;
         }
         DWORD_PTR pRec = (DWORD_PTR)buf + sizeof(USN);
         while(pRec + sizeof(USN_RECORD_V2) <= (DWORD_PTR)buf + bytes){
