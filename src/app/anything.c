@@ -2062,11 +2062,18 @@ static BOOL push_with_backoff(MPMCQueue* q, void* data, DWORD timeout_ms, const 
     if(!q) return FALSE;
     ULONGLONG start = GetTickCount64();
     int tries = 0;
+    static volatile LONG last_log_tick = 0;
     for(;;){
         if(MPMC_Push(q, data)) return TRUE;
         tries++;
         if(tries > 1000){
-            fprintf(stderr, "%s: queue saturated, pausing producer to relieve pressure\n", owner ? owner : "queue");
+            DWORD now = GetTickCount();
+            LONG prev = last_log_tick;
+            if((DWORD)(now - (DWORD)prev) >= 1000){
+                if(InterlockedCompareExchange(&last_log_tick, (LONG)now, prev) == prev){
+                    fprintf(stderr, "%s: queue saturated, pausing producer to relieve pressure\n", owner ? owner : "queue");
+                }
+            }
             Sleep(10);
             tries = 0;
         } else {
