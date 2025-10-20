@@ -2291,18 +2291,14 @@ static BOOL writer_enqueue(WriterCtx* ctx, DbWorkItem* wi, const char* stage){
     return FALSE;
 }
 
-static void writer_drain_backlog(WriterCtx* ctx){
-    if(!ctx || ctx->backlog_count == 0) return;
-    size_t attempts = ctx->backlog_count;
-    while(attempts-- && ctx->backlog_count){
+static DbWorkItem* writer_take_backlog(WriterCtx* ctx){
+    if(!ctx) return NULL;
+    while(ctx->backlog_count){
         DbWorkItem* wi = writer_backlog_peek(ctx);
-        if(!wi) { writer_backlog_pop(ctx); continue; }
-        if(push_with_backoff(&ctx->queue, wi, ctx->push_timeout_ms, "DbWriterThread backlog")){
-            writer_backlog_pop(ctx);
-        } else {
-            break;
-        }
+        writer_backlog_pop(ctx);
+        if(wi) return wi;
     }
+    return NULL;
 }
 
 static DWORD WINAPI DbWriterThread(void* p){
@@ -2339,7 +2335,6 @@ static DWORD WINAPI DbWriterThread(void* p){
             }
             continue;
         }
-        writer_drain_backlog(ctx);
         if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
                                            &intern_requests, &intern_count, &intern_capacity)){
             if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
@@ -2349,46 +2344,52 @@ static DWORD WINAPI DbWriterThread(void* p){
             }
             continue;
         }
-        void* item = NULL;
-        if(!MPMC_Pop(&ctx->queue, &item)){
-            if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
-                                               &intern_requests, &intern_count, &intern_capacity)){
-                if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
-                                                  &intern_requests, &intern_count)){
-                    success = FALSE;
-                    goto cleanup;
+        DbWorkItem* wi = writer_take_backlog(ctx);
+        if(!wi){
+            void* item = NULL;
+            if(!MPMC_Pop(&ctx->queue, &item)){
+                if(!writer_process_content_results(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                                   &intern_requests, &intern_count, &intern_capacity)){
+                    if(!writer_reset_after_txn_failure(ctx, &buf, &buf_capacity, &in_batch, &batch_requires_sync,
+                                                      &intern_requests, &intern_count)){
+                        success = FALSE;
+                        goto cleanup;
+                    }
+                    continue;
+                }
+                if(ctx->done && ctx->backlog_count == 0){
+                    LONG64 pending = ctx->content_pool ? content_pool_pending(ctx->content_pool) : 0;
+                    if(pending == 0) break;
+                }
+                BOOL timed_out = FALSE;
+                if(!writer_signal_wait(&ctx->data_signal, ctx->idle_wait_ms, &timed_out)){
+                    Sleep(1);
+                } else if(timed_out){
+                    if(ctx->consecutive_idle_waits < SIZE_MAX) ctx->consecutive_idle_waits++;
+                    ctx->consecutive_full_batches = 0;
+                    if(ctx->consecutive_idle_waits >= 5 && ctx->batch_size > ctx->min_batch_size){
+                        ctx->batch_size = ctx->min_batch_size;
+                        ctx->consecutive_idle_waits = 0;
+                    }
+                } else {
+                    ctx->consecutive_idle_waits = 0;
                 }
                 continue;
             }
-            if(ctx->done && ctx->backlog_count == 0){
+            if(item == NULL){
                 LONG64 pending = ctx->content_pool ? content_pool_pending(ctx->content_pool) : 0;
-                if(pending == 0) break;
+                if(ctx->backlog_count == 0 && pending == 0) break;
+                ctx->done = TRUE;
+                continue;
             }
-            BOOL timed_out = FALSE;
-            if(!writer_signal_wait(&ctx->data_signal, ctx->idle_wait_ms, &timed_out)){
-                Sleep(1);
-            } else if(timed_out){
-                if(ctx->consecutive_idle_waits < SIZE_MAX) ctx->consecutive_idle_waits++;
-                ctx->consecutive_full_batches = 0;
-                if(ctx->consecutive_idle_waits >= 5 && ctx->batch_size > ctx->min_batch_size){
-                    ctx->batch_size = ctx->min_batch_size;
-                    ctx->consecutive_idle_waits = 0;
-                }
-            } else {
-                ctx->consecutive_idle_waits = 0;
-            }
-            continue;
-        }
-        if(item == NULL){
-            LONG64 pending = ctx->content_pool ? content_pool_pending(ctx->content_pool) : 0;
-            if(ctx->backlog_count == 0 && pending == 0) break;
-            ctx->done = TRUE;
-            continue;
+
+            ctx->consecutive_idle_waits = 0;
+
+            wi = (DbWorkItem*)item;
+        } else {
+            ctx->consecutive_idle_waits = 0;
         }
 
-        ctx->consecutive_idle_waits = 0;
-
-        DbWorkItem* wi = (DbWorkItem*)item;
         if(wi->stage == INDEX_NAMES_ONLY || wi->op == WI_DELETE) push_live_update(wi);
         if(wi->op == WI_DELETE){
             db_delete_path(ctx->db, wi->parent_path, wi->name);
