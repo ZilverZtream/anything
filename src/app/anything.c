@@ -2504,18 +2504,21 @@ static DWORD WINAPI DbWriterThread(void* p){
                 goto cleanup;
             }
             buf[in_batch++] = r;
-            DbWorkItem* next = acquire_work_item();
-            if(next){
-                wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
-                wcscpy_s(next->name, MAX_PATH, wi->name);
-                next->file_size = next->creation_time = next->modified_time = next->access_time = 0;
-                next->attributes = wi->attributes;
-                next->clone_id = 0;
-                next->hash_crc = wi->hash_crc;
-                next->hash_ready = wi->hash_ready;
-                next->stage = INDEX_METADATA_LIGHT; next->op = WI_ADD;
-                if(!writer_enqueue(ctx, next, "metadata-light")){
-                    release_work_item(next);
+            size_t backlog = writer_backlog_count(ctx);
+            if(backlog < 10000){
+                DbWorkItem* next = acquire_work_item();
+                if(next){
+                    wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
+                    wcscpy_s(next->name, MAX_PATH, wi->name);
+                    next->file_size = next->creation_time = next->modified_time = next->access_time = 0;
+                    next->attributes = wi->attributes;
+                    next->clone_id = 0;
+                    next->hash_crc = wi->hash_crc;
+                    next->hash_ready = wi->hash_ready;
+                    next->stage = INDEX_METADATA_LIGHT; next->op = WI_ADD;
+                    if(!writer_enqueue(ctx, next, "metadata-light")){
+                        release_work_item(next);
+                    }
                 }
             }
             release_work_item(wi);
@@ -2549,18 +2552,21 @@ static DWORD WINAPI DbWriterThread(void* p){
             r.access_time   = at;
             buf[in_batch++] = r;
             if(!(attrs & FILE_ATTRIBUTE_DIRECTORY)){
-                DbWorkItem* next = acquire_work_item();
-                if(next){
-                    wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
-                    wcscpy_s(next->name, MAX_PATH, wi->name);
-                    next->file_size = sz; next->creation_time=ct; next->modified_time=mt; next->access_time=at;
-                    next->attributes = attrs;
-                    next->clone_id = 0;
-                    next->hash_crc = wi->hash_crc;
-                    next->hash_ready = wi->hash_ready;
-                    next->stage = INDEX_FULL_CONTENT; next->op = WI_ADD;
-                    if(!writer_enqueue(ctx, next, "full-content")){
-                        release_work_item(next);
+                size_t backlog = writer_backlog_count(ctx);
+                if(backlog < 10000){
+                    DbWorkItem* next = acquire_work_item();
+                    if(next){
+                        wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
+                        wcscpy_s(next->name, MAX_PATH, wi->name);
+                        next->file_size = sz; next->creation_time=ct; next->modified_time=mt; next->access_time=at;
+                        next->attributes = attrs;
+                        next->clone_id = 0;
+                        next->hash_crc = wi->hash_crc;
+                        next->hash_ready = wi->hash_ready;
+                        next->stage = INDEX_FULL_CONTENT; next->op = WI_ADD;
+                        if(!writer_enqueue(ctx, next, "full-content")){
+                            release_work_item(next);
+                        }
                     }
                 }
             }
@@ -2846,10 +2852,9 @@ int wmain(int argc, wchar_t** argv){
     if(ctx.content_threads > MAX_THREADS) ctx.content_threads = MAX_THREADS;
     if(ctx.content_threads > 4) ctx.content_threads = 4;
     wcscpy_s(ctx.db_path, MAX_PATH, args.dbPath);
-    size_t desired_queue = (size_t)args.threads * (size_t)args.batch;
-    size_t min_queue = (size_t)args.threads * 4096;
+    size_t desired_queue = (size_t)args.threads * (size_t)args.batch * 8;
+    size_t min_queue = (size_t)(1u<<18);
     if(desired_queue < min_queue) desired_queue = min_queue;
-    if(desired_queue < (size_t)(1u<<16)) desired_queue = (size_t)(1u<<16);
     LONG queue_pow2 = 1;
     while(queue_pow2 < (LONG)desired_queue && queue_pow2 < (1<<24)) queue_pow2 <<= 1;
     if(queue_pow2 < (LONG)desired_queue) queue_pow2 = (1<<24);
