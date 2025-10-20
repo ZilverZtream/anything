@@ -2389,6 +2389,12 @@ static DWORD WINAPI DbWriterThread(void* p){
         ctx->consecutive_idle_waits = 0;
 
         DbWorkItem* wi = (DbWorkItem*)item;
+
+        // Give deferred work a chance to enter the primary queue now that we've
+        // made space by popping an item. This prevents the backlog from growing
+        // without bound when producers outpace the writer thread.
+        writer_drain_backlog(ctx);
+
         if(wi->stage == INDEX_NAMES_ONLY || wi->op == WI_DELETE) push_live_update(wi);
         if(wi->op == WI_DELETE){
             db_delete_path(ctx->db, wi->parent_path, wi->name);
