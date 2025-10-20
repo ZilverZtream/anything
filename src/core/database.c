@@ -2102,6 +2102,7 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
             }
         }
         size_t norm_offset = 0;
+        int max_norm_key = mdb_env_get_maxkeysize(d->env);
         for(size_t i = 0; i < unique_count; ++i){
             InternTask* leader = unique[i];
             if(!leader->need_normalized) continue;
@@ -2116,12 +2117,22 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
                 leader->normalized_utf8 = buf;
                 leader->normalized_len = strlen(buf);
                 leader->normalized_hash = hash64(buf, leader->normalized_len);
+                // Skip normalized handling if the LMDB key would be invalid.
+                if(leader->normalized_len == 0 ||
+                   leader->normalized_len > (size_t)max_norm_key){
+                    leader->normalized_utf8 = NULL;
+                    leader->normalized_len = 0;
+                    leader->normalized_hash = 0;
+                    leader->normalized_id = leader->id;
+                }
             } else {
                 leader->normalized_utf8 = NULL;
                 leader->normalized_len = 0;
                 leader->normalized_hash = 0;
+                leader->normalized_id = leader->id;
             }
             leader->normalized_leader = leader;
+            if(!leader->normalized_utf8) continue;
             size_t bucket = (size_t)(leader->normalized_hash & (norm_hash_cap - 1));
             for(;;){
                 InternHashEntry* entry = &norm_table[bucket];
