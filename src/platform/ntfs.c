@@ -28,7 +28,7 @@ static void pool_init(AdaptiveThreadPool* pool, int min_t, int max_t,
     pool->worker_arg = arg;
     QueryPerformanceCounter(&pool->last_adjustment);
     for(int i=0;i<min_t;i++){
-        HANDLE h = (HANDLE)_beginthreadex(NULL,0,worker,arg,0,NULL);
+        HANDLE h = (HANDLE)_beginthreadex(NULL,0,(_beginthreadex_proc_type)worker,arg,0,NULL);
         if(h){ pool->threads[pool->current_threads++] = h; }
     }
 }
@@ -203,31 +203,6 @@ static BOOL frnmap_ensure_slot_committed(FrnMap* m, size_t index){
     (void)m; (void)index;
 #endif
     return TRUE;
-}
-
-static BOOL should_pause_for_backpressure(USNScanner* s){
-    if(!s || !s->outq){
-        return FALSE;
-    }
-    LONG64 mask = s->outq->mask;
-    size_t capacity = (size_t)(mask + 1);
-    if(capacity == 0){
-        return FALSE;
-    }
-    LONG64 head = s->outq->head;
-    LONG64 tail = s->outq->tail;
-    size_t count = 0;
-    if(tail > head){
-        LONG64 diff = tail - head;
-        if(diff < 0){
-            diff = 0;
-        }
-        count = (size_t)diff;
-        if(count > capacity){
-            count = capacity;
-        }
-    }
-    return count > (capacity * 4 / 5);
 }
 
 static BOOL frnmap_allocate_slots(FrnMap* m, size_t slot_count){
@@ -648,6 +623,31 @@ typedef struct USNScanner {
     LONG emit_chunk;
 } USNScanner;
 
+static BOOL should_pause_for_backpressure(USNScanner* s){
+    if(!s || !s->outq){
+        return FALSE;
+    }
+    LONG64 mask = s->outq->mask;
+    size_t capacity = (size_t)(mask + 1);
+    if(capacity == 0){
+        return FALSE;
+    }
+    LONG64 head = s->outq->head;
+    LONG64 tail = s->outq->tail;
+    size_t count = 0;
+    if(tail > head){
+        LONG64 diff = tail - head;
+        if(diff < 0){
+            diff = 0;
+        }
+        count = (size_t)diff;
+        if(count > capacity){
+            count = capacity;
+        }
+    }
+    return count > (capacity * 4 / 5);
+}
+
 static BOOL volume_from_root(const wchar_t* root, wchar_t* volprefix, size_t cch){
     if(!root || wcslen(root)<2 || root[1]!=L':') return FALSE;
     return swprintf(volprefix, cch, L"\\\\.\\%c:", root[0])>0;
@@ -890,7 +890,7 @@ static void usn_queue_streaming_emit(USNScanner* s, const USN_RECORD_V2* r){
     slot->attrs = r->FileAttributes;
 }
 
-static LONG usn_remaining_map_items(const USNScanner* s){
+static LONG usn_remaining_map_items(USNScanner* s){
     if(!s || !s->map.cap){
         return 0;
     }
@@ -1441,7 +1441,10 @@ static DWORD WINAPI tail_thread(void* p){
                         // full is \?\C:\Dir\Name — split into parent/name
                         wchar_t parent[MAX_LONG_PATH]; wcscpy_s(parent, MAX_LONG_PATH, full);
                         if(wcsncmp(parent, L"\\\\?\\", 4)==0) { memmove(parent, parent+4, (wcslen(parent)-3)*sizeof(wchar_t)); }
-                        wchar_t* p = wcsrchr(parent, L'\\'); if(p){ *p=0; }
+                        wchar_t* last_sep = wcsrchr(parent, L'\\');
+                        if(last_sep){
+                            *last_sep = 0;
+                        }
                         DbWorkItem* wi = acquire_work_item();
                         if(!wi){
                             continue;
@@ -1451,7 +1454,10 @@ static DWORD WINAPI tail_thread(void* p){
                         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
                         wcscpy_s(wi->name, MAX_PATH, name);
                         uint32_t attrs=0; uint64_t sz=0, ct=0, mt=0, at=0;
-                        wchar_t fn[MAX_LONG_PATH]; swprintf(fn, MAX_LONG_PATH, L"%s\%s", parent, name);
+                        wchar_t fn[MAX_LONG_PATH];
+                        wcscpy_s(fn, MAX_LONG_PATH, parent);
+                        wcscat_s(fn, MAX_LONG_PATH, L"\\");
+                        wcscat_s(fn, MAX_LONG_PATH, name);
                         get_file_info_basic(fn, &attrs, &sz, &ct, &mt, &at);
                         wi->attributes = attrs?attrs: r->FileAttributes;
                         wi->file_size = sz; wi->creation_time=ct; wi->modified_time=mt; wi->access_time=at;
