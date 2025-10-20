@@ -1876,7 +1876,7 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
     InternHashEntry* norm_table = NULL;
     char* norm_storage = NULL;
     uint8_t* arena = NULL;
-    MDB_txn* rtxn = NULL;
+    MDB_txn* rtxn = d->wtxn ? d->wtxn : NULL;
     BOOL need_abort = FALSE;
     size_t task_count = 0;
     size_t unique_count = 0;
@@ -1884,12 +1884,14 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
     BOOL any_need_normalized = FALSE;
     size_t total_normalized_bytes = 0;
     if(!tasks){
-        if(out_normalized_ids){
-            for(size_t i = 0; i < count; ++i){
+        for(size_t i = 0; i < count; ++i){
+            out_ids[i] = 0;
+            if(out_normalized_ids){
                 out_normalized_ids[i] = 0;
             }
         }
-        return TRUE;
+        set_error(d, DB_ERROR_OS, 0, "out of memory");
+        return FALSE;
     }
     size_t total_utf8_bytes = 0;
     for(size_t i = 0; i < count; ++i){
@@ -2023,8 +2025,6 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         InternTask* t = unique[i];
         t->id = string_cache_lookup(t->utf8, t->utf8_hash);
     }
-    rtxn = d->wtxn ? d->wtxn : NULL;
-    need_abort = FALSE;
     if(!rtxn){
         int rc = mdb_txn_begin(d->env, NULL, MDB_RDONLY, &rtxn);
         if(rc == 0){
@@ -2234,7 +2234,7 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         }
     }
 cleanup:
-    if(need_abort && rtxn){
+    if(need_abort && rtxn && rtxn != d->wtxn){
         mdb_txn_abort(rtxn);
     }
     if(arena) free(arena);
@@ -2467,6 +2467,7 @@ static BOOL db_put_records_internal(Db* db_,
     d->last_write_progress = 0;
     BOOL result = TRUE;
     BOOL commit_succeeded = FALSE;
+    MDB_txn* batch_txn = NULL;
 
     const DbStringInternRequest** request_refs = NULL;
     const wchar_t** intern_strings = NULL;
@@ -2478,6 +2479,23 @@ static BOOL db_put_records_internal(Db* db_,
     size_t intern_active = 0;
     BOOL intern_any_norm = FALSE;
     BOOL assigned_intern_targets = FALSE;
+
+#define RESTORE_INTERN_TARGETS()                                                   \
+    do {                                                                           \
+        if(assigned_intern_targets){                                               \
+            for(size_t i_restore = 0; i_restore < intern_active; ++i_restore){     \
+                const DbStringInternRequest* req_restore = request_refs[i_restore];\
+                if(req_restore->target && intern_target_backup){                   \
+                    *(req_restore->target) = intern_target_backup[i_restore];      \
+                }                                                                  \
+                if(req_restore->normalized_target && intern_norm_backup){          \
+                    *(req_restore->normalized_target) =                           \
+                        intern_norm_backup[i_restore];                             \
+                }                                                                  \
+            }                                                                      \
+            assigned_intern_targets = FALSE;                                       \
+        }                                                                          \
+    } while(0)
 
     IndexEntry64* fname_entries = NULL; size_t fname_count = 0, fname_cap = 0;
     IndexEntry64* parent_entries = NULL; size_t parent_count = 0, parent_cap = 0;
@@ -2515,15 +2533,16 @@ static BOOL db_put_records_internal(Db* db_,
             if(!request_refs || !intern_strings || !intern_needs_norm || !intern_ids ||
                (intern_any_norm && (!intern_norm_ids || !intern_norm_backup)) ||
                !intern_target_backup){
-                free(request_refs);
-                free(intern_strings);
-                free(intern_needs_norm);
-                free(intern_ids);
-                free(intern_target_backup);
-                if(intern_norm_ids) free(intern_norm_ids);
-                if(intern_norm_backup) free(intern_norm_backup);
+                free(request_refs); request_refs = NULL;
+                free(intern_strings); intern_strings = NULL;
+                free(intern_needs_norm); intern_needs_norm = NULL;
+                free(intern_ids); intern_ids = NULL;
+                free(intern_target_backup); intern_target_backup = NULL;
+                if(intern_norm_ids){ free(intern_norm_ids); intern_norm_ids = NULL; }
+                if(intern_norm_backup){ free(intern_norm_backup); intern_norm_backup = NULL; }
                 set_error(d, DB_ERROR_OS, 0, "out of memory");
-                return FALSE;
+                result = FALSE;
+                goto cleanup;
             }
             size_t idx = 0;
             for(size_t i = 0; i < string_count; ++i){
@@ -2560,6 +2579,32 @@ static BOOL db_put_records_internal(Db* db_,
         bloom_committed_before = d->bloom_committed_tail;
     }
 
+    int rc = mdb_txn_begin(d->env, parent_txn, 0, &batch_txn);
+    if(rc == MDB_BAD_TXN){
+        // Parent is invalid; abort it and clear d->wtxn so we don't keep a poisoned txn.
+        if(parent_txn){
+            mdb_txn_abort(parent_txn);
+        }
+        parent_txn = NULL;
+        d->wtxn = NULL;
+        rc = mdb_txn_begin(d->env, NULL, 0, &batch_txn);
+    }
+    if(rc){
+        fprintf(stderr, "!!! mdb_txn_begin for child failed with error: %s\n", mdb_strerror(rc));
+        d->dirty = dirty_before;
+        set_mdb_error(d, rc);
+        d->header_cache = header_before;
+        d->bloom_offset = bloom_offset_before;
+        result = FALSE;
+        goto cleanup;
+    }
+
+    DbHeader header_tmp = header_before;
+    size_t processed = 0;
+    BOOL success = TRUE;
+
+    d->wtxn = batch_txn;
+
     if(intern_active){
         if(!db_intern_wstrings_batched(db_,
                                        intern_strings,
@@ -2568,8 +2613,15 @@ static BOOL db_put_records_internal(Db* db_,
                                        intern_ids,
                                        intern_any_norm ? intern_norm_ids : NULL)){
             fprintf(stderr, "!!! db_intern_wstrings_batched returned false. Propagating failure.\n");
-            // If this fails, the parent transaction is poisoned.
-            // Go DIRECTLY to cleanup to preserve the original error code.
+            mdb_txn_abort(batch_txn);
+            d->wtxn = parent_txn;
+            d->bloom_file_size = bloom_file_size_before;
+            d->bloom_committed_tail = bloom_committed_before;
+            InterlockedExchange64(&d->bloom_tail, (LONG64)bloom_tail_before);
+            d->header_cache = header_before;
+            d->bloom_offset = bloom_offset_before;
+            d->dirty = dirty_before;
+            RESTORE_INTERN_TARGETS();
             result = FALSE;
             goto cleanup;
         }
@@ -2587,45 +2639,13 @@ static BOOL db_put_records_internal(Db* db_,
         assigned_intern_targets = TRUE;
     }
 
-    MDB_txn* batch_txn = NULL;
-    int rc = mdb_txn_begin(d->env, parent_txn, 0, &batch_txn);
-    if(rc){
-        fprintf(stderr, "!!! mdb_txn_begin for child failed with error: %s\n", mdb_strerror(rc));
-        d->dirty = dirty_before;
-        set_mdb_error(d, rc);
-        d->header_cache = header_before;
-        d->bloom_offset = bloom_offset_before;
-        result = FALSE;
-        goto cleanup;
-    }
-
-    DbHeader header_tmp = header_before;
-    size_t processed = 0;
-    BOOL success = TRUE;
-
-    d->wtxn = batch_txn;
+    // Carry forward header changes made by the interner (e.g., string_count).
+    header_tmp = d->header_cache;
 
     fname_count = parent_count = path_count = size_count = date_count = mtime_count = 0;
     attr_count = 0;
     ext_count = 0;
     content_count = author_count = camera_count = lens_count = artist_count = album_count = title_count = 0;
-
-    #define RESTORE_INTERN_TARGETS()                                                   \
-        do {                                                                           \
-            if(assigned_intern_targets){                                               \
-                for(size_t i_restore = 0; i_restore < intern_active; ++i_restore){     \
-                    const DbStringInternRequest* req_restore = request_refs[i_restore];\
-                    if(req_restore->target && intern_target_backup){                   \
-                        *(req_restore->target) = intern_target_backup[i_restore];      \
-                    }                                                                  \
-                    if(req_restore->normalized_target && intern_norm_backup){          \
-                        *(req_restore->normalized_target) =                           \
-                            intern_norm_backup[i_restore];                             \
-                    }                                                                  \
-                }                                                                      \
-                assigned_intern_targets = FALSE;                                       \
-            }                                                                          \
-        } while(0)
 
     for(; success && processed<count; ++processed){
         const DbRecord* r = &recs[processed];
@@ -2906,6 +2926,9 @@ static BOOL db_put_records_internal(Db* db_,
         goto cleanup;
     }
 
+    // Child is committed; restore writer to the parent (may be NULL if we fell back).
+    d->wtxn = parent_txn;
+
     d->header_cache = header_tmp;
     d->bloom_offset = (uint64_t)InterlockedCompareExchange64(&d->bloom_tail, 0, 0);
     d->dirty = TRUE;
@@ -2917,7 +2940,18 @@ static BOOL db_put_records_internal(Db* db_,
     goto cleanup;
 
 cleanup:
+    if(!commit_succeeded && batch_txn && d->wtxn == batch_txn){
+        mdb_txn_abort(batch_txn);
+        d->wtxn = parent_txn;
+    }
     if(!commit_succeeded){
+        d->header_cache = header_before;
+        d->bloom_file_size = bloom_file_size_before;
+        d->bloom_committed_tail = bloom_committed_before;
+        InterlockedExchange64(&d->bloom_tail, (LONG64)bloom_tail_before);
+        d->bloom_offset = bloom_offset_before;
+        d->dirty = dirty_before;
+        d->last_write_progress = processed;
         RESTORE_INTERN_TARGETS();
     }
     #undef RESTORE_INTERN_TARGETS
