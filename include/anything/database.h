@@ -120,7 +120,7 @@ BOOL db_get_compressed_trigram(Db* db, uint32_t trigram, CompressedTrigram* out)
 void db_free_compressed_trigram(CompressedTrigram* ct);
 
 uint64_t db_intern_wstring(Db* db, const wchar_t* s);
-void db_intern_wstrings_batched(Db* db,
+BOOL db_intern_wstrings_batched(Db* db,
                                 const wchar_t* const* strings,
                                 const uint8_t* need_normalized_flags,
                                 size_t count,
