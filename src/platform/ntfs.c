@@ -108,8 +108,8 @@ typedef struct FrnMap {
 
 #define FRNMAP_STREAMING_SENTINEL ((FrnEntry*)(intptr_t)(-1))
 #define FRN_ARENA_DEFAULT_CHUNK 4096
-#define FRN_ARENA_HEAP_LIMIT_BYTES (size_t)(512ULL*1024ULL*1024ULL)
-#define FRN_ARENA_MMAP_LIMIT_BYTES (size_t)(4ULL*1024ULL*1024ULL*1024ULL)
+#define FRN_ARENA_HEAP_LIMIT_BYTES (size_t)(128ULL*1024ULL*1024ULL)
+#define FRN_ARENA_MMAP_LIMIT_BYTES (size_t)(0ULL)
 #define FRN_SMALL_ARENA_CHARS (size_t)(16ULL*1024ULL)
 #define FRN_ARENA_POOL_BATCH 32
 #define FRN_ARENA_ALIGN_CHARS 2
@@ -1072,7 +1072,7 @@ static DWORD WINAPI usn_thread(void* p){
             (unsigned long long)med.LowUsn,
             (unsigned long long)med.HighUsn);
     DWORD bytes;
-    frnmap_init(&s->map, 1<<20);
+    frnmap_init(&s->map, 1<<18);
     int iteration = 0;
     BOOL retried_full = using_journal_window ? FALSE : TRUE;
     for(;;){
