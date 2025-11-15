@@ -696,76 +696,104 @@ static void usn_log_error(const wchar_t* volume_root, DWORD err, const wchar_t* 
 
 // Build full path from FRN by walking parents in the map
 static BOOL frn_build_path(FrnMap* fm, uint64_t frn, wchar_t* full, size_t cch){
-    wchar_t temp[MAX_LONG_PATH]; temp[0]=0;
-    wchar_t seg[512];
-    size_t pos = 0;
-    uint64_t cur = frn;
-    size_t guard = 0;
-    uint64_t visited[4096];
-    size_t visited_count = 0;
-    while(cur && guard < 4096){
-        for(size_t i = 0; i < visited_count; ++i){
-            if(visited[i] == cur){
-                return FALSE;
-            }
-        }
-        if(visited_count >= sizeof(visited)/sizeof(visited[0])){
-            return FALSE;
-        }
-        visited[visited_count++] = cur;
-        FrnEntry* e = frnmap_get(fm, cur);
-        if(!e) break;
-        // prepend segment
-        swprintf(seg, 512, L"\\%s", e->name);
-        size_t sl = wcslen(seg);
-        if(sl + pos >= MAX_LONG_PATH-4) return FALSE;
-        memmove(temp+sl, temp, (pos+1)*sizeof(wchar_t));
-        memcpy(temp, seg, sl*sizeof(wchar_t));
-        pos += sl;
-        cur = e->parent;
-        guard++;
-    }
-    if(cur){
+    if(!fm || !full || cch == 0){
         return FALSE;
     }
-    // temp begins with \Dir\Sub\Name
-    if(wcslen(temp)==0) return FALSE;
-    if(wcslen(temp)+3 >= cch) return FALSE;
-    // Strip the last segment into parent and name: caller does this separately; here we return full path root + temp
-    wcscpy_s(full, cch, L"");
-    return wcscpy_s(full, cch, temp)==0;
+    FrnEntry* stack[4096];
+    const size_t max_depth = sizeof(stack) / sizeof(stack[0]);
+    size_t depth = 0;
+    uint64_t cur = frn;
+    while(cur){
+        if(depth >= max_depth){
+            return FALSE;
+        }
+        FrnEntry* e = frnmap_get(fm, cur);
+        if(!e){
+            return FALSE;
+        }
+        stack[depth++] = e;
+        cur = e->parent;
+    }
+    if(depth == 0){
+        return FALSE;
+    }
+    size_t required = 1; // null terminator
+    for(size_t i = depth; i > 0; --i){
+        const wchar_t* name = stack[i-1]->name;
+        if(!name){
+            return FALSE;
+        }
+        size_t len = wcslen(name);
+        if(len == 0){
+            return FALSE;
+        }
+        required += len + 1; // include path separator
+        if(required >= cch){
+            return FALSE;
+        }
+    }
+    wchar_t* out = full;
+    size_t remaining = cch;
+    for(size_t i = depth; i > 0; --i){
+        const wchar_t* name = stack[i-1]->name;
+        size_t len = wcslen(name);
+        if(len + 1 >= remaining){
+            return FALSE;
+        }
+        *out++ = L'\\';
+        wmemcpy(out, name, len);
+        out += len;
+        remaining -= len + 1;
+    }
+    *out = L'\0';
+    return TRUE;
 }
 
+static BOOL usn_parent_cache_lookup(USNScanner* s, uint64_t parent_frn, wchar_t* parent, size_t cch);
+static void usn_parent_cache_store(USNScanner* s, uint64_t parent_frn, const wchar_t* parent);
+
 static BOOL frn_resolve_parent_path(USNScanner* s, uint64_t parent_frn, wchar_t* parent, size_t cch){
+    if(!s || !parent){
+        return FALSE;
+    }
     if(parent_frn == 0){
         return swprintf(parent, cch, L"%c:\\", s->volRoot[0])>0;
     }
+    if(usn_parent_cache_lookup(s, parent_frn, parent, cch)){
+        return TRUE;
+    }
+    BOOL ok = FALSE;
     FrnEntry* e = frnmap_get(&s->map, parent_frn);
     if(e){
         wchar_t rel[MAX_LONG_PATH];
-        if(!frn_build_path(&s->map, parent_frn, rel, MAX_LONG_PATH)){
+        if(frn_build_path(&s->map, parent_frn, rel, MAX_LONG_PATH)){
+            if(swprintf(parent, cch, L"%c:%s", s->volRoot[0], rel) > 0){
+                ok = TRUE;
+            }
+        }
+    }
+    if(!ok){
+        FILE_ID_DESCRIPTOR pfid = {0};
+        pfid.dwSize = sizeof(pfid);
+        pfid.Type = FileIdType;
+        pfid.FileId.QuadPart = parent_frn;
+        HANDLE hPar = OpenFileById(s->hVol, &pfid, FILE_READ_ATTRIBUTES,
+                                   FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, 0);
+        if(hPar == INVALID_HANDLE_VALUE){
             return FALSE;
         }
-        return swprintf(parent, cch, L"%c:%s", s->volRoot[0], rel)>0;
-    }
-    FILE_ID_DESCRIPTOR pfid = {0};
-    pfid.dwSize = sizeof(pfid);
-    pfid.Type = FileIdType;
-    pfid.FileId.QuadPart = parent_frn;
-    HANDLE hPar = OpenFileById(s->hVol, &pfid, FILE_READ_ATTRIBUTES,
-                               FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, 0);
-    if(hPar == INVALID_HANDLE_VALUE){
-        return FALSE;
-    }
-    BOOL ok = FALSE;
-    wchar_t parent_full[MAX_LONG_PATH];
-    DWORD got = GetFinalPathNameByHandleW(hPar, parent_full, MAX_LONG_PATH, FILE_NAME_NORMALIZED);
-    CloseHandle(hPar);
-    if(got>0 && got<MAX_LONG_PATH){
-        if(wcsncmp(parent_full, L"\\\\?\\", 4)==0){
-            memmove(parent_full, parent_full+4, (wcslen(parent_full)-3)*sizeof(wchar_t));
+        wchar_t parent_full[MAX_LONG_PATH];
+        DWORD got = GetFinalPathNameByHandleW(hPar, parent_full, MAX_LONG_PATH, FILE_NAME_NORMALIZED);
+        CloseHandle(hPar);
+        if(got>0 && got<MAX_LONG_PATH){
+            if(wcsncmp(parent_full, L"\\\\?\\", 4)==0){
+                memmove(parent_full, parent_full+4, (wcslen(parent_full)-3)*sizeof(wchar_t));
+            }
+            ok = wcscpy_s(parent, cch, parent_full)==0;
         }
-        ok = wcscpy_s(parent, cch, parent_full)==0;
+    }
+    if(ok){
+        usn_parent_cache_store(s, parent_frn, parent);
     }
     return ok;
 }
@@ -989,12 +1017,10 @@ static DWORD WINAPI map_emit_worker(void* p){
             continue;
         }
         FrnEntry* e = &s->map.slots[idx];
-        wchar_t rel[MAX_LONG_PATH];
-        if(!frn_build_path(&s->map, e->parent, rel, MAX_LONG_PATH)){
+        wchar_t parent[MAX_LONG_PATH];
+        if(!frn_resolve_parent_path(s, e->parent, parent, MAX_LONG_PATH)){
             continue;
         }
-        wchar_t parent[MAX_LONG_PATH];
-        swprintf(parent, MAX_LONG_PATH, L"%c:%s", s->volRoot[0], rel);
         DbWorkItem* wi = acquire_work_item();
         if(!wi){
             if(is_cancelled(s->cancel)){
