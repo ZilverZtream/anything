@@ -11,6 +11,7 @@ typedef struct AppConfig {
     int default_batch;
     int default_search_workers;
     int max_search_workers;
+    int max_content_index_bytes;  // Maximum bytes to index for full-text search (default: 5MB)
 } AppConfig;
 
 extern AppConfig g_config;

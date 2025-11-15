@@ -2025,9 +2025,9 @@ static DWORD WINAPI filter_worker_thread(void* p){
         size_t parent_needed = 0;
         db_parent_cache_copy(r->parent_str_id, NULL, 0, &parent_needed);
         if(parent_needed > 0){
-            parent = (char*)_malloca(parent_needed);
+            parent = (char*)malloc(parent_needed);
             if(parent && !db_parent_cache_copy(r->parent_str_id, parent, parent_needed, NULL)){
-                _freea(parent);
+                free(parent);
                 parent = NULL;
             }
         }
@@ -2035,7 +2035,7 @@ static DWORD WINAPI filter_worker_thread(void* p){
             MDB_val parent_val;
             if(mdb_get(txn, dbi_strings, &pk, &pv)!=0) goto next_record;
             string_value_parse(&pv, &parent_val, NULL);
-            parent = (char*)_malloca(parent_val.mv_size + 1);
+            parent = (char*)malloc(parent_val.mv_size + 1);
             if(!parent) goto next_record;
             memcpy(parent, parent_val.mv_data, parent_val.mv_size);
             parent[parent_val.mv_size] = 0;
@@ -2044,7 +2044,7 @@ static DWORD WINAPI filter_worker_thread(void* p){
         if(mdb_get(txn, dbi_strings, &nk, &nv)!=0) goto next_record;
         MDB_val name_val; StringMeta name_meta;
         string_value_parse(&nv, &name_val, &name_meta);
-        name = (char*)_malloca(name_val.mv_size + 1);
+        name = (char*)malloc(name_val.mv_size + 1);
         if(!name) goto next_record;
         memcpy(name, name_val.mv_data, name_val.mv_size);
         name[name_val.mv_size] = 0;
@@ -2066,8 +2066,8 @@ static DWORD WINAPI filter_worker_thread(void* p){
             a->outn++;
         }
 next_record:
-        if(name){ _freea(name); name = NULL; }
-        if(parent){ _freea(parent); parent = NULL; }
+        if(name){ free(name); name = NULL; }
+        if(parent){ free(parent); parent = NULL; }
     }
 done:
     if(txn) mdb_txn_abort(txn);
@@ -2111,7 +2111,7 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         if(mdb_get(txn, dbi_strings, &ck, &cv)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&cv, &text_val, &meta);
-            char* content = (char*)_malloca(text_val.mv_size + 1);
+            char* content = (char*)malloc(text_val.mv_size + 1);
             if(content){
                 memcpy(content, text_val.mv_data, text_val.mv_size);
                 content[text_val.mv_size] = 0;
@@ -2119,7 +2119,7 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
                 int dl = (int)text_val.mv_size;
                 const float avgdl = 1000.0f;
                 content_score = bm25_score(tf, dl, avgdl, (int)total_docs, (int)docs_with_term);
-                _freea(content);
+                free(content);
             }
         }
     }
@@ -2128,12 +2128,12 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         if(mdb_get(txn, dbi_strings, &ak, &av)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&av, &text_val, &meta);
-            char* author=(char*)_malloca(text_val.mv_size + 1);
+            char* author=(char*)malloc(text_val.mv_size + 1);
             if(author){
                 memcpy(author, text_val.mv_data, text_val.mv_size);
                 author[text_val.mv_size] = 0;
                 if(_stricmp(author, q->author_pattern)==0) meta_score += 1.0f;
-                _freea(author);
+                free(author);
             }
         }
     }
@@ -2142,12 +2142,12 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         if(mdb_get(txn, dbi_strings, &ck, &cv)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&cv, &text_val, &meta);
-            char* camera=(char*)_malloca(text_val.mv_size + 1);
+            char* camera=(char*)malloc(text_val.mv_size + 1);
             if(camera){
                 memcpy(camera, text_val.mv_data, text_val.mv_size);
                 camera[text_val.mv_size] = 0;
                 if(_stricmp(camera, q->camera_pattern)==0) meta_score += 1.0f;
-                _freea(camera);
+                free(camera);
             }
         }
     }
@@ -2156,12 +2156,12 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         if(mdb_get(txn, dbi_strings, &lk, &lv)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&lv, &text_val, &meta);
-            char* lens=(char*)_malloca(text_val.mv_size + 1);
+            char* lens=(char*)malloc(text_val.mv_size + 1);
             if(lens){
                 memcpy(lens, text_val.mv_data, text_val.mv_size);
                 lens[text_val.mv_size] = 0;
                 if(_stricmp(lens, q->lens_pattern)==0) meta_score += 1.0f;
-                _freea(lens);
+                free(lens);
             }
         }
     }
@@ -2170,12 +2170,12 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         if(mdb_get(txn, dbi_strings, &ark, &av2)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&av2, &text_val, &meta);
-            char* artist=(char*)_malloca(text_val.mv_size + 1);
+            char* artist=(char*)malloc(text_val.mv_size + 1);
             if(artist){
                 memcpy(artist, text_val.mv_data, text_val.mv_size);
                 artist[text_val.mv_size] = 0;
                 if(_stricmp(artist, q->artist_pattern)==0) meta_score += 1.0f;
-                _freea(artist);
+                free(artist);
             }
         }
     }
@@ -2184,12 +2184,12 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         if(mdb_get(txn, dbi_strings, &abk, &abv)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&abv, &text_val, &meta);
-            char* album=(char*)_malloca(text_val.mv_size + 1);
+            char* album=(char*)malloc(text_val.mv_size + 1);
             if(album){
                 memcpy(album, text_val.mv_data, text_val.mv_size);
                 album[text_val.mv_size] = 0;
                 if(_stricmp(album, q->album_pattern)==0) meta_score += 1.0f;
-                _freea(album);
+                free(album);
             }
         }
     }
@@ -2198,12 +2198,12 @@ static float calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbReco
         if(mdb_get(txn, dbi_strings, &tk, &tv)==0){
             MDB_val text_val; StringMeta meta;
             string_value_parse(&tv, &text_val, &meta);
-            char* title=(char*)_malloca(text_val.mv_size + 1);
+            char* title=(char*)malloc(text_val.mv_size + 1);
             if(title){
                 memcpy(title, text_val.mv_data, text_val.mv_size);
                 title[text_val.mv_size] = 0;
                 if(_stricmp(title, q->title_pattern)==0) meta_score += 1.0f;
-                _freea(title);
+                free(title);
             }
         }
     }
@@ -2417,7 +2417,8 @@ static void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const 
         // fallback: too short or invalid; skip trigram and let filename_index iterate
         out->n=0; return;
     }
-    char* tmp=(char*)_malloca(len+1);
+    char* tmp=(char*)malloc(len+1);
+    if(!tmp){ out->n=0; return; }
     memcpy(tmp, term, len);
     tmp[len]='\0';
     lowercase_ascii(tmp, len);
@@ -2442,7 +2443,7 @@ static void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const 
         if(candidates.n==0) break;
     }
     *out = candidates;
-    _freea(tmp);
+    free(tmp);
 }
 
 static int precedence(Token t){
@@ -2711,11 +2712,11 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
             }
             MDB_val text_val; StringMeta meta_tmp;
             string_value_parse(&sv, &text_val, &meta_tmp);
-            char* tmp=(char*)_malloca(text_val.mv_size + 1);
+            char* tmp=(char*)malloc(text_val.mv_size + 1);
             if(!tmp){ rc = mdb_cursor_get(cix,&key,&val,MDB_NEXT_NODUP); continue; }
             memcpy(tmp,text_val.mv_data,text_val.mv_size); tmp[text_val.mv_size]=0;
             BOOL matched = fuzzy_match(tmp, normalized, maxd);
-            _freea(tmp);
+            free(tmp);
             if(matched){
                 do{
                     if(out->n >= MAX_NAME_RESULTS){ limit_reached = TRUE; break; }

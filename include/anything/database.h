@@ -17,9 +17,13 @@ typedef int BOOL;
 #include <wchar.h>
 #include "anything/anything.h"
 
-#define DB_BLOOM_MAX_BYTES      (128*1024)  // only index first 128KB of any string
-#define DB_BLOOM_STRIDE_AFTER   (64*1024)   // process every trigram up to 64KB
-#define DB_BLOOM_STRIDE         2           // then sample every other trigram
+// Full-text indexing limit: Only index first N bytes of any file
+// Previous limit was 128KB which was too restrictive for real-world use
+// Increased to 5MB to support proper document indexing
+// NOTE: This can be configured via config file (see AppConfig.max_content_index_bytes)
+#define DB_BLOOM_MAX_BYTES      (5*1024*1024)  // default: index first 5MB of any string
+#define DB_BLOOM_STRIDE_AFTER   (1*1024*1024)  // process every trigram up to 1MB
+#define DB_BLOOM_STRIDE         2              // then sample every other trigram
 
 #ifdef __cplusplus
 extern "C" {

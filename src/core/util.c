@@ -518,6 +518,19 @@ float bm25_score(int tf, int doc_len, float avg_doc_len, int docs_total, int doc
     return idf * ((float)tf * (k1 + 1.0f) / denom);
 }
 
+// Thread-local buffer for Levenshtein distance calculation
+// This avoids millions of malloc/free calls during fuzzy search
+#if defined(_MSC_VER)
+    #define THREAD_LOCAL __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+    #define THREAD_LOCAL __thread
+#else
+    #define THREAD_LOCAL
+#endif
+
+static THREAD_LOCAL int* g_levenshtein_buffer = NULL;
+static THREAD_LOCAL size_t g_levenshtein_buffer_capacity = 0;
+
 int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen){
     enum { MAX_TOTAL = 65536, STACK_COLS = 256 };
 
@@ -556,12 +569,24 @@ int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen)
     }
 
     size_t cols = blen + 1;
-    size_t buf_size = cols * sizeof(int);
     int stack_col[STACK_COLS];
-    BOOL heap = cols > STACK_COLS;
-    int* col = heap ? (int*)malloc(buf_size) : stack_col;
-    if(!col){
-        return (int)(alen>blen?alen:blen);
+    int* col;
+
+    if(cols <= STACK_COLS){
+        // Use stack buffer for small strings
+        col = stack_col;
+    } else {
+        // Use thread-local heap buffer for larger strings
+        // Reuse and grow as needed to avoid repeated allocations
+        if(cols > g_levenshtein_buffer_capacity){
+            int* new_buf = (int*)realloc(g_levenshtein_buffer, cols * sizeof(int));
+            if(!new_buf){
+                return (int)(alen>blen?alen:blen);
+            }
+            g_levenshtein_buffer = new_buf;
+            g_levenshtein_buffer_capacity = cols;
+        }
+        col = g_levenshtein_buffer;
     }
 
     for(size_t j=0; j<cols; j++) col[j] = (int)j;
@@ -582,7 +607,7 @@ int levenshtein_distance(const char* a, size_t alen, const char* b, size_t blen)
     }
 
     int dist = col[blen];
-    if(heap) free(col);
+    // No free() needed - buffer is reused
     return dist;
 }
 

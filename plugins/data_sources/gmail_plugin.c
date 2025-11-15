@@ -163,8 +163,19 @@ cleanup:
 }
 
 static BOOL init(const PluginHost* host){
-    if(!host) return FALSE; g_host=*host; const char* env=getenv("GMAIL_TOKEN");
-    if(env) to_wide(env,g_oauth_token,256); else fprintf(stderr,"[gmail] GMAIL_TOKEN not set\n");
+    if(!host) return FALSE; g_host=*host;
+
+    // WARNING: Reading OAuth tokens from environment variables is INSECURE
+    // Environment variables can be read by other processes
+    // TODO: Use OS credential manager (Windows: CredRead, macOS: Keychain, Linux: libsecret)
+    const char* env=getenv("GMAIL_TOKEN");
+    if(env){
+        fprintf(stderr,"[gmail] WARNING: Using GMAIL_TOKEN from environment variable is insecure!\n");
+        fprintf(stderr,"[gmail] Tokens should be stored in OS credential manager.\n");
+        to_wide(env,g_oauth_token,256);
+    } else {
+        fprintf(stderr,"[gmail] GMAIL_TOKEN not set\n");
+    }
     return TRUE;
 }
 
