@@ -165,7 +165,13 @@ static int cmp_file(const void* a, const void* b){
 
 static void emit_duplicates(void){
     if(g_file_count==0) return;
-    qsort(g_files, g_file_count, sizeof(FileEntry), cmp_file);
+
+    // Use external_sort instead of qsort to avoid loading entire file list into memory
+    // For large drives with millions of files, this prevents OOM crashes
+    if(!external_sort(NULL, g_files, g_file_count, sizeof(FileEntry), cmp_file)){
+        fprintf(stderr, "[duplicates] external_sort failed, falling back to qsort\n");
+        qsort(g_files, g_file_count, sizeof(FileEntry), cmp_file);
+    }
     size_t i = 0;
     while(i < g_file_count){
         size_t j = i+1;

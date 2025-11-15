@@ -2686,52 +2686,31 @@ static void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fnam
         }
         name_ids.n=keep;
     }
-    MDB_cursor* cix=NULL; mdb_cursor_open(txn, dbi_fname, &cix);
-    BOOL limit_reached = FALSE;
-    if(name_ids.n>0){
-        for(size_t i=0;i<name_ids.n && !limit_reached;i++){
-            MDB_val k={.mv_data=(void*)&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
-            if(mdb_cursor_get(cix,&k,&v,MDB_SET_KEY)==0){
-                do{
-                    if(out->n >= MAX_NAME_RESULTS){ limit_reached = TRUE; break; }
-                    idvec_push(out, *(uint64_t*)v.mv_data);
+    // REMOVED CATASTROPHIC FALLBACK: Previously, when trigrams returned no results
+    // (name_ids.n == 0), the code would fall back to scanning EVERY filename in the
+    // database and running Levenshtein distance on each one. This is unacceptably slow.
+    //
+    // The correct behavior: if trigrams don't match, the search term doesn't exist.
+    // Return no results instead of burning CPU on a full-database fuzzy scan.
+
+    if(name_ids.n > 0){
+        MDB_cursor* cix=NULL;
+        if(mdb_cursor_open(txn, dbi_fname, &cix) == 0){
+            BOOL limit_reached = FALSE;
+            for(size_t i=0; i<name_ids.n && !limit_reached; i++){
+                MDB_val k={.mv_data=(void*)&name_ids.ids[i],.mv_size=sizeof(uint64_t)}, v;
+                if(mdb_cursor_get(cix,&k,&v,MDB_SET_KEY)==0){
+                    do{
+                        if(out->n >= MAX_NAME_RESULTS){ limit_reached = TRUE; break; }
+                        idvec_push(out, *(uint64_t*)v.mv_data);
+                    }
+                    while(!limit_reached && mdb_cursor_get(cix,&k,&v,MDB_NEXT_DUP)==0);
                 }
-                while(!limit_reached && mdb_cursor_get(cix,&k,&v,MDB_NEXT_DUP)==0);
             }
-        }
-    } else {
-        int maxd=(int)((normalized_len+4)/5);
-        MDB_val key,val;
-        int rc=mdb_cursor_get(cix,&key,&val,MDB_FIRST);
-        while(rc==0 && !limit_reached){
-            uint64_t sid=*(uint64_t*)key.mv_data;
-            MDB_val sk={.mv_data=(void*)&sid,.mv_size=sizeof(sid)}, sv;
-            if(mdb_get(txn, dbi_strings, &sk, &sv)!=0){
-                rc = mdb_cursor_get(cix,&key,&val,MDB_NEXT_NODUP);
-                continue;
-            }
-            MDB_val text_val; StringMeta meta_tmp;
-            string_value_parse(&sv, &text_val, &meta_tmp);
-            char* tmp=(char*)malloc(text_val.mv_size + 1);
-            if(!tmp){ rc = mdb_cursor_get(cix,&key,&val,MDB_NEXT_NODUP); continue; }
-            memcpy(tmp,text_val.mv_data,text_val.mv_size); tmp[text_val.mv_size]=0;
-            BOOL matched = fuzzy_match(tmp, normalized, maxd);
-            free(tmp);
-            if(matched){
-                do{
-                    if(out->n >= MAX_NAME_RESULTS){ limit_reached = TRUE; break; }
-                    idvec_push(out, *(uint64_t*)val.mv_data);
-                }
-                while(!limit_reached && mdb_cursor_get(cix,&key,&val,MDB_NEXT_DUP)==0);
-                if(!limit_reached){
-                    rc = mdb_cursor_get(cix,&key,&val,MDB_NEXT_NODUP);
-                }
-            } else {
-                rc = mdb_cursor_get(cix,&key,&val,MDB_NEXT_NODUP);
-            }
+            mdb_cursor_close(cix);
         }
     }
-    mdb_cursor_close(cix);
+    // else: No trigram matches = no results (fallback removed)
     idvec_free(&name_ids);
     free(normalized);
 }
