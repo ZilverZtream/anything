@@ -289,16 +289,11 @@ BOOL work_item_pool_init(size_t capacity){
 
 void work_item_pool_destroy(void){
     if(!g_work_item_pool.initialized) return;
+    // Drain the free queue (all items are from the contiguous pool block now)
     void* ptr = NULL;
-    DbWorkItem* start = g_work_item_pool.items;
-    DbWorkItem* end = start ? start + g_work_item_pool.capacity : start;
     while(MPMC_Pop(&g_work_item_pool.free_queue, &ptr)){
-        if(ptr && (ptr < (void*)start || ptr >= (void*)end)){
-            DbWorkItem* extra = (DbWorkItem*)ptr;
-            if(extra->content){ free(extra->content); extra->content = NULL; }
-            if(extra->preview){ free(extra->preview); extra->preview = NULL; }
-            aligned_free(extra);
-        }
+        // Items are from the pool, no need to free individually
+        // content/preview are already freed by release_work_item
     }
     MPMC_Destroy(&g_work_item_pool.free_queue);
     if(g_work_item_pool.items){
@@ -312,16 +307,15 @@ void work_item_pool_destroy(void){
 
 DbWorkItem* acquire_work_item(void){
     void* item_ptr = NULL;
-    if(g_work_item_pool.initialized && MPMC_Pop(&g_work_item_pool.free_queue, &item_ptr)){
-        DbWorkItem* item = (DbWorkItem*)item_ptr;
-        work_item_clear(item);
-        return item;
+    // Bounded blocking pool: spin until an item is available
+    // This provides natural backpressure to file scanners
+    while(!MPMC_Pop(&g_work_item_pool.free_queue, &item_ptr)){
+        // Brief sleep to avoid excessive CPU usage while waiting
+        Sleep(1);
     }
-    DbWorkItem* fallback = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
-    if(fallback){
-        work_item_clear(fallback);
-    }
-    return fallback;
+    DbWorkItem* item = (DbWorkItem*)item_ptr;
+    work_item_clear(item);
+    return item;
 }
 
 void release_work_item(DbWorkItem* item){
@@ -329,12 +323,12 @@ void release_work_item(DbWorkItem* item){
     if(item->content){ free(item->content); item->content = NULL; }
     if(item->preview){ free(item->preview); item->preview = NULL; }
     work_item_clear(item);
-    if(g_work_item_pool.initialized){
-        if(MPMC_Push(&g_work_item_pool.free_queue, item)){
-            return;
-        }
+    // Bounded blocking pool: spin until item is returned to pool
+    // With proper pool sizing, this should rarely (if ever) block
+    while(!MPMC_Push(&g_work_item_pool.free_queue, item)){
+        // Brief sleep to avoid excessive CPU usage while waiting
+        Sleep(1);
     }
-    aligned_free(item);
 }
 
 BOOL live_updates_poll(LiveUpdate* out){
