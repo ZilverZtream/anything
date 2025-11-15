@@ -1848,6 +1848,30 @@ typedef struct InternHashEntry {
     size_t index;
 } InternHashEntry;
 
+// Comparison function for sorting InternTask* by UTF-8 string (for bulk operations)
+static int compare_intern_task_utf8(const void* a, const void* b){
+    const InternTask* ta = *(const InternTask**)a;
+    const InternTask* tb = *(const InternTask**)b;
+    size_t min_len = (ta->utf8_len < tb->utf8_len) ? ta->utf8_len : tb->utf8_len;
+    int cmp = memcmp(ta->utf8, tb->utf8, min_len);
+    if(cmp != 0) return cmp;
+    if(ta->utf8_len < tb->utf8_len) return -1;
+    if(ta->utf8_len > tb->utf8_len) return 1;
+    return 0;
+}
+
+// Comparison function for sorting InternTask* by normalized UTF-8 string (for bulk operations)
+static int compare_intern_task_normalized(const void* a, const void* b){
+    const InternTask* ta = *(const InternTask**)a;
+    const InternTask* tb = *(const InternTask**)b;
+    size_t min_len = (ta->normalized_len < tb->normalized_len) ? ta->normalized_len : tb->normalized_len;
+    int cmp = memcmp(ta->normalized_utf8, tb->normalized_utf8, min_len);
+    if(cmp != 0) return cmp;
+    if(ta->normalized_len < tb->normalized_len) return -1;
+    if(ta->normalized_len > tb->normalized_len) return 1;
+    return 0;
+}
+
 static THREAD_LOCAL InternTask* g_tls_task_pool = NULL;
 static THREAD_LOCAL size_t g_tls_task_capacity = 0;
 
@@ -2058,69 +2082,134 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
         }
     }
     int max_raw_key = mdb_env_get_maxkeysize(d->env);
+    // Bulk check: sort unique strings and use cursor to check existence in one pass
     if(rtxn){
-        for(size_t i = 0; i < unique_count; ++i){
-            InternTask* t = unique[i];
-            if(t->id) continue;
-            if(t->utf8_len == 0 || t->utf8_len > (size_t)max_raw_key){
-                continue;
+        // Sort the unique array by UTF-8 string for efficient cursor scan
+        qsort(unique, unique_count, sizeof(InternTask*), compare_intern_task_utf8);
+
+        MDB_cursor* cursor = NULL;
+        int rc = mdb_cursor_open(rtxn, d->dbi_strrev, &cursor);
+        if(rc == 0){
+            size_t task_idx = 0;
+            MDB_val cursor_key, cursor_val;
+            int cursor_rc = mdb_cursor_get(cursor, &cursor_key, &cursor_val, MDB_FIRST);
+
+            while(task_idx < unique_count && cursor_rc == 0){
+                InternTask* t = unique[task_idx];
+                if(t->id || t->utf8_len == 0 || t->utf8_len > (size_t)max_raw_key){
+                    task_idx++;
+                    continue;
+                }
+
+                // Compare task string with cursor key
+                size_t min_len = (t->utf8_len < cursor_key.mv_size) ? t->utf8_len : cursor_key.mv_size;
+                int cmp = memcmp(t->utf8, cursor_key.mv_data, min_len);
+                if(cmp == 0){
+                    if(t->utf8_len < cursor_key.mv_size) cmp = -1;
+                    else if(t->utf8_len > cursor_key.mv_size) cmp = 1;
+                }
+
+                if(cmp < 0){
+                    // Task string is before cursor - doesn't exist in DB
+                    task_idx++;
+                } else if(cmp == 0){
+                    // Found match - extract ID
+                    t->id = *(uint64_t*)cursor_val.mv_data;
+                    task_idx++;
+                } else {
+                    // Cursor is before task - advance cursor
+                    cursor_rc = mdb_cursor_get(cursor, &cursor_key, &cursor_val, MDB_NEXT);
+                }
             }
-            MDB_val k = {.mv_data = t->utf8, .mv_size = t->utf8_len};
-            MDB_val v;
-            if(mdb_get(rtxn, d->dbi_strrev, &k, &v) == 0){
-                t->id = *(uint64_t*)v.mv_data;
-            }
+
+            mdb_cursor_close(cursor);
         }
     }
     uint64_t original_count = d->header_cache.string_count;
     BOOL header_dirty = FALSE;
+
+    // Bulk insert: count new strings and ensure we have a write transaction
+    size_t new_string_count = 0;
     for(size_t i = 0; i < unique_count; ++i){
         InternTask* t = unique[i];
-        if(t->id) continue;
+        if(!t->id){
+            new_string_count++;
+        }
+    }
+
+    if(new_string_count > 0){
         if(!d->wtxn && !db_begin_write(db_)){
             d->header_cache.string_count = original_count;
             result = FALSE;
             goto cleanup;
         }
-        uint64_t new_id = d->header_cache.string_count + 1;
-        d->header_cache.string_count = new_id;
-        MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-        size_t total_len = t->utf8_len + sizeof(StringMeta);
-        uint8_t* storage = (uint8_t*)malloc(total_len);
-        if(!storage){
-            d->header_cache.string_count = original_count;
-            set_error(d, DB_ERROR_OS, 0, "out of memory");
-            result = FALSE;
-            goto cleanup;
-        }
-        memcpy(storage, t->utf8, t->utf8_len);
-        StringMeta placeholder; string_meta_init(&placeholder);
-        memcpy(storage + t->utf8_len, &placeholder, sizeof(placeholder));
-        MDB_val idval = {.mv_data = storage, .mv_size = total_len};
-        int rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
-        free(storage);
-        if(rc){
-            fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (strings) with error: %s\n", mdb_strerror(rc));
-            d->header_cache.string_count = original_count;
-            set_mdb_error(d, rc);
-            result = FALSE;
-            goto cleanup;
-        }
-        if(t->utf8_len > 0 && t->utf8_len <= (size_t)max_raw_key){
-            MDB_val revkey = {.mv_data = t->utf8, .mv_size = t->utf8_len};
-            MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-            rc = mdb_put(d->wtxn, d->dbi_strrev, &revkey, &revid, 0);
+
+        // Allocate all IDs upfront
+        uint64_t next_id = d->header_cache.string_count + 1;
+        d->header_cache.string_count += new_string_count;
+
+        // Open cursor for bulk insert into dbi_strrev (already sorted from bulk check)
+        MDB_cursor* rev_cursor = NULL;
+        int rc = mdb_cursor_open(d->wtxn, d->dbi_strrev, &rev_cursor);
+        BOOL cursor_opened = (rc == 0);
+
+        // Iterate through sorted unique array and insert new strings
+        uint64_t current_id = next_id;
+        for(size_t i = 0; i < unique_count; ++i){
+            InternTask* t = unique[i];
+            if(t->id) continue;
+
+            uint64_t new_id = current_id++;
+            t->id = new_id;
+
+            // Insert into dbi_strings (keyed by ID)
+            MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
+            size_t total_len = t->utf8_len + sizeof(StringMeta);
+            uint8_t* storage = (uint8_t*)malloc(total_len);
+            if(!storage){
+                if(cursor_opened) mdb_cursor_close(rev_cursor);
+                d->header_cache.string_count = original_count;
+                set_error(d, DB_ERROR_OS, 0, "out of memory");
+                result = FALSE;
+                goto cleanup;
+            }
+            memcpy(storage, t->utf8, t->utf8_len);
+            StringMeta placeholder; string_meta_init(&placeholder);
+            memcpy(storage + t->utf8_len, &placeholder, sizeof(placeholder));
+            MDB_val idval = {.mv_data = storage, .mv_size = total_len};
+            rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
+            free(storage);
             if(rc){
-                fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (strrev) with error: %s\n", mdb_strerror(rc));
+                fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (strings) with error: %s\n", mdb_strerror(rc));
+                if(cursor_opened) mdb_cursor_close(rev_cursor);
                 d->header_cache.string_count = original_count;
                 set_mdb_error(d, rc);
                 result = FALSE;
                 goto cleanup;
             }
+
+            // Insert into dbi_strrev using cursor with MDB_APPEND (bulk operation)
+            if(cursor_opened && t->utf8_len > 0 && t->utf8_len <= (size_t)max_raw_key){
+                MDB_val revkey = {.mv_data = t->utf8, .mv_size = t->utf8_len};
+                MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
+                rc = mdb_cursor_put(rev_cursor, &revkey, &revid, MDB_APPEND);
+                if(rc){
+                    fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (strrev) with error: %s\n", mdb_strerror(rc));
+                    mdb_cursor_close(rev_cursor);
+                    d->header_cache.string_count = original_count;
+                    set_mdb_error(d, rc);
+                    result = FALSE;
+                    goto cleanup;
+                }
+            }
+
+            string_cache_insert(t->utf8, t->utf8_hash, t->id);
+            header_dirty = TRUE;
         }
-        t->id = new_id;
-        string_cache_insert(t->utf8, t->utf8_hash, t->id);
-        header_dirty = TRUE;
+
+        if(cursor_opened){
+            mdb_cursor_close(rev_cursor);
+        }
     }
     if(any_need_normalized && unique_count){
         size_t norm_hash_cap = ht_cap;
@@ -2184,65 +2273,135 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
             if(!leader->normalized_utf8) continue;
             leader->normalized_id = string_cache_lookup(leader->normalized_utf8, leader->normalized_hash);
         }
-        if(rtxn){
-            for(size_t i = 0; i < norm_unique_count; ++i){
-                InternTask* leader = norm_unique[i];
-                if(!leader->normalized_utf8) continue;
-                if(leader->normalized_id) continue;
-                MDB_val k = {.mv_data = leader->normalized_utf8, .mv_size = leader->normalized_len};
-                MDB_val v;
-                if(mdb_get(rtxn, d->dbi_strrev, &k, &v) == 0){
-                    leader->normalized_id = *(uint64_t*)v.mv_data;
-                    string_cache_insert(leader->normalized_utf8, leader->normalized_hash, leader->normalized_id);
+
+        // Bulk check: sort normalized strings and use cursor to check existence in one pass
+        if(rtxn && norm_unique_count > 0){
+            // Sort the norm_unique array by normalized UTF-8 string for efficient cursor scan
+            qsort(norm_unique, norm_unique_count, sizeof(InternTask*), compare_intern_task_normalized);
+
+            MDB_cursor* cursor = NULL;
+            int rc = mdb_cursor_open(rtxn, d->dbi_strrev, &cursor);
+            if(rc == 0){
+                size_t task_idx = 0;
+                MDB_val cursor_key, cursor_val;
+                int cursor_rc = mdb_cursor_get(cursor, &cursor_key, &cursor_val, MDB_FIRST);
+
+                while(task_idx < norm_unique_count && cursor_rc == 0){
+                    InternTask* leader = norm_unique[task_idx];
+                    if(!leader->normalized_utf8 || leader->normalized_id){
+                        task_idx++;
+                        continue;
+                    }
+
+                    // Compare normalized string with cursor key
+                    size_t min_len = (leader->normalized_len < cursor_key.mv_size) ? leader->normalized_len : cursor_key.mv_size;
+                    int cmp = memcmp(leader->normalized_utf8, cursor_key.mv_data, min_len);
+                    if(cmp == 0){
+                        if(leader->normalized_len < cursor_key.mv_size) cmp = -1;
+                        else if(leader->normalized_len > cursor_key.mv_size) cmp = 1;
+                    }
+
+                    if(cmp < 0){
+                        // Normalized string is before cursor - doesn't exist in DB
+                        task_idx++;
+                    } else if(cmp == 0){
+                        // Found match - extract ID
+                        leader->normalized_id = *(uint64_t*)cursor_val.mv_data;
+                        string_cache_insert(leader->normalized_utf8, leader->normalized_hash, leader->normalized_id);
+                        task_idx++;
+                    } else {
+                        // Cursor is before normalized string - advance cursor
+                        cursor_rc = mdb_cursor_get(cursor, &cursor_key, &cursor_val, MDB_NEXT);
+                    }
                 }
+
+                mdb_cursor_close(cursor);
             }
         }
+
+        // Bulk insert: count new normalized strings and ensure we have a write transaction
+        size_t new_norm_count = 0;
         for(size_t i = 0; i < norm_unique_count; ++i){
             InternTask* leader = norm_unique[i];
-            if(!leader->normalized_utf8) continue;
-            if(leader->normalized_id) continue;
+            if(leader->normalized_utf8 && !leader->normalized_id){
+                new_norm_count++;
+            }
+        }
+
+        if(new_norm_count > 0){
             if(!d->wtxn && !db_begin_write(db_)){
                 d->header_cache.string_count = original_count;
                 result = FALSE;
                 goto cleanup;
             }
-            uint64_t new_id = d->header_cache.string_count + 1;
-            d->header_cache.string_count = new_id;
-            MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-            size_t total_len = leader->normalized_len + sizeof(StringMeta);
-            uint8_t* storage = (uint8_t*)malloc(total_len);
-            if(!storage){
-                d->header_cache.string_count = original_count;
-                set_error(d, DB_ERROR_OS, 0, "out of memory");
-                result = FALSE;
-                goto cleanup;
+
+            // Allocate all IDs upfront
+            uint64_t next_id = d->header_cache.string_count + 1;
+            d->header_cache.string_count += new_norm_count;
+
+            // Open cursor for bulk insert into dbi_strrev (already sorted from bulk check)
+            MDB_cursor* rev_cursor = NULL;
+            int rc = mdb_cursor_open(d->wtxn, d->dbi_strrev, &rev_cursor);
+            BOOL cursor_opened = (rc == 0);
+
+            // Iterate through sorted norm_unique array and insert new normalized strings
+            uint64_t current_id = next_id;
+            for(size_t i = 0; i < norm_unique_count; ++i){
+                InternTask* leader = norm_unique[i];
+                if(!leader->normalized_utf8) continue;
+                if(leader->normalized_id) continue;
+
+                uint64_t new_id = current_id++;
+                leader->normalized_id = new_id;
+
+                // Insert into dbi_strings (keyed by ID)
+                MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
+                size_t total_len = leader->normalized_len + sizeof(StringMeta);
+                uint8_t* storage = (uint8_t*)malloc(total_len);
+                if(!storage){
+                    if(cursor_opened) mdb_cursor_close(rev_cursor);
+                    d->header_cache.string_count = original_count;
+                    set_error(d, DB_ERROR_OS, 0, "out of memory");
+                    result = FALSE;
+                    goto cleanup;
+                }
+                memcpy(storage, leader->normalized_utf8, leader->normalized_len);
+                StringMeta placeholder; string_meta_init(&placeholder);
+                memcpy(storage + leader->normalized_len, &placeholder, sizeof(placeholder));
+                MDB_val idval = {.mv_data = storage, .mv_size = total_len};
+                rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
+                free(storage);
+                if(rc){
+                    fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (normalized strings) with error: %s\n", mdb_strerror(rc));
+                    if(cursor_opened) mdb_cursor_close(rev_cursor);
+                    d->header_cache.string_count = original_count;
+                    set_mdb_error(d, rc);
+                    result = FALSE;
+                    goto cleanup;
+                }
+
+                // Insert into dbi_strrev using cursor with MDB_APPEND (bulk operation)
+                if(cursor_opened){
+                    MDB_val revkey = {.mv_data = leader->normalized_utf8, .mv_size = leader->normalized_len};
+                    MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
+                    rc = mdb_cursor_put(rev_cursor, &revkey, &revid, MDB_APPEND);
+                    if(rc){
+                        fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (normalized strrev) with error: %s\n", mdb_strerror(rc));
+                        mdb_cursor_close(rev_cursor);
+                        d->header_cache.string_count = original_count;
+                        set_mdb_error(d, rc);
+                        result = FALSE;
+                        goto cleanup;
+                    }
+                }
+
+                string_cache_insert(leader->normalized_utf8, leader->normalized_hash, leader->normalized_id);
+                header_dirty = TRUE;
             }
-            memcpy(storage, leader->normalized_utf8, leader->normalized_len);
-            StringMeta placeholder; string_meta_init(&placeholder);
-            memcpy(storage + leader->normalized_len, &placeholder, sizeof(placeholder));
-            MDB_val idval = {.mv_data = storage, .mv_size = total_len};
-            int rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
-            free(storage);
-            if(rc){
-                fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (normalized strings) with error: %s\n", mdb_strerror(rc));
-                d->header_cache.string_count = original_count;
-                set_mdb_error(d, rc);
-                result = FALSE;
-                goto cleanup;
+
+            if(cursor_opened){
+                mdb_cursor_close(rev_cursor);
             }
-            MDB_val revkey = {.mv_data = leader->normalized_utf8, .mv_size = leader->normalized_len};
-            MDB_val revid = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-            rc = mdb_put(d->wtxn, d->dbi_strrev, &revkey, &revid, 0);
-            if(rc){
-                fprintf(stderr, "!!! FAILED in db_intern_wstrings_batched (normalized strrev) with error: %s\n", mdb_strerror(rc));
-                d->header_cache.string_count = original_count;
-                set_mdb_error(d, rc);
-                result = FALSE;
-                goto cleanup;
-            }
-            leader->normalized_id = new_id;
-            string_cache_insert(leader->normalized_utf8, leader->normalized_hash, leader->normalized_id);
-            header_dirty = TRUE;
         }
         for(size_t i = 0; i < unique_count; ++i){
             InternTask* leader = unique[i];
