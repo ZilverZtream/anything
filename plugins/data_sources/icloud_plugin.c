@@ -139,9 +139,21 @@ static void process_record(cJSON* rec){
 }
 
 static BOOL init(const PluginHost* host){
-    if(!host) return FALSE; g_host=*host; const char* env=getenv("ICLOUD_TOKEN"); if(env) to_wide(env,g_oauth_token,256);
+    if(!host) return FALSE; g_host=*host;
+
+    // WARNING: Reading OAuth tokens from environment variables is INSECURE
+    // Environment variables can be read by other processes
+    // TODO: Use OS credential manager (Windows: CredRead, macOS: Keychain, Linux: libsecret)
+    const char* env=getenv("ICLOUD_TOKEN");
+    if(env){
+        fprintf(stderr,"[icloud] WARNING: Using ICLOUD_TOKEN from environment variable is insecure!\n");
+        fprintf(stderr,"[icloud] Tokens should be stored in OS credential manager.\n");
+        to_wide(env,g_oauth_token,256);
+    }
+
     const char* c=getenv("ICLOUD_CONTAINER"); if(c) to_wide(c,g_container,256);
-    const char* e=getenv("ICLOUD_ENV"); if(e) to_wide(e,g_environment,64); return TRUE;
+    const char* e=getenv("ICLOUD_ENV"); if(e) to_wide(e,g_environment,64);
+    return TRUE;
 }
 
 static void scan(void){

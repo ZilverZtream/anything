@@ -217,16 +217,35 @@ static void push_page(const char* url,const char* title,const char* text){
         Sleep(0); }
 }
 
-static void process_url(const char* url,const char* title){
-    if(!url||seen_has(url)) return; char* html=http_fetch(url); if(!html){ seen_add(url); return; }
-    char* text=html_to_text(html); free(html); if(text){ push_page(url,title,text); free(text); }
+// Process URL from history - INDEX METADATA ONLY (no content fetching)
+// Previously this would download the entire web page for every URL in history,
+// which is extremely wasteful and slow. Now it only indexes the URL and title.
+static void process_history_url(const char* url, const char* title){
+    if(!url || seen_has(url)) return;
+
+    // Index URL and title only - no content fetching
+    // Content would come from browser's local cache if available (not implemented)
+    push_page(url, title, NULL);  // NULL content = metadata only
+    seen_add(url);
+}
+
+// Process URL from bookmarks - OPTIONALLY fetch content
+// This is still problematic but limited to bookmarks only
+static void process_bookmark_url(const char* url, const char* title){
+    if(!url || seen_has(url)) return;
+
+    // WARNING: Fetching content for bookmarks is slow and bandwidth-intensive
+    // TODO: Implement local cache lookup instead
+    // For now, we only index metadata to avoid the performance issue
+    fprintf(stderr, "[web_archive] WARNING: Skipping content fetch for bookmark %s (use local cache instead)\n", url);
+    push_page(url, title, NULL);  // Changed: no longer fetching content
     seen_add(url);
 }
 
 // ---- Chrome ----
 static void parse_chrome_bm(cJSON* node){
     if(!node) return; cJSON* url=cJSON_GetObjectItem(node,"url"); cJSON* name=cJSON_GetObjectItem(node,"name");
-    if(cJSON_IsString(url)) process_url(url->valuestring, cJSON_IsString(name)?name->valuestring:NULL);
+    if(cJSON_IsString(url)) process_bookmark_url(url->valuestring, cJSON_IsString(name)?name->valuestring:NULL);
     cJSON* children=cJSON_GetObjectItem(node,"children"); if(cJSON_IsArray(children)){
         cJSON* ch=NULL; cJSON_ArrayForEach(ch,children){ parse_chrome_bm(ch); }
     }
@@ -239,7 +258,8 @@ static void scan_chromium_variant(const char* hist,const char* bm){
             while(sqlite3_step(stmt)==SQLITE_ROW){
                 const unsigned char* u=sqlite3_column_text(stmt,0);
                 const unsigned char* t=sqlite3_column_text(stmt,1);
-                process_url((const char*)u,(const char*)t);
+                // Changed: use process_history_url to avoid downloading entire browsing history
+                process_history_url((const char*)u,(const char*)t);
                 if(is_cancelled(g_host.cancel_token)) break;
             }
             sqlite3_finalize(stmt);
@@ -345,7 +365,8 @@ static void scan_opera_gx(void){
 static void scan_firefox_db(const char* path){
     sqlite3* db=NULL; if(sqlite3_open(path,&db)!=SQLITE_OK) return; const char* sql="SELECT url,title FROM moz_places";
     sqlite3_stmt* stmt=NULL; if(sqlite3_prepare_v2(db,sql,-1,&stmt,NULL)==SQLITE_OK){
-        while(sqlite3_step(stmt)==SQLITE_ROW){ const unsigned char* u=sqlite3_column_text(stmt,0); const unsigned char* t=sqlite3_column_text(stmt,1); process_url((const char*)u,(const char*)t); if(is_cancelled(g_host.cancel_token)) break; }
+        // Changed: use process_history_url to avoid downloading entire browsing history
+        while(sqlite3_step(stmt)==SQLITE_ROW){ const unsigned char* u=sqlite3_column_text(stmt,0); const unsigned char* t=sqlite3_column_text(stmt,1); process_history_url((const char*)u,(const char*)t); if(is_cancelled(g_host.cancel_token)) break; }
         sqlite3_finalize(stmt); }
     sqlite3_close(db);
 }
@@ -379,13 +400,15 @@ static void parse_safari_bookmarks(const char* path){
     if(!data){ fclose(f); return; }
     if(fread(data,1,sz,f)!=(size_t)sz){ fprintf(stderr,"[web_archive] failed to read %s\n",path); free(data); fclose(f); return; }
     data[sz]=0; fclose(f);
-    char* p=data; while((p=strstr(p,"<key>URLString</key>"))){ char* s=strstr(p,"<string>"); if(!s) break; s+=8; char* e=strstr(s,"</string>"); if(!e) break; char url[4096]; size_t l=e-s; if(l>4095) l=4095; memcpy(url,s,l); url[l]=0; char* tkey=strstr(p,"<key>title</key>"); const char* title=NULL; char tbuf[1024]; if(tkey && tkey<e){ char* ts=strstr(tkey,"<string>"); if(ts){ ts+=8; char* te=strstr(ts,"</string>"); if(te){ size_t tl=te-ts; if(tl>1023) tl=1023; memcpy(tbuf,ts,tl); tbuf[tl]=0; title=tbuf; } }} process_url(url,title); p=e; }
+    // Changed: use process_bookmark_url for Safari bookmarks
+    char* p=data; while((p=strstr(p,"<key>URLString</key>"))){ char* s=strstr(p,"<string>"); if(!s) break; s+=8; char* e=strstr(s,"</string>"); if(!e) break; char url[4096]; size_t l=e-s; if(l>4095) l=4095; memcpy(url,s,l); url[l]=0; char* tkey=strstr(p,"<key>title</key>"); const char* title=NULL; char tbuf[1024]; if(tkey && tkey<e){ char* ts=strstr(tkey,"<string>"); if(ts){ ts+=8; char* te=strstr(ts,"</string>"); if(te){ size_t tl=te-ts; if(tl>1023) tl=1023; memcpy(tbuf,ts,tl); tbuf[tl]=0; title=tbuf; } }} process_bookmark_url(url,title); p=e; }
     free(data);
 }
 
 static void scan_safari(void){
     const char* home=getenv("HOME"); if(!home) return; char hist[PATH_MAX]; snprintf(hist,sizeof(hist),"%s/Library/Safari/History.db",home);
-    sqlite3* db=NULL; if(sqlite3_open(hist,&db)==SQLITE_OK){ const char* sql="SELECT url,title FROM history_items"; sqlite3_stmt* stmt=NULL; if(sqlite3_prepare_v2(db,sql,-1,&stmt,NULL)==SQLITE_OK){ while(sqlite3_step(stmt)==SQLITE_ROW){ const unsigned char* u=sqlite3_column_text(stmt,0); const unsigned char* t=sqlite3_column_text(stmt,1); process_url((const char*)u,(const char*)t); if(is_cancelled(g_host.cancel_token)) break; } sqlite3_finalize(stmt); } sqlite3_close(db); }
+    // Changed: use process_history_url to avoid downloading entire browsing history
+    sqlite3* db=NULL; if(sqlite3_open(hist,&db)==SQLITE_OK){ const char* sql="SELECT url,title FROM history_items"; sqlite3_stmt* stmt=NULL; if(sqlite3_prepare_v2(db,sql,-1,&stmt,NULL)==SQLITE_OK){ while(sqlite3_step(stmt)==SQLITE_ROW){ const unsigned char* u=sqlite3_column_text(stmt,0); const unsigned char* t=sqlite3_column_text(stmt,1); process_history_url((const char*)u,(const char*)t); if(is_cancelled(g_host.cancel_token)) break; } sqlite3_finalize(stmt); } sqlite3_close(db); }
     char bm[PATH_MAX]; snprintf(bm,sizeof(bm),"%s/Library/Safari/Bookmarks.plist",home); parse_safari_bookmarks(bm);
 }
 #endif

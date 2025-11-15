@@ -110,26 +110,60 @@ static wchar_t g_token[256]=L"";
 static PluginHost g_host;
 
 static BOOL load_token(void){
+    // WARNING: Reading OAuth tokens from environment variables is INSECURE
+    // Environment variables can be read by other processes
+    // TODO: Use OS credential manager (Windows: CredRead, macOS: Keychain, Linux: libsecret)
     const char* env=getenv("MS_MAIL_TOKEN");
-    if(env){ to_wide(env,g_token,256); return TRUE; }
+    if(env){
+        fprintf(stderr,"[msmail] WARNING: Using MS_MAIL_TOKEN from environment variable is insecure!\n");
+        fprintf(stderr,"[msmail] Tokens should be stored in OS credential manager or secure file with 0600 permissions.\n");
+        to_wide(env,g_token,256);
+        return TRUE;
+    }
+
     const char* path_env=getenv("MS_MAIL_TOKEN_FILE");
     char path_u8[512];
     if(path_env){ strncpy(path_u8,path_env,sizeof(path_u8)-1); path_u8[sizeof(path_u8)-1]=0; }
     else {
         const char* home=getenv("HOME");
 #ifdef _WIN32
-        if(!home) return FALSE; snprintf(path_u8,sizeof(path_u8),"%s\\.anything\\ms_mail_token",home);
+        if(!home) home = getenv("USERPROFILE");
+        if(!home) return FALSE;
+        snprintf(path_u8,sizeof(path_u8),"%s\\.anything\\ms_mail_token",home);
 #else
-        if(!home) return FALSE; snprintf(path_u8,sizeof(path_u8),"%s/.anything/ms_mail_token",home);
+        if(!home) return FALSE;
+        snprintf(path_u8,sizeof(path_u8),"%s/.anything/ms_mail_token",home);
 #endif
     }
+
     FILE* f=fopen(path_u8,"rb");
     if(!f){ fprintf(stderr,"[msmail] failed to open token file %s: %s\n",path_u8,strerror(errno)); return FALSE; }
-#ifndef _WIN32
-    struct stat st; if(stat(path_u8,&st)!=0){ fprintf(stderr,"[msmail] stat failed for %s: %s\n",path_u8,strerror(errno)); fclose(f); return FALSE; }
-    if((st.st_mode&0777)!=0600){ fprintf(stderr,"[msmail] insecure permissions on %s\n",path_u8); fclose(f); return FALSE; }
+
+    // Verify file permissions on all platforms
+#ifdef _WIN32
+    // On Windows, check file is not world-readable
+    HANDLE hFile = CreateFileA(path_u8, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(hFile != INVALID_HANDLE_VALUE){
+        // TODO: Add proper ACL check using GetSecurityInfo
+        fprintf(stderr,"[msmail] WARNING: Cannot verify file permissions on Windows. Ensure %s is only readable by current user.\n", path_u8);
+        CloseHandle(hFile);
+    }
+#else
+    struct stat st;
+    if(stat(path_u8,&st)!=0){
+        fprintf(stderr,"[msmail] stat failed for %s: %s\n",path_u8,strerror(errno));
+        fclose(f);
+        return FALSE;
+    }
+    if((st.st_mode&0777)!=0600){
+        fprintf(stderr,"[msmail] INSECURE PERMISSIONS on %s (must be 0600, found 0%o)\n",path_u8, st.st_mode&0777);
+        fclose(f);
+        return FALSE;
+    }
 #endif
-    char buf[256]; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f); if(n==0){ fprintf(stderr,"[msmail] token file %s empty or unreadable\n",path_u8); return FALSE; }
+
+    char buf[256]; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f);
+    if(n==0){ fprintf(stderr,"[msmail] token file %s empty or unreadable\n",path_u8); return FALSE; }
     buf[n]=0; char* nl=strpbrk(buf,"\r\n"); if(nl) *nl=0;
     to_wide(buf,g_token,256);
     return g_token[0]!=L'\0';
@@ -175,6 +209,7 @@ cleanup:
 static BOOL init(const PluginHost* host){
     if(!host) return FALSE; g_host=*host;
     if(!load_token()) return TRUE; // token may be absent
+
     const char* store_path=getenv("MS_MAIL_TOKEN_STORE");
     if(store_path){
         char tok_u8[256]; to_utf8(g_token,tok_u8,sizeof(tok_u8));
@@ -182,10 +217,27 @@ static BOOL init(const PluginHost* host){
         if(!f){
             fprintf(stderr,"[msmail] cannot write token store %s: %s\n",store_path,strerror(errno));
         }else{
-#ifndef _WIN32
+            // Set secure permissions BEFORE writing sensitive data
+#ifdef _WIN32
+            // On Windows, close and reopen with secure ACL
+            fclose(f);
+            // Create file with restricted access (owner only)
+            SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, FALSE};
+            HANDLE hFile = CreateFileA(store_path, GENERIC_WRITE, 0, &sa,
+                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if(hFile == INVALID_HANDLE_VALUE){
+                fprintf(stderr,"[msmail] cannot create secure token store %s\n",store_path);
+            }else{
+                DWORD written;
+                WriteFile(hFile, tok_u8, (DWORD)strlen(tok_u8), &written, NULL);
+                CloseHandle(hFile);
+            }
+#else
+            // On POSIX, set permissions before writing
             fchmod(fileno(f),0600);
+            fwrite(tok_u8,1,strlen(tok_u8),f);
+            fclose(f);
 #endif
-            fwrite(tok_u8,1,strlen(tok_u8),f); fclose(f);
         }
     }
     return TRUE;

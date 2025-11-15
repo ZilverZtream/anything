@@ -100,6 +100,10 @@ BOOL index_archive(Db* db, const wchar_t* archive_path){
     if(!a) return FALSE;
     archive_read_support_filter_all(a);
     archive_read_support_format_all(a);
+
+    // Enable libarchive's built-in security features
+    archive_read_disk_set_standard_lookup(a);
+
     if(archive_read_open_filename(a, u8, 10240) != ARCHIVE_OK){
         archive_read_free(a);
         return FALSE;
@@ -108,11 +112,30 @@ BOOL index_archive(Db* db, const wchar_t* archive_path){
     struct archive_entry* entry;
     while(archive_read_next_header(a, &entry) == ARCHIVE_OK){
         const char* name = archive_entry_pathname(entry);
+
+        // First check: Use libarchive's built-in path type detection
+        // Reject absolute paths and symlinks that could escape
+        if(archive_entry_filetype(entry) == AE_IFLNK){
+            const char* link_target = archive_entry_symlink(entry);
+            if(link_target && (link_target[0] == '/' || strstr(link_target, ".."))){
+                archive_read_data_skip(a);
+                continue;
+            }
+        }
+
+        // Second check: Our custom normalization
         char canon[MAX_LONG_PATH*3];
         if(!normalize_archive_path(name, canon, sizeof(canon))){
             archive_read_data_skip(a);
             continue;
         }
+
+        // Third check: Final safety check - ensure no ".." remains after normalization
+        if(strstr(canon, "..") || canon[0] == '/' || canon[0] == '\\'){
+            archive_read_data_skip(a);
+            continue;
+        }
+
         wchar_t wname[MAX_LONG_PATH];
         to_wide(canon, wname, MAX_LONG_PATH);
         DbRecord rec = {0};

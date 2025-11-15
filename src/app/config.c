@@ -26,6 +26,7 @@ void config_init_default(void){
     g_config.default_batch = 50000;
     g_config.default_search_workers = 1;
     g_config.max_search_workers = 4;
+    g_config.max_content_index_bytes = 5*1024*1024;  // 5MB default
 }
 
 BOOL config_load_file(const wchar_t* path){
@@ -50,6 +51,8 @@ BOOL config_load_file(const wchar_t* path){
             g_config.default_search_workers = (int)wcstol(val, NULL, 10);
         } else if(wcscmp(key, L"max_search_workers")==0){
             g_config.max_search_workers = (int)wcstol(val, NULL, 10);
+        } else if(wcscmp(key, L"max_content_index_bytes")==0){
+            g_config.max_content_index_bytes = (int)wcstol(val, NULL, 10);
         }
     }
     fclose(f);
@@ -60,5 +63,7 @@ BOOL config_load_file(const wchar_t* path){
     if(g_config.default_search_workers > g_config.max_search_workers) g_config.default_search_workers = g_config.max_search_workers;
     if(g_config.default_batch < 1) g_config.default_batch = 1;
     if(g_config.max_search_workers < 1) g_config.max_search_workers = 1;
+    if(g_config.max_content_index_bytes < 1024) g_config.max_content_index_bytes = 1024;  // minimum 1KB
+    if(g_config.max_content_index_bytes > 100*1024*1024) g_config.max_content_index_bytes = 100*1024*1024;  // maximum 100MB
     return TRUE;
 }

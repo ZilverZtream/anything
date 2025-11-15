@@ -152,6 +152,9 @@ static void process_line(char* line, char** buf, size_t* len, size_t* cap){
     }
 }
 
+#define MAX_LINE_LENGTH 4096
+#define MAX_FILE_SIZE_FOR_PARSING (10 * 1024 * 1024)  // 10MB limit for code parsing
+
 static wchar_t* parse_file(const wchar_t* path){
 #ifdef _WIN32
     FILE* f = _wfopen(path, L"rb");
@@ -162,36 +165,39 @@ static wchar_t* parse_file(const wchar_t* path){
     FILE* f = fopen(path_mb, "rb");
     if(!f){ fprintf(stderr,"[code] failed to open %s: %s\n",path_mb,strerror(errno)); return NULL; }
 #endif
-    fseek(f,0,SEEK_END); long len = ftell(f); fseek(f,0,SEEK_SET);
-    char* data = (char*)malloc(len+1);
-    if(!data){ fclose(f); return NULL; }
-#ifdef _WIN32
-    size_t r=fread(data,1,len,f);
-    if(r!=(size_t)len){ fwprintf(stderr,L"[code] failed to read %ls\n",path); free(data); fclose(f); return NULL; }
-#else
-    size_t r=fread(data,1,len,f);
-    if(r!=(size_t)len){ fprintf(stderr,"[code] failed to read %s\n",path_mb); free(data); fclose(f); return NULL; }
-#endif
-    data[len]=0; fclose(f);
 
-    size_t cap = len*2 + 1; size_t l=0; char* out = (char*)malloc(cap);
-    if(!out){ free(data); return NULL; }
+    // Check file size first to prevent parsing huge files
+    fseek(f,0,SEEK_END);
+    long file_size = ftell(f);
+    fseek(f,0,SEEK_SET);
+
+    if(file_size > MAX_FILE_SIZE_FOR_PARSING){
+#ifdef _WIN32
+        fwprintf(stderr,L"[code] file %ls is too large (%ld bytes), skipping\n",path, file_size);
+#else
+        fprintf(stderr,"[code] file %s is too large (%ld bytes), skipping\n",path_mb, file_size);
+#endif
+        fclose(f);
+        return NULL;
+    }
+
+    // Use streaming line-by-line processing with fixed buffer
+    size_t cap = 4096;
+    size_t l = 0;
+    char* out = (char*)malloc(cap);
+    if(!out){ fclose(f); return NULL; }
     out[0]=0;
 
-    char* ctx = NULL;
-#ifdef _WIN32
-    char* line = strtok_s(data, "\n\r", &ctx);
-#else
-    char* line = strtok_r(data, "\n\r", &ctx);
-#endif
-    while(line){
+    char line[MAX_LINE_LENGTH];
+    while(fgets(line, sizeof(line), f)){
+        // Remove newline characters
+        size_t len = strlen(line);
+        while(len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')){
+            line[--len] = 0;
+        }
         process_line(line,&out,&l,&cap);
-#ifdef _WIN32
-        line = strtok_s(NULL, "\n\r", &ctx);
-#else
-        line = strtok_r(NULL, "\n\r", &ctx);
-#endif
     }
+    fclose(f);
 
 #ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8,0,out,-1,NULL,0);
@@ -202,7 +208,7 @@ static wchar_t* parse_file(const wchar_t* path){
     wchar_t* wout = (wchar_t*)malloc(sizeof(wchar_t)*(wlen+1));
     if(wout) mbstowcs(wout, out, wlen+1);
 #endif
-    free(out); free(data);
+    free(out);
     return wout;
 }
 
