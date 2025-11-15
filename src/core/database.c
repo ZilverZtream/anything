@@ -28,6 +28,11 @@ typedef struct {
 } ExtensionEntry;
 
 typedef struct {
+    uint32_t trigram;    // 3-byte trigram key (padded to 4 bytes)
+    uint64_t string_id;  // string ID value
+} TrigramEntry;
+
+typedef struct {
     MDB_env* env;
     MDB_dbi  dbi_meta;
     MDB_dbi  dbi_strings;
@@ -42,6 +47,7 @@ typedef struct {
     MDB_dbi  dbi_extension_index; // key: utf8 ext   → rec_id (dups)
     MDB_dbi  dbi_path_hierarchy;  // key: parent_id  → rec_id (dups)
     MDB_dbi  dbi_trigram_index;   // key: 3 bytes    → string_id (dups)
+    MDB_dbi  dbi_string_trigrams; // key: string_id  → blob of trigram keys (for fast deletion)
     MDB_dbi  dbi_content_index;   // key: content_str_id → rec_id (dups)
     MDB_dbi  dbi_author_index;    // key: author_str_id  → rec_id (dups)
     MDB_dbi  dbi_camera_index;    // key: camera_str_id  → rec_id (dups)
@@ -822,12 +828,9 @@ static BOOL ensure_bloom_for_string(DbImpl* d, uint64_t str_id, MDB_val* value, 
         if(existing_meta->hash_count > 0 && existing_meta->bloom_length > 0 && !existing_meta->bloom_pending){
             return TRUE;
         }
-        if(existing_meta->bloom_pending){
-            bloom_generator_request(str_id);
-            return TRUE;
-        }
     }
 
+    // Generate bloom filter synchronously instead of deferring
     if(ctx->lower_len < 5){
         StringMeta sm; string_meta_init(&sm);
         sm.trigram_count = (uint32_t)ctx->trigram_count;
@@ -852,27 +855,46 @@ static BOOL ensure_bloom_for_string(DbImpl* d, uint64_t str_id, MDB_val* value, 
         return TRUE;
     }
 
-    StringMeta placeholder; string_meta_init(&placeholder);
-    placeholder.trigram_count = (uint32_t)ctx->trigram_count;
-    placeholder.bloom_pending = 1;
-    BOOL needs_update = TRUE;
-    if(meta_present){
-        needs_update = existing_meta->trigram_count != placeholder.trigram_count ||
-                       existing_meta->hash_count != 0 ||
-                       existing_meta->bloom_length != 0 ||
-                       existing_meta->bloom_offset != 0 ||
-                       existing_meta->bloom_log2 != 0 ||
-                       existing_meta->bloom_pending != 1;
-    }
-    if(needs_update){
-        if(!string_value_update(d, str_id, value, &placeholder)){
-            set_error(d, DB_ERROR_OS, 0, "failed to update string meta with placeholder");
+    // Generate bloom filter immediately
+    uint8_t bloom[8192];
+    uint32_t tc = build_bloom_from_context(ctx, bloom);
+
+    StringMeta sm; string_meta_init(&sm);
+    sm.trigram_count = tc ? tc : (uint32_t)ctx->trigram_count;
+    sm.bloom_pending = 0;
+
+    if(ctx->bloom_bytes > 0 && ctx->hash_count > 0 && tc > 0){
+        uint8_t encoded[8192 + 1024];
+        size_t bloom_bytes = ctx->bloom_bytes;
+        size_t enc_len = bloom_packbits_compress(bloom, bloom_bytes, encoded, sizeof(encoded));
+        const uint8_t* out_data = bloom;
+        size_t out_len = bloom_bytes;
+        if(enc_len > 0 && enc_len < bloom_bytes){
+            out_data = encoded;
+            out_len = enc_len;
+        }
+
+        uint64_t bloom_offset = 0;
+        if(!bloom_storage_append(d, out_data, out_len, &bloom_offset)){
             return FALSE;
         }
-        d->dirty = TRUE;
+
+        uint32_t hash_count = ctx->hash_count;
+        if(hash_count > UINT8_MAX){
+            hash_count = UINT8_MAX;
+        }
+        sm.hash_count = (uint8_t)hash_count;
+        sm.bloom_log2 = bloom_bytes_to_log2(bloom_bytes);
+        sm.bloom_length = (uint32_t)out_len;
+        sm.bloom_offset = bloom_offset;
     }
-    if(existing_meta) *existing_meta = placeholder;
-    bloom_generator_request(str_id);
+
+    if(!string_value_update(d, str_id, value, &sm)){
+        set_error(d, DB_ERROR_OS, 0, "failed to update string meta with bloom");
+        return FALSE;
+    }
+    d->dirty = TRUE;
+    if(existing_meta) *existing_meta = sm;
     return TRUE;
 }
 
@@ -1459,6 +1481,7 @@ static int open_content_dbs(MDB_txn* txn, DbImpl* d, BOOL create){
     unsigned int flags = create? MDB_CREATE:0;
     int rc;
     if((rc = mdb_dbi_open(txn, "trigram_index", flags|MDB_DUPSORT, &d->dbi_trigram_index))) return rc;
+    if((rc = mdb_dbi_open(txn, "string_trigrams", flags, &d->dbi_string_trigrams))) return rc;
     if((rc = mdb_dbi_open(txn, "content_index", flags|MDB_DUPSORT, &d->dbi_content_index))) return rc;
     if((rc = mdb_dbi_open(txn, "author_index", flags|MDB_DUPSORT, &d->dbi_author_index))) return rc;
     if((rc = mdb_dbi_open(txn, "camera_index", flags|MDB_DUPSORT, &d->dbi_camera_index))) return rc;
@@ -2333,6 +2356,131 @@ static int compare_u32(const void* a, const void* b){
     return 0;
 }
 
+static int compare_trigram_entry(const void* a, const void* b){
+    const TrigramEntry* ea = (const TrigramEntry*)a;
+    const TrigramEntry* eb = (const TrigramEntry*)b;
+    // First sort by trigram
+    if(ea->trigram < eb->trigram) return -1;
+    if(ea->trigram > eb->trigram) return 1;
+    // Then by string_id for deterministic ordering
+    if(ea->string_id < eb->string_id) return -1;
+    if(ea->string_id > eb->string_id) return 1;
+    return 0;
+}
+
+// Collect trigrams for batch writing instead of immediate emission
+static BOOL collect_trigrams(TrigramEntry** entries, size_t* count, size_t* capacity,
+                             uint64_t string_id, NameBloomContext* ctx){
+    if(!entries || !count || !capacity || !ctx) return FALSE;
+    if(ctx->trigram_count == 0) return TRUE;
+
+    // Sort trigrams and remove duplicates
+    qsort(ctx->trigrams, ctx->trigram_count, sizeof(uint32_t), compare_u32);
+
+    // Count unique trigrams
+    size_t unique_count = 0;
+    for(size_t i = 0; i < ctx->trigram_count; i++){
+        if(i == 0 || ctx->trigrams[i] != ctx->trigrams[i-1]){
+            unique_count++;
+        }
+    }
+
+    // Ensure capacity
+    if(*count + unique_count > *capacity){
+        size_t newcap = *capacity ? (*capacity * 2) : 256;
+        while(newcap < *count + unique_count) newcap *= 2;
+        TrigramEntry* tmp = (TrigramEntry*)realloc(*entries, newcap * sizeof(TrigramEntry));
+        if(!tmp) return FALSE;
+        *entries = tmp;
+        *capacity = newcap;
+    }
+
+    // Add unique trigrams
+    for(size_t i = 0; i < ctx->trigram_count; i++){
+        uint32_t key = ctx->trigrams[i];
+        if(i > 0 && key == ctx->trigrams[i-1]) continue;
+
+        (*entries)[*count].trigram = key;
+        (*entries)[*count].string_id = string_id;
+        (*count)++;
+    }
+
+    return TRUE;
+}
+
+// Write all collected trigrams in a single sorted pass - MUCH faster than individual writes
+static BOOL write_trigrams_batch(DbImpl* d, TrigramEntry* entries, size_t count){
+    if(!d || count == 0) return TRUE;
+    if(!entries) return FALSE;
+
+    // Sort all trigrams by (trigram, string_id)
+    qsort(entries, count, sizeof(TrigramEntry), compare_trigram_entry);
+
+    // Write all trigrams using mdb_put with MDB_NODUPDATA
+    // LMDB will handle duplicates efficiently since data is sorted
+    for(size_t i = 0; i < count; i++){
+        uint32_t key = entries[i].trigram;
+        uint64_t val = entries[i].string_id;
+
+        MDB_val k = {.mv_data = &key, .mv_size = 3};
+        MDB_val v = {.mv_data = &val, .mv_size = sizeof(val)};
+
+        int rc = mdb_put(d->wtxn, d->dbi_trigram_index, &k, &v, MDB_NODUPDATA);
+        if(rc && rc != MDB_KEYEXIST){
+            set_mdb_error(d, rc);
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+// Store trigram list for a string (for efficient deletion)
+static BOOL store_string_trigrams(DbImpl* d, uint64_t string_id, NameBloomContext* ctx){
+    if(!d || !ctx) return FALSE;
+    if(ctx->trigram_count == 0) return TRUE;
+
+    // Sort and deduplicate trigrams
+    qsort(ctx->trigrams, ctx->trigram_count, sizeof(uint32_t), compare_u32);
+
+    // Count unique trigrams
+    size_t unique_count = 0;
+    for(size_t i = 0; i < ctx->trigram_count; i++){
+        if(i == 0 || ctx->trigrams[i] != ctx->trigrams[i-1]){
+            unique_count++;
+        }
+    }
+
+    // Pack unique trigrams (3 bytes each) into a blob
+    uint8_t* blob = (uint8_t*)malloc(unique_count * 3);
+    if(!blob) return FALSE;
+
+    size_t blob_idx = 0;
+    for(size_t i = 0; i < ctx->trigram_count; i++){
+        uint32_t tri = ctx->trigrams[i];
+        if(i > 0 && tri == ctx->trigrams[i-1]) continue;
+
+        blob[blob_idx++] = (uint8_t)(tri >> 16);
+        blob[blob_idx++] = (uint8_t)(tri >> 8);
+        blob[blob_idx++] = (uint8_t)tri;
+    }
+
+    // Store in dbi_string_trigrams
+    MDB_val k = {.mv_data = &string_id, .mv_size = sizeof(string_id)};
+    MDB_val v = {.mv_data = blob, .mv_size = unique_count * 3};
+
+    int rc = mdb_put(d->wtxn, d->dbi_string_trigrams, &k, &v, 0);
+    free(blob);
+
+    if(rc){
+        set_mdb_error(d, rc);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+// Old emit_trigrams kept for backward compatibility with other parts of code
 static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id, NameBloomContext* prepared){
     if(!d || !name_u8 || !name_u8[0]) return;
     NameBloomContext local;
@@ -2361,6 +2509,50 @@ static void emit_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id, Name
     if(need_release) name_bloom_context_release(ctx);
 }
 
+// Fast trigram removal using stored trigram list (no string re-reading or re-calculation)
+static void remove_trigrams_fast(DbImpl* d, uint64_t string_id){
+    if(!d || string_id == 0) return;
+
+    // Read stored trigram list from dbi_string_trigrams
+    MDB_val k = {.mv_data = &string_id, .mv_size = sizeof(string_id)};
+    MDB_val v;
+    int rc = mdb_get(d->wtxn, d->dbi_string_trigrams, &k, &v);
+
+    if(rc == MDB_NOTFOUND){
+        // No stored trigrams, nothing to delete
+        return;
+    }
+
+    if(rc != 0){
+        set_mdb_error(d, rc);
+        return;
+    }
+
+    // Trigrams are stored as packed 3-byte values
+    const uint8_t* blob = (const uint8_t*)v.mv_data;
+    size_t blob_len = v.mv_size;
+    size_t tri_count = blob_len / 3;
+
+    // Delete each trigram from the index
+    for(size_t i = 0; i < tri_count; i++){
+        uint32_t trigram = ((uint32_t)blob[i*3] << 16) |
+                          ((uint32_t)blob[i*3 + 1] << 8) |
+                          ((uint32_t)blob[i*3 + 2]);
+
+        MDB_val tk = {.mv_data = &trigram, .mv_size = 3};
+        MDB_val tv = {.mv_data = &string_id, .mv_size = sizeof(string_id)};
+
+        rc = mdb_del(d->wtxn, d->dbi_trigram_index, &tk, &tv);
+        if(rc && rc != MDB_NOTFOUND){
+            set_mdb_error(d, rc);
+        }
+    }
+
+    // Delete the stored trigram list
+    mdb_del(d->wtxn, d->dbi_string_trigrams, &k, NULL);
+}
+
+// Old remove_trigrams kept for backward compatibility
 static void remove_trigrams(DbImpl* d, const char* name_u8, uint64_t name_id){
     size_t len = strlen(name_u8);
     if(len < 3) return;
@@ -2529,6 +2721,7 @@ static BOOL db_put_records_internal(Db* db_,
     IndexEntry64* artist_entries = NULL; size_t artist_count = 0, artist_cap = 0;
     IndexEntry64* album_entries = NULL; size_t album_count = 0, album_cap = 0;
     IndexEntry64* title_entries = NULL; size_t title_count = 0, title_cap = 0;
+    TrigramEntry* trigram_entries = NULL; size_t trigram_count = 0, trigram_cap = 0;
 
     if(strings && string_count){
         for(size_t i = 0; i < string_count; ++i){
@@ -2720,7 +2913,18 @@ static BOOL db_put_records_internal(Db* db_,
                 name_bloom_context_release(&norm_ctx);
                 break;
             }
-            emit_trigrams(d, (const char*)normv.mv_data, r->normalized_name_str_id, &norm_ctx);
+            // Collect trigrams for batch write and store for efficient deletion
+            if(!collect_trigrams(&trigram_entries, &trigram_count, &trigram_cap, r->normalized_name_str_id, &norm_ctx)){
+                success = FALSE;
+                set_error(d, DB_ERROR_OS, 0, "failed to collect trigrams");
+                name_bloom_context_release(&norm_ctx);
+                break;
+            }
+            if(!store_string_trigrams(d, r->normalized_name_str_id, &norm_ctx)){
+                success = FALSE;
+                name_bloom_context_release(&norm_ctx);
+                break;
+            }
             name_bloom_context_release(&norm_ctx);
         } else if(success && have_name){
             NameBloomContext name_ctx;
@@ -2734,7 +2938,18 @@ static BOOL db_put_records_internal(Db* db_,
                 name_bloom_context_release(&name_ctx);
                 break;
             }
-            emit_trigrams(d, (const char*)namev.mv_data, r->name_str_id, &name_ctx);
+            // Collect trigrams for batch write and store for efficient deletion
+            if(!collect_trigrams(&trigram_entries, &trigram_count, &trigram_cap, r->name_str_id, &name_ctx)){
+                success = FALSE;
+                set_error(d, DB_ERROR_OS, 0, "failed to collect trigrams");
+                name_bloom_context_release(&name_ctx);
+                break;
+            }
+            if(!store_string_trigrams(d, r->name_str_id, &name_ctx)){
+                success = FALSE;
+                name_bloom_context_release(&name_ctx);
+                break;
+            }
             name_bloom_context_release(&name_ctx);
         }
         if(success && have_name){
@@ -2768,7 +2983,18 @@ static BOOL db_put_records_internal(Db* db_,
                     name_bloom_context_release(&content_ctx);
                     break;
                 }
-                emit_trigrams(d, (const char*)cvstr.mv_data, r->content_str_id, &content_ctx);
+                // Collect trigrams for batch write and store for efficient deletion
+                if(!collect_trigrams(&trigram_entries, &trigram_count, &trigram_cap, r->content_str_id, &content_ctx)){
+                    success = FALSE;
+                    set_error(d, DB_ERROR_OS, 0, "failed to collect trigrams");
+                    name_bloom_context_release(&content_ctx);
+                    break;
+                }
+                if(!store_string_trigrams(d, r->content_str_id, &content_ctx)){
+                    success = FALSE;
+                    name_bloom_context_release(&content_ctx);
+                    break;
+                }
                 name_bloom_context_release(&content_ctx);
             }
         }
@@ -2906,6 +3132,12 @@ static BOOL db_put_records_internal(Db* db_,
             rc = mdb_put(d->wtxn, d->dbi_title_index, &key, &val, MDB_NODUPDATA);
             if(rc && rc!=MDB_KEYEXIST){ success = FALSE; set_mdb_error(d,rc); }
         }
+        // Batch write all collected trigrams in a single sorted pass
+        if(success && trigram_count > 0){
+            if(!write_trigrams_batch(d, trigram_entries, trigram_count)){
+                success = FALSE;
+            }
+        }
     }
     if(success){
         MDB_val mkv, mvv; const char* H="header"; to_mdb_val(H, strlen(H), &mkv);
@@ -2987,6 +3219,7 @@ cleanup:
     free(artist_entries);
     free(album_entries);
     free(title_entries);
+    free(trigram_entries);
     free(request_refs);
     free(intern_strings);
     free(intern_needs_norm);
@@ -3044,20 +3277,18 @@ static BOOL db_delete_record(DbImpl* d, uint64_t id, const DbRecord* r){
             mdb_del(d->wtxn, d->dbi_extension_index, &ek, &ev);
         }
     }
-    MDB_val normv = (MDB_val){0};
-    if(r->normalized_name_str_id && str_by_id_with_retry(d, r->normalized_name_str_id, &normv, 5, NULL, NULL)){
-        remove_trigrams(d, (const char*)normv.mv_data, r->normalized_name_str_id);
-    } else if(have_name){
-        remove_trigrams(d, (const char*)namev.mv_data, r->name_str_id);
+
+    // Fast trigram deletion using stored trigram lists (no re-reading strings)
+    if(r->normalized_name_str_id){
+        remove_trigrams_fast(d, r->normalized_name_str_id);
+    } else if(r->name_str_id){
+        remove_trigrams_fast(d, r->name_str_id);
     }
 
     if(r->content_str_id){
         MDB_val ck,cv; to_mdb_val(&r->content_str_id, sizeof(r->content_str_id), &ck); to_mdb_val(&id, sizeof(id), &cv);
         mdb_del(d->wtxn, d->dbi_content_index, &ck, &cv);
-        MDB_val cvstr;
-        if(str_by_id_with_retry(d, r->content_str_id, &cvstr, 5, NULL, NULL)){
-            remove_trigrams(d, (const char*)cvstr.mv_data, r->content_str_id);
-        }
+        remove_trigrams_fast(d, r->content_str_id);
     }
 
     if(r->author_str_id){ MDB_val author_k,author_v; to_mdb_val(&r->author_str_id, sizeof(r->author_str_id), &author_k); to_mdb_val(&id, sizeof(id), &author_v); mdb_del(d->wtxn, d->dbi_author_index, &author_k, &author_v); }
