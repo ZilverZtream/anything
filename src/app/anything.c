@@ -2470,7 +2470,7 @@ static DWORD WINAPI DbWriterThread(void* p){
             ctx->consecutive_idle_waits = 0;
         }
 
-        if(wi->stage == INDEX_NAMES_ONLY || wi->op == WI_DELETE) push_live_update(wi);
+        if(wi->stage == INDEX_METADATA_LIGHT || wi->stage == INDEX_NAMES_ONLY || wi->op == WI_DELETE) push_live_update(wi);
         if(wi->op == WI_DELETE){
             db_delete_path(ctx->db, wi->parent_path, wi->name);
             batch_requires_sync = TRUE;
@@ -2485,44 +2485,7 @@ static DWORD WINAPI DbWriterThread(void* p){
         }
 
         DbRecord r = {0};
-        if(wi->stage == INDEX_NAMES_ONLY){
-            r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
-            r.attributes = wi->attributes;
-            wchar_t* parent_copy = dup_wstring_local(wi->parent_path);
-            wchar_t* name_copy = dup_wstring_local(wi->name);
-            if(!parent_copy || !name_copy){
-                if(parent_copy) free(parent_copy);
-                if(name_copy) free(name_copy);
-                release_work_item(wi);
-                success = FALSE;
-                goto cleanup;
-            }
-            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, parent_copy, &r.parent_str_id, NULL) ||
-               !writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, name_copy, &r.name_str_id, &r.normalized_name_str_id)){
-                release_work_item(wi);
-                success = FALSE;
-                goto cleanup;
-            }
-            buf[in_batch++] = r;
-            size_t backlog = writer_backlog_count(ctx);
-            if(backlog < 10000){
-                DbWorkItem* next = acquire_work_item();
-                if(next){
-                    wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
-                    wcscpy_s(next->name, MAX_PATH, wi->name);
-                    next->file_size = next->creation_time = next->modified_time = next->access_time = 0;
-                    next->attributes = wi->attributes;
-                    next->clone_id = 0;
-                    next->hash_crc = wi->hash_crc;
-                    next->hash_ready = wi->hash_ready;
-                    next->stage = INDEX_METADATA_LIGHT; next->op = WI_ADD;
-                    if(!writer_enqueue(ctx, next, "metadata-light")){
-                        release_work_item(next);
-                    }
-                }
-            }
-            release_work_item(wi);
-        } else if(wi->stage == INDEX_METADATA_LIGHT){
+        if(wi->stage == INDEX_METADATA_LIGHT){
             batch_requires_sync = TRUE;
             r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
             r.attributes = wi->attributes;
@@ -2541,26 +2504,25 @@ static DWORD WINAPI DbWriterThread(void* p){
                 success = FALSE;
                 goto cleanup;
             }
-            wchar_t full[MAX_LONG_PATH];
-            _snwprintf(full, MAX_LONG_PATH, L"%s\\%s", wi->parent_path, wi->name);
-            uint32_t attrs=0; uint64_t sz=0, ct=0, mt=0, at=0;
-            get_file_info_basic(full, &attrs, &sz, &ct, &mt, &at);
-            r.attributes = attrs;
-            r.file_size = sz;
-            r.creation_time = ct;
-            r.modified_time = mt;
-            r.access_time   = at;
+            // Metadata already fetched by scanner - no need to call get_file_info_basic()
+            r.file_size = wi->file_size;
+            r.creation_time = wi->creation_time;
+            r.modified_time = wi->modified_time;
+            r.access_time = wi->access_time;
             buf[in_batch++] = r;
-            if(!(attrs & FILE_ATTRIBUTE_DIRECTORY)){
+            if(!(wi->attributes & FILE_ATTRIBUTE_DIRECTORY)){
                 size_t backlog = writer_backlog_count(ctx);
                 if(backlog < 10000){
                     DbWorkItem* next = acquire_work_item();
                     if(next){
                         wcscpy_s(next->parent_path, MAX_LONG_PATH, wi->parent_path);
                         wcscpy_s(next->name, MAX_PATH, wi->name);
-                        next->file_size = sz; next->creation_time=ct; next->modified_time=mt; next->access_time=at;
-                        next->attributes = attrs;
-                        next->clone_id = 0;
+                        next->file_size = wi->file_size;
+                        next->creation_time = wi->creation_time;
+                        next->modified_time = wi->modified_time;
+                        next->access_time = wi->access_time;
+                        next->attributes = wi->attributes;
+                        next->clone_id = wi->clone_id;
                         next->hash_crc = wi->hash_crc;
                         next->hash_ready = wi->hash_ready;
                         next->stage = INDEX_FULL_CONTENT; next->op = WI_ADD;
@@ -2570,6 +2532,27 @@ static DWORD WINAPI DbWriterThread(void* p){
                     }
                 }
             }
+            release_work_item(wi);
+        } else if(wi->stage == INDEX_NAMES_ONLY){
+            // Fallback for virtual files (zip/PST entries) that don't have filesystem metadata
+            r.type = (wi->attributes & FILE_ATTRIBUTE_DIRECTORY) ? DB_REC_DIR : DB_REC_FILE;
+            r.attributes = wi->attributes;
+            wchar_t* parent_copy = dup_wstring_local(wi->parent_path);
+            wchar_t* name_copy = dup_wstring_local(wi->name);
+            if(!parent_copy || !name_copy){
+                if(parent_copy) free(parent_copy);
+                if(name_copy) free(name_copy);
+                release_work_item(wi);
+                success = FALSE;
+                goto cleanup;
+            }
+            if(!writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, parent_copy, &r.parent_str_id, NULL) ||
+               !writer_add_intern_request(&intern_requests, &intern_count, &intern_capacity, name_copy, &r.name_str_id, &r.normalized_name_str_id)){
+                release_work_item(wi);
+                success = FALSE;
+                goto cleanup;
+            }
+            buf[in_batch++] = r;
             release_work_item(wi);
         } else {
             batch_requires_sync = TRUE;

@@ -810,13 +810,29 @@ static BOOL frn_emit_resolved(USNScanner* s, const wchar_t* parent, const wchar_
     wi->preview = NULL;
     wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
     wcscpy_s(wi->name, MAX_PATH, name);
-    wi->file_size = 0;
-    wi->creation_time = wi->modified_time = wi->access_time = 0;
-    wi->attributes = attrs;
+
+    // Fetch metadata immediately to avoid re-queueing
+    wchar_t full[MAX_LONG_PATH];
+    _snwprintf(full, MAX_LONG_PATH, L"%s\\%s", parent, name);
+    uint32_t file_attrs = 0;
+    uint64_t sz = 0, ct = 0, mt = 0, at = 0;
+    if(get_file_info_basic(full, &file_attrs, &sz, &ct, &mt, &at)){
+        wi->attributes = file_attrs;
+        wi->file_size = sz;
+        wi->creation_time = ct;
+        wi->modified_time = mt;
+        wi->access_time = at;
+    } else {
+        // Fallback to USN record attributes if file is inaccessible
+        wi->attributes = attrs;
+        wi->file_size = 0;
+        wi->creation_time = wi->modified_time = wi->access_time = 0;
+    }
+
     wi->clone_id = 0;
     wi->hash_crc = 0;
     wi->hash_ready = FALSE;
-    wi->stage = INDEX_NAMES_ONLY;
+    wi->stage = INDEX_METADATA_LIGHT;  // Start at metadata stage
     wi->op = WI_ADD;
     if(!outq_push_blocking(s->outq, wi, s->cancel)){
         release_work_item(wi);
@@ -1032,13 +1048,29 @@ static DWORD WINAPI map_emit_worker(void* p){
         wi->preview = NULL;
         wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
         wcscpy_s(wi->name, MAX_PATH, e->name);
-        wi->file_size = 0;
-        wi->creation_time = wi->modified_time = wi->access_time = 0;
-        wi->attributes = e->attrs;
+
+        // Fetch metadata immediately to avoid re-queueing
+        wchar_t full[MAX_LONG_PATH];
+        _snwprintf(full, MAX_LONG_PATH, L"%s\\%s", parent, e->name);
+        uint32_t file_attrs = 0;
+        uint64_t sz = 0, ct = 0, mt = 0, at = 0;
+        if(get_file_info_basic(full, &file_attrs, &sz, &ct, &mt, &at)){
+            wi->attributes = file_attrs;
+            wi->file_size = sz;
+            wi->creation_time = ct;
+            wi->modified_time = mt;
+            wi->access_time = at;
+        } else {
+            // Fallback to FRN map attributes if file is inaccessible
+            wi->attributes = e->attrs;
+            wi->file_size = 0;
+            wi->creation_time = wi->modified_time = wi->access_time = 0;
+        }
+
         wi->clone_id = 0;
         wi->hash_crc = 0;
         wi->hash_ready = FALSE;
-        wi->stage = INDEX_NAMES_ONLY;
+        wi->stage = INDEX_METADATA_LIGHT;  // Start at metadata stage
         wi->op = WI_ADD;
         if(!outq_push_blocking(s->outq, wi, s->cancel)){
             release_work_item(wi);
