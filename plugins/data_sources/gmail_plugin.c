@@ -56,7 +56,7 @@ static void wi_free(void* p){
 #endif
 }
 
-static wchar_t g_oauth_token[256] = L"";
+static wchar_t g_oauth_token[4096] = L"";
 static PluginHost g_host;
 
 struct curl_buf{ char* data; size_t size; };
@@ -172,7 +172,7 @@ static BOOL init(const PluginHost* host){
     if(env){
         fprintf(stderr,"[gmail] WARNING: Using GMAIL_TOKEN from environment variable is insecure!\n");
         fprintf(stderr,"[gmail] Tokens should be stored in OS credential manager.\n");
-        to_wide(env,g_oauth_token,256);
+        to_wide(env,g_oauth_token,4096);
     } else {
         fprintf(stderr,"[gmail] GMAIL_TOKEN not set\n");
     }
@@ -180,7 +180,7 @@ static BOOL init(const PluginHost* host){
 }
 
 static void scan(void){
-    if(g_oauth_token[0]==L'\0') return; char token_utf8[256];
+    if(g_oauth_token[0]==L'\0') return; char token_utf8[4096];
     to_utf8(g_oauth_token,token_utf8,sizeof(token_utf8));
     char* resp=NULL; cJSON* root=NULL;
     if(!http_get("https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=5",token_utf8,&resp)){
