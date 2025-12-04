@@ -196,7 +196,7 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
         char* str = atomic_load_char((volatile char**)&c->string);
         if(!str){
             if(InterlockedCompareExchangePointer((PVOID*)&c->string, (PVOID)STRING_CACHE_BUSY, NULL) == NULL){
-                c->hash = h;
+                InterlockedExchange64((volatile LONG64*)&c->hash, (LONG64)h);
                 InterlockedExchange((volatile LONG*)&c->string_id, (LONG)id32);
                 InterlockedExchange64(&c->stamp, stamp);
                 InterlockedExchange((volatile LONG*)&c->hot, 1);
@@ -249,7 +249,7 @@ static void string_cache_insert(const char* s, uint64_t h, uint64_t id){
         if(expected == STRING_CACHE_BUSY) continue;
         if(InterlockedCompareExchangePointer((PVOID*)&victim->string, (PVOID)STRING_CACHE_BUSY, expected) == expected){
             if(expected) free(expected);
-            victim->hash = h;
+            InterlockedExchange64((volatile LONG64*)&victim->hash, (LONG64)h);
             InterlockedExchange((volatile LONG*)&victim->string_id, (LONG)id32);
             InterlockedExchange64(&victim->stamp, stamp);
             InterlockedExchange((volatile LONG*)&victim->hot, 1);
@@ -567,7 +567,16 @@ static BOOL name_bloom_context_prepare(const char* name_u8, NameBloomContext* ct
 
     size_t tri_count = len >= 3 ? (len - 2) : 0;
     BOOL use_tls_tris = tri_count <= TLS_FILENAME_CAP;
-    uint32_t* tris = tri_count ? (use_tls_tris ? g_bloom_tls_buffers.trigram_buf : (uint32_t*)malloc(tri_count * sizeof(uint32_t))) : g_bloom_tls_buffers.trigram_buf;
+    uint32_t* tris = g_bloom_tls_buffers.trigram_buf;
+    if(tri_count && !use_tls_tris){
+        // Check for integer overflow before allocation
+        if(tri_count > SIZE_MAX / sizeof(uint32_t)){
+            if(!use_tls_lower) free(lower);
+            name_bloom_context_init(ctx);
+            return FALSE;
+        }
+        tris = (uint32_t*)malloc(tri_count * sizeof(uint32_t));
+    }
     if(tri_count && !tris){
         if(!use_tls_lower) free(lower);
         name_bloom_context_init(ctx);
@@ -673,6 +682,8 @@ static BOOL string_value_update(DbImpl* d, uint64_t id, const MDB_val* current, 
     MDB_val text;
     db_string_value_parse(current, &text, NULL, NULL);
     size_t text_len = text.mv_size;
+    // Check for integer overflow before allocation
+    if(text_len > SIZE_MAX - sizeof(StringMeta)) return FALSE;
     size_t total = text_len + sizeof(StringMeta);
     uint8_t* buf = (uint8_t*)malloc(total);
     if(!buf) return FALSE;

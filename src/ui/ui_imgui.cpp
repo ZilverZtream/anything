@@ -586,11 +586,23 @@ static void open_file_os(const std::string& p){
     ((void(*)(id, SEL, id))objc_msgSend)(ws, sel_registerName("openURL:"), url);
     CFRelease(url);
 #elif defined(__ANDROID__)
-    std::string cmd = std::string("am start -a android.intent.action.VIEW -d \"file://") + p + "\"";
-    system(cmd.c_str());
+    // Use safe fork/exec instead of system() to avoid command injection
+    pid_t pid = fork();
+    if(pid == 0){
+        std::string uri = std::string("file://") + p;
+        execl("/system/bin/am", "am", "start", "-a", "android.intent.action.VIEW", "-d", uri.c_str(), (char*)NULL);
+        _exit(1);
+    }
 #else
-    std::string cmd = std::string("xdg-open \"") + p + "\"";
-    system(cmd.c_str());
+    // Use safe fork/exec instead of system() to avoid command injection
+    pid_t pid = fork();
+    if(pid == 0){
+        execl("/usr/bin/xdg-open", "xdg-open", p.c_str(), (char*)NULL);
+        // Fallback paths if xdg-open is not in standard location
+        execl("/bin/xdg-open", "xdg-open", p.c_str(), (char*)NULL);
+        execlp("xdg-open", "xdg-open", p.c_str(), (char*)NULL);
+        _exit(1);
+    }
 #endif
 }
 
@@ -608,11 +620,23 @@ static void open_folder_os(const std::string& p){
     ((void(*)(id, SEL, id))objc_msgSend)(ws, sel_registerName("openURL:"), url);
     CFRelease(url);
 #elif defined(__ANDROID__)
-    std::string cmd = std::string("am start -a android.intent.action.VIEW -d \"file://") + p + "\"";
-    system(cmd.c_str());
+    // Use safe fork/exec instead of system() to avoid command injection
+    pid_t pid = fork();
+    if(pid == 0){
+        std::string uri = std::string("file://") + p;
+        execl("/system/bin/am", "am", "start", "-a", "android.intent.action.VIEW", "-d", uri.c_str(), (char*)NULL);
+        _exit(1);
+    }
 #else
-    std::string cmd = std::string("xdg-open \"") + p + "\"";
-    system(cmd.c_str());
+    // Use safe fork/exec instead of system() to avoid command injection
+    pid_t pid = fork();
+    if(pid == 0){
+        execl("/usr/bin/xdg-open", "xdg-open", p.c_str(), (char*)NULL);
+        // Fallback paths if xdg-open is not in standard location
+        execl("/bin/xdg-open", "xdg-open", p.c_str(), (char*)NULL);
+        execlp("xdg-open", "xdg-open", p.c_str(), (char*)NULL);
+        _exit(1);
+    }
 #endif
 }
 
@@ -1413,7 +1437,8 @@ int run_ui(void){
     }
     sta.env = env;
     sta.queue = &result_queue;
-    strcpy(sta.db_path, u8db);
+    strncpy(sta.db_path, u8db, sizeof(sta.db_path) - 1);
+    sta.db_path[sizeof(sta.db_path) - 1] = '\0';
 
     std::vector<Result> all_items; // Dummy if needed
 
