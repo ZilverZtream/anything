@@ -397,6 +397,7 @@ typedef enum {
     CONTENT_NONE,
     CONTENT_TEXT,
     CONTENT_IFILTER,
+    CONTENT_OFFICE,
     CONTENT_EMAIL,
     CONTENT_EPUB
 #ifndef _WIN32
@@ -422,10 +423,13 @@ static ContentMode get_content_mode(const wchar_t* name){
        _wcsicmp(ext,L"sql")==0)
         return CONTENT_TEXT;
 
-    if(_wcsicmp(ext,L"pdf")==0  || _wcsicmp(ext,L"doc")==0  ||
-       _wcsicmp(ext,L"docx")==0 || _wcsicmp(ext,L"ppt")==0  ||
-       _wcsicmp(ext,L"pptx")==0 || _wcsicmp(ext,L"xls")==0  ||
-       _wcsicmp(ext,L"xlsx")==0)
+    // Modern Office formats (ZIP-based XML) use native parser
+    if(_wcsicmp(ext,L"docx")==0 || _wcsicmp(ext,L"pptx")==0 || _wcsicmp(ext,L"xlsx")==0)
+        return CONTENT_OFFICE;
+
+    // Legacy formats and PDF still use IFilter
+    if(_wcsicmp(ext,L"pdf")==0 || _wcsicmp(ext,L"doc")==0 ||
+       _wcsicmp(ext,L"ppt")==0 || _wcsicmp(ext,L"xls")==0)
         return CONTENT_IFILTER;
 
     if(_wcsicmp(ext,L"eml")==0 || _wcsicmp(ext,L"emlx")==0)
@@ -1190,6 +1194,8 @@ static BOOL index_file_content(const wchar_t* parent,
             }
             free(buf);
         }
+    } else if(mode == CONTENT_OFFICE){
+        wbuf = extract_office_content(path, &author_local, &title_local);
     } else if(mode == CONTENT_IFILTER){
         wbuf = extract_with_filter(path);
     } else if(mode == CONTENT_EMAIL){
