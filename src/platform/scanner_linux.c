@@ -135,7 +135,13 @@ static void* thread_proc(void* arg){
 FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* outQueue, CancelToken* cancelToken){
     (void)threads; (void)cancelToken;
     char tmp[PATH_MAX];
-    wcstombs(tmp, rootPath, PATH_MAX);
+    size_t converted = wcstombs(tmp, rootPath, PATH_MAX);
+    if(converted == (size_t)-1){
+        return NULL;
+    }
+    if(converted >= PATH_MAX){
+        tmp[PATH_MAX - 1] = '\0';
+    }
 #if !defined(__ANDROID__)
     struct statfs sfs;
     if(statfs(tmp, &sfs)==0){
@@ -151,7 +157,14 @@ FileScanner* FileScanner_Start(const wchar_t* rootPath, int threads, MPMCQueue* 
 #endif
     FileScanner* s = (FileScanner*)calloc(1, sizeof(FileScanner));
     if(!s) return NULL;
-    wcstombs(s->root, rootPath, PATH_MAX);
+    converted = wcstombs(s->root, rootPath, PATH_MAX);
+    if(converted == (size_t)-1){
+        free(s);
+        return NULL;
+    }
+    if(converted >= PATH_MAX){
+        s->root[PATH_MAX - 1] = '\0';
+    }
     s->outq = outQueue;
     s->cancel = cancelToken;
     s->inotify_fd = inotify_init1(0);
