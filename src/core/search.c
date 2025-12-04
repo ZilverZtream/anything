@@ -1132,7 +1132,14 @@ static void parse_query(int argc, wchar_t** argv, wchar_t* dbPath, SearchQuery* 
                 if(gt){ q->size_min=val+1; } else { q->size_max=val-1; }
             } else {
                 const char* dots=strstr(s,"..");
-                if(dots){ char a[64]={0},b[64]={0}; strncpy(a,s,(size_t)(dots-s)); strcpy(b,dots+2); q->size_min=parse_size(a); q->size_max=parse_size(b); }
+                if(dots){
+                    char a[64]={0},b[64]={0};
+                    strncpy(a,s,(size_t)(dots-s));
+                    a[sizeof(a)-1]='\0';
+                    strncpy(b,dots+2,sizeof(b)-1);
+                    b[sizeof(b)-1]='\0';
+                    q->size_min=parse_size(a); q->size_max=parse_size(b);
+                }
                 else { q->size_min=q->size_max=parse_size(s); }
             }
         } else if(_strnicmp(u8,"dm:",3)==0){
@@ -1141,7 +1148,15 @@ static void parse_query(int argc, wchar_t** argv, wchar_t* dbPath, SearchQuery* 
                 BOOL gt=(s[0]=='>'); s++; uint64_t day; if(parse_date(s,&day)){ if(gt){ q->date_min_day=day+1; } else { q->date_max_day=day-1; } }
             } else {
                 const char* dots=strstr(s,"..");
-                if(dots){ char a[64]={0},b[64]={0}; strncpy(a,s,(size_t)(dots-s)); strcpy(b,dots+2); uint64_t da,db; if(parse_date(a,&da)&&parse_date(b,&db)){ q->date_min_day=da; q->date_max_day=db; } }
+                if(dots){
+                    char a[64]={0},b[64]={0};
+                    strncpy(a,s,(size_t)(dots-s));
+                    a[sizeof(a)-1]='\0';
+                    strncpy(b,dots+2,sizeof(b)-1);
+                    b[sizeof(b)-1]='\0';
+                    uint64_t da,db;
+                    if(parse_date(a,&da)&&parse_date(b,&db)){ q->date_min_day=da; q->date_max_day=db; }
+                }
                 else { uint64_t d; if(parse_date(s,&d)){ q->date_min_day=d; q->date_max_day=d; } }
             }
         } else if(_strnicmp(u8,"path:",5)==0){

@@ -38,8 +38,16 @@ static void emit(FileScanner* s, const char* parent, const char* name, const str
     if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
     wi->content = NULL;
     wi->preview = NULL;
-    mbstowcs(wi->parent_path, parent, MAX_LONG_PATH);
-    mbstowcs(wi->name, name, MAX_PATH);
+    size_t parent_result = mbstowcs(wi->parent_path, parent, MAX_LONG_PATH);
+    if(parent_result == (size_t)-1){
+        free(wi);
+        return;
+    }
+    size_t name_result = mbstowcs(wi->name, name, MAX_PATH);
+    if(name_result == (size_t)-1){
+        free(wi);
+        return;
+    }
     wi->file_size = st->st_size;
     wi->creation_time = st->st_mtime;
     wi->modified_time = st->st_mtime;
@@ -57,10 +65,13 @@ static int enum_cb(const char* fpath, const struct stat* sb, int typeflag, struc
     const char* name = fpath + ftwbuf->base;
     char parent[PATH_MAX];
     if(ftwbuf->base > 0){
-        strncpy(parent, fpath, ftwbuf->base);
-        parent[ftwbuf->base-1] = '\0';
+        size_t copy_len = (ftwbuf->base < PATH_MAX) ? ftwbuf->base : (PATH_MAX - 1);
+        strncpy(parent, fpath, copy_len);
+        parent[copy_len] = '\0';
+        if(copy_len > 0) parent[copy_len-1] = '\0';
     } else {
-        strcpy(parent, fpath);
+        strncpy(parent, fpath, PATH_MAX - 1);
+        parent[PATH_MAX - 1] = '\0';
     }
     emit(s, parent, name, sb);
     if(typeflag == FTW_D){
@@ -76,8 +87,16 @@ static void process_event(FileScanner* s, struct inotify_event* ev){
         if(posix_memalign((void**)&wi, CACHE_LINE_SIZE, sizeof(DbWorkItem))!=0) return;
         wi->content = NULL;
         wi->preview = NULL;
-        mbstowcs(wi->parent_path, s->root, MAX_LONG_PATH);
-        mbstowcs(wi->name, ev->name, MAX_PATH);
+        size_t parent_result = mbstowcs(wi->parent_path, s->root, MAX_LONG_PATH);
+        if(parent_result == (size_t)-1){
+            free(wi);
+            return;
+        }
+        size_t name_result = mbstowcs(wi->name, ev->name, MAX_PATH);
+        if(name_result == (size_t)-1){
+            free(wi);
+            return;
+        }
         wi->file_size = wi->creation_time = wi->modified_time = wi->access_time = 0;
         wi->attributes = 0;
         wi->clone_id = 0;
@@ -91,7 +110,8 @@ static void process_event(FileScanner* s, struct inotify_event* ev){
     struct stat st;
     if(stat(full, &st)!=0) return;
     char parent[PATH_MAX];
-    strcpy(parent, s->root);
+    strncpy(parent, s->root, PATH_MAX - 1);
+    parent[PATH_MAX - 1] = '\0';
     emit(s, parent, ev->name, &st);
 }
 

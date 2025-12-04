@@ -73,9 +73,19 @@ static void process_commit(const wchar_t* repo_path, git_repository* repo, const
     size_t authlen = strlen(author);
     size_t msglen = message ? strlen(message) : 0;
     size_t difflen = buf.size;
-    char* total = (char*)malloc(authlen + msglen + difflen + 20);
+    // Check for integer overflow before allocation
+    size_t total_size = authlen + msglen + difflen + 20;
+    if(total_size < authlen || total_size < msglen || total_size < difflen){
+        git_buf_dispose(&buf);
+        git_diff_free(diff);
+        git_tree_free(commit_tree);
+        git_tree_free(parent_tree);
+        git_commit_free(commit);
+        return;
+    }
+    char* total = (char*)malloc(total_size);
     if(total){
-        int n = snprintf(total, authlen + msglen + difflen + 20, "Author: %s\n", author);
+        int n = snprintf(total, total_size, "Author: %s\n", author);
         if(message) memcpy(total + n, message, msglen);
         n += (int)msglen;
         if(difflen){
