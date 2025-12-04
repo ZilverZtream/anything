@@ -2931,7 +2931,9 @@ int wmain(int argc, wchar_t** argv){
     WaitForMultipleObjects(drive_count, drive_threads, TRUE, INFINITE);
     for(int i=0;i<drive_count;i++) CloseHandle(drive_threads[i]);
 
-    Plugin_ScanAll();
+    // Run Plugin_ScanAll() in a background thread to avoid blocking on network I/O
+    HANDLE plugin_thread = (HANDLE)_beginthreadex(NULL, 0,
+        (unsigned (__stdcall *)(void*))Plugin_ScanAll, NULL, 0, NULL);
 
     if(args.tail_changes && !args.all_drives){
         HANDLE tailer = StartUSNTailer(args.rootPath, &ctx.queue, &ctx.cancel);
@@ -2978,6 +2980,11 @@ int wmain(int argc, wchar_t** argv){
     }
     writer_backlog_destroy(&ctx);
     writer_signal_destroy(&ctx.data_signal);
+    // Wait for plugin thread to complete before unloading
+    if(plugin_thread){
+        WaitForSingleObject(plugin_thread, INFINITE);
+        CloseHandle(plugin_thread);
+    }
     Plugin_UnloadAll();
     bloom_generator_shutdown();
     db_close(db);

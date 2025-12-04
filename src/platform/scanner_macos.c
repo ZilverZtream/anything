@@ -38,6 +38,26 @@ struct FileScanner {
 static FileScanner* g_current;
 
 wchar_t* GenerateThumbnail(const wchar_t* path){
+    // Create a dedicated thumbnail cache directory
+    char cache_dir[PATH_MAX];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/anything_thumbnails", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
+    mkdir(cache_dir, 0755); // Create if doesn't exist, ignore errors if it does
+
+    // Generate a hash-based filename to enable reuse
+    uint64_t hash = crc64(path, wcslen(path) * sizeof(wchar_t));
+    char thumb_path[PATH_MAX];
+    snprintf(thumb_path, sizeof(thumb_path), "%s/%016llx.png", cache_dir, hash);
+
+    // Check if thumbnail already exists
+    struct stat st;
+    if(stat(thumb_path, &st) == 0 && S_ISREG(st.st_mode)){
+        // Thumbnail already exists, reuse it
+        wchar_t wtmp[PATH_MAX];
+        mbstowcs(wtmp, thumb_path, PATH_MAX);
+        return wcsdup(wtmp);
+    }
+
+    // Generate new thumbnail
     CFStringRef cfPath = CFStringCreateWithCharacters(NULL, path, wcslen(path));
     if(!cfPath) return NULL;
     CFURLRef url = CFURLCreateWithFileSystemPath(NULL, cfPath, kCFURLPOSIXPathStyle, false);
@@ -47,11 +67,8 @@ wchar_t* GenerateThumbnail(const wchar_t* path){
     CGImageRef img = QLThumbnailImageCreate(NULL, url, size, NULL);
     CFRelease(url);
     if(!img) return NULL;
-    uuid_t id; uuid_generate(id);
-    char idstr[37]; uuid_unparse_lower(id, idstr);
-    char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "/tmp/%s.png", idstr);
-    CFURLRef dst = CFURLCreateFromFileSystemRepresentation(NULL, (UInt8*)tmp, strlen(tmp), false);
+
+    CFURLRef dst = CFURLCreateFromFileSystemRepresentation(NULL, (UInt8*)thumb_path, strlen(thumb_path), false);
     if(!dst){ CGImageRelease(img); return NULL; }
     CGImageDestinationRef dest = CGImageDestinationCreateWithURL(dst, kUTTypePNG, 1, NULL);
     if(!dest){ CFRelease(dst); CGImageRelease(img); return NULL; }
@@ -62,7 +79,7 @@ wchar_t* GenerateThumbnail(const wchar_t* path){
     CGImageRelease(img);
     if(!ok) return NULL;
     wchar_t wtmp[PATH_MAX];
-    mbstowcs(wtmp, tmp, PATH_MAX);
+    mbstowcs(wtmp, thumb_path, PATH_MAX);
     return wcsdup(wtmp);
 }
 
