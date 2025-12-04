@@ -9,6 +9,7 @@
 #include "anything/enterprise.h"
 #include <immintrin.h>
 #include <limits.h>
+#include <zstd.h>
 #pragma comment(lib, "shlwapi.lib")
 
 typedef struct {
@@ -618,6 +619,37 @@ static inline size_t bloom_log2_to_bytes(uint8_t log2){
     return 0;
 }
 
+#define STRING_COMPRESSION_NONE 0
+#define STRING_COMPRESSION_ZSTD 1
+
+static const size_t STRING_COMPRESSION_HEADER_SIZE = sizeof(uint64_t);
+
+typedef struct StringDecompressBuffer {
+    uint8_t* data;
+    size_t   capacity;
+} StringDecompressBuffer;
+
+static THREAD_LOCAL StringDecompressBuffer g_tls_string_decompress = {NULL, 0};
+
+static BOOL ensure_decompress_buffer(size_t size, MDB_val* out){
+    if(!out) return FALSE;
+    if(size == 0){
+        out->mv_data = NULL;
+        out->mv_size = 0;
+        return TRUE;
+    }
+    if(g_tls_string_decompress.capacity < size){
+        size_t new_cap = size;
+        uint8_t* tmp = (uint8_t*)realloc(g_tls_string_decompress.data, new_cap);
+        if(!tmp) return FALSE;
+        g_tls_string_decompress.data = tmp;
+        g_tls_string_decompress.capacity = new_cap;
+    }
+    out->mv_data = g_tls_string_decompress.data;
+    out->mv_size = size;
+    return TRUE;
+}
+
 static void string_meta_init(StringMeta* sm){
     if(!sm) return;
     ZeroMemory(sm, sizeof(*sm));
@@ -626,11 +658,71 @@ static void string_meta_init(StringMeta* sm){
     sm->bloom_pending = 0;
 }
 
+static BOOL string_value_encode(const char* text, size_t text_len, const StringMeta* meta, MDB_val* out, uint8_t** alloc_out){
+    if(!meta || !out || !alloc_out) return FALSE;
+    *alloc_out = NULL;
+
+    StringMeta meta_copy = *meta;
+    meta_copy._reserved[1] = 0;
+    meta_copy._reserved[2] = 0;
+
+    size_t meta_size = sizeof(StringMeta);
+    size_t plain_payload = text_len;
+    size_t best_payload = plain_payload;
+    uint8_t compression = STRING_COMPRESSION_NONE;
+
+    size_t max_compressed = text_len ? ZSTD_compressBound(text_len) : 0;
+    size_t header_size = (text_len && max_compressed > 0) ? STRING_COMPRESSION_HEADER_SIZE : 0;
+
+    size_t worst_case = meta_size;
+    if(header_size > SIZE_MAX - meta_size) return FALSE;
+    worst_case += header_size;
+    if(max_compressed > SIZE_MAX - worst_case) return FALSE;
+    worst_case += max_compressed;
+    if(worst_case < meta_size) return FALSE;
+
+    uint8_t* buffer = (uint8_t*)malloc(worst_case ? worst_case : meta_size);
+    if(!buffer) return FALSE;
+
+    if(text_len > 0 && max_compressed > 0){
+        size_t compressed_size = ZSTD_compress(buffer + STRING_COMPRESSION_HEADER_SIZE, max_compressed, text, text_len, ZSTD_CLEVEL_DEFAULT);
+        if(!ZSTD_isError(compressed_size) && compressed_size + STRING_COMPRESSION_HEADER_SIZE < text_len){
+            memcpy(buffer, &text_len, sizeof(uint64_t));
+            best_payload = compressed_size + STRING_COMPRESSION_HEADER_SIZE;
+            compression = STRING_COMPRESSION_ZSTD;
+        }
+    }
+
+    if(compression == STRING_COMPRESSION_NONE){
+        if(plain_payload + meta_size > worst_case){
+            uint8_t* tmp = (uint8_t*)realloc(buffer, plain_payload + meta_size);
+            if(!tmp){
+                free(buffer);
+                return FALSE;
+            }
+            buffer = tmp;
+        }
+        if(text_len > 0 && text){
+            memcpy(buffer, text, text_len);
+        }
+    }
+
+    meta_copy._reserved[0] = compression;
+    memcpy(buffer + best_payload, &meta_copy, meta_size);
+    out->mv_data = buffer;
+    out->mv_size = best_payload + meta_size;
+    *alloc_out = buffer;
+    return TRUE;
+}
+
 BOOL db_string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta_out, BOOL* has_meta){
     if(!value) return FALSE;
     BOOL present = FALSE;
+    BOOL ok = TRUE;
     size_t total = value->mv_size;
     const uint8_t* base = (const uint8_t*)value->mv_data;
+
+    StringMeta meta_tmp; string_meta_init(&meta_tmp);
 
     typedef struct {
         uint32_t trigram_count;
@@ -646,7 +738,7 @@ BOOL db_string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta
         const StringMeta* tail = (const StringMeta*)(base + total - sizeof(StringMeta));
         if(tail->magic0 == STRING_META_MAGIC0 && tail->magic1 == STRING_META_MAGIC1){
             present = TRUE;
-            if(meta_out) *meta_out = *tail;
+            meta_tmp = *tail;
             total -= sizeof(StringMeta);
         }
     }
@@ -654,45 +746,71 @@ BOOL db_string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta
         const StringMetaV1* legacy = (const StringMetaV1*)(base + total - sizeof(StringMetaV1));
         if(legacy->magic0 == STRING_META_MAGIC0 && legacy->magic1 == STRING_META_MAGIC1){
             present = TRUE;
-            if(meta_out){
-                string_meta_init(meta_out);
-                meta_out->trigram_count = legacy->trigram_count;
-                meta_out->hash_count = legacy->hash_count;
-                meta_out->bloom_log2 = legacy->bloom_log2;
-                meta_out->bloom_offset = legacy->bloom_offset;
-                meta_out->bloom_length = legacy->bloom_length;
-                meta_out->bloom_pending = 0;
-            }
+            string_meta_init(&meta_tmp);
+            meta_tmp.trigram_count = legacy->trigram_count;
+            meta_tmp.hash_count = legacy->hash_count;
+            meta_tmp.bloom_log2 = legacy->bloom_log2;
+            meta_tmp.bloom_offset = legacy->bloom_offset;
+            meta_tmp.bloom_length = legacy->bloom_length;
+            meta_tmp.bloom_pending = 0;
             total -= sizeof(StringMetaV1);
         }
     }
-    if(meta_out && !present){
-        string_meta_init(meta_out);
-    }
     if(text){
-        text->mv_data = value->mv_data;
-        text->mv_size = total;
+        const uint8_t* payload = base;
+        size_t payload_len = total;
+        if(present && meta_tmp._reserved[0] == STRING_COMPRESSION_ZSTD){
+            if(payload_len < STRING_COMPRESSION_HEADER_SIZE){
+                ok = FALSE;
+            } else {
+                uint64_t raw_len = 0;
+                memcpy(&raw_len, payload, sizeof(raw_len));
+                const uint8_t* compressed = payload + STRING_COMPRESSION_HEADER_SIZE;
+                size_t compressed_len = payload_len - STRING_COMPRESSION_HEADER_SIZE;
+                if(raw_len > SIZE_MAX){
+                    ok = FALSE;
+                } else if(!ensure_decompress_buffer((size_t)raw_len, text)){
+                    ok = FALSE;
+                } else {
+                    size_t decompressed = ZSTD_decompress(text->mv_data, (size_t)raw_len, compressed, compressed_len);
+                    if(ZSTD_isError(decompressed) || decompressed != raw_len){
+                        ok = FALSE;
+                    }
+                }
+            }
+        } else {
+            text->mv_data = value->mv_data;
+            text->mv_size = payload_len;
+        }
+    }
+    if(meta_out){
+        if(present){
+            *meta_out = meta_tmp;
+        } else {
+            string_meta_init(meta_out);
+        }
     }
     if(has_meta) *has_meta = present;
-    return present;
+    return ok && present;
 }
 
 static BOOL string_value_update(DbImpl* d, uint64_t id, const MDB_val* current, const StringMeta* meta){
     if(!d || !current || !meta || !d->wtxn) return FALSE;
     MDB_val text;
-    db_string_value_parse(current, &text, NULL, NULL);
-    size_t text_len = text.mv_size;
-    // Check for integer overflow before allocation
-    if(text_len > SIZE_MAX - sizeof(StringMeta)) return FALSE;
-    size_t total = text_len + sizeof(StringMeta);
-    uint8_t* buf = (uint8_t*)malloc(total);
-    if(!buf) return FALSE;
-    memcpy(buf, text.mv_data, text_len);
-    memcpy(buf + text_len, meta, sizeof(StringMeta));
+    StringMeta existing_meta; string_meta_init(&existing_meta);
+    if(!db_string_value_parse(current, &text, &existing_meta, NULL)) return FALSE;
+
+    StringMeta meta_copy = *meta;
+    meta_copy._reserved[0] = existing_meta._reserved[0];
+    meta_copy._reserved[1] = existing_meta._reserved[1];
+    meta_copy._reserved[2] = existing_meta._reserved[2];
+
     MDB_val key = {.mv_data=&id,.mv_size=sizeof(id)};
-    MDB_val val = {.mv_data=buf,.mv_size=total};
+    MDB_val val;
+    uint8_t* encoded = NULL;
+    if(!string_value_encode((const char*)text.mv_data, text.mv_size, &meta_copy, &val, &encoded)) return FALSE;
     int rc = mdb_put(d->wtxn, d->dbi_strings, &key, &val, 0);
-    free(buf);
+    free(encoded);
     if(rc) return FALSE;
     return TRUE;
 }
@@ -2175,19 +2293,16 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
 
             // Insert into dbi_strings (keyed by ID)
             MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-            size_t total_len = t->utf8_len + sizeof(StringMeta);
-            uint8_t* storage = (uint8_t*)malloc(total_len);
-            if(!storage){
+            StringMeta placeholder; string_meta_init(&placeholder);
+            MDB_val idval;
+            uint8_t* storage = NULL;
+            if(!string_value_encode(t->utf8, t->utf8_len, &placeholder, &idval, &storage)){
                 if(cursor_opened) mdb_cursor_close(rev_cursor);
                 d->header_cache.string_count = original_count;
                 set_error(d, DB_ERROR_OS, 0, "out of memory");
                 result = FALSE;
                 goto cleanup;
             }
-            memcpy(storage, t->utf8, t->utf8_len);
-            StringMeta placeholder; string_meta_init(&placeholder);
-            memcpy(storage + t->utf8_len, &placeholder, sizeof(placeholder));
-            MDB_val idval = {.mv_data = storage, .mv_size = total_len};
             rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
             free(storage);
             if(rc){
@@ -2367,19 +2482,16 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
 
                 // Insert into dbi_strings (keyed by ID)
                 MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-                size_t total_len = leader->normalized_len + sizeof(StringMeta);
-                uint8_t* storage = (uint8_t*)malloc(total_len);
-                if(!storage){
+                StringMeta placeholder; string_meta_init(&placeholder);
+                MDB_val idval;
+                uint8_t* storage = NULL;
+                if(!string_value_encode(leader->normalized_utf8, leader->normalized_len, &placeholder, &idval, &storage)){
                     if(cursor_opened) mdb_cursor_close(rev_cursor);
                     d->header_cache.string_count = original_count;
                     set_error(d, DB_ERROR_OS, 0, "out of memory");
                     result = FALSE;
                     goto cleanup;
                 }
-                memcpy(storage, leader->normalized_utf8, leader->normalized_len);
-                StringMeta placeholder; string_meta_init(&placeholder);
-                memcpy(storage + leader->normalized_len, &placeholder, sizeof(placeholder));
-                MDB_val idval = {.mv_data = storage, .mv_size = total_len};
                 rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
                 free(storage);
                 if(rc){
