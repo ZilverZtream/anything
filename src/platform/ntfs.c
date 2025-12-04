@@ -626,6 +626,7 @@ typedef struct USNScanner {
     ParentPathCacheEntry parent_cache[USN_PARENT_CACHE];
     size_t parent_cache_count;
     uint64_t parent_cache_clock;
+    CRITICAL_SECTION parent_cache_lock;  // Protects parent cache from concurrent access
     volatile LONG emit_budget;
     LONG emit_chunk;
 } USNScanner;
@@ -843,23 +844,27 @@ static BOOL frn_emit_resolved(USNScanner* s, const wchar_t* parent, const wchar_
 
 static BOOL usn_parent_cache_lookup(USNScanner* s, uint64_t parent_frn, wchar_t* parent, size_t cch){
     if(!s) return FALSE;
+    EnterCriticalSection(&s->parent_cache_lock);
+    BOOL found = FALSE;
     for(size_t i = 0; i < USN_PARENT_CACHE; ++i){
         ParentPathCacheEntry* entry = &s->parent_cache[i];
         if(entry->valid && entry->frn == parent_frn){
             if(wcscpy_s(parent, cch, entry->path) == 0){
                 entry->last_use = ++s->parent_cache_clock;
-                return TRUE;
+                found = TRUE;
             }
-            return FALSE;
+            break;
         }
     }
-    return FALSE;
+    LeaveCriticalSection(&s->parent_cache_lock);
+    return found;
 }
 
 static void usn_parent_cache_store(USNScanner* s, uint64_t parent_frn, const wchar_t* parent){
     if(!s || !parent){
         return;
     }
+    EnterCriticalSection(&s->parent_cache_lock);
     ParentPathCacheEntry* target = NULL;
     ParentPathCacheEntry* oldest = NULL;
     for(size_t i = 0; i < USN_PARENT_CACHE; ++i){
@@ -886,6 +891,7 @@ static void usn_parent_cache_store(USNScanner* s, uint64_t parent_frn, const wch
     wcscpy_s(target->path, MAX_LONG_PATH, parent);
     target->valid = TRUE;
     target->last_use = ++s->parent_cache_clock;
+    LeaveCriticalSection(&s->parent_cache_lock);
 }
 
 static void emit_direct_batched(USNScanner* s, PendingEmit* batch, size_t count){
@@ -1320,6 +1326,7 @@ NTFSScanner* NTFSScanner_Start(const wchar_t* volumeRoot, int threads, MPMCQueue
     s->emit_chunk = USN_EMIT_CHUNK_SIZE;
     s->emit_budget = 0;
     s->next_idx = -1;
+    InitializeCriticalSection(&s->parent_cache_lock);
 
     size_t root_cch = sizeof(s->volRoot) / sizeof(s->volRoot[0]);
     size_t prefix_cch = sizeof(s->volPrefix) / sizeof(s->volPrefix[0]);
@@ -1439,6 +1446,7 @@ void NTFSScanner_Free(NTFSScanner* s_){
         CloseHandle(s->hVol);
         s->hVol = INVALID_HANDLE_VALUE;
     }
+    DeleteCriticalSection(&s->parent_cache_lock);
     frnmap_free(&s->map);
     free(s);
 }

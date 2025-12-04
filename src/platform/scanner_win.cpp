@@ -154,6 +154,28 @@ wchar_t* GenerateThumbnail(const wchar_t* path){
     if(!ensure_thread_com_initialized()){
         return NULL;
     }
+
+    // Create a dedicated thumbnail cache directory
+    wchar_t cache_dir[MAX_PATH];
+    if(!GetTempPathW(MAX_PATH, cache_dir)){
+        return NULL;
+    }
+    wcscat_s(cache_dir, MAX_PATH, L"anything_thumbnails\\");
+    CreateDirectoryW(cache_dir, NULL); // Create if doesn't exist, ignore errors if it does
+
+    // Generate a hash-based filename to enable reuse
+    uint64_t hash = crc64(path, wcslen(path) * sizeof(wchar_t));
+    wchar_t thumb_path[MAX_PATH];
+    _snwprintf(thumb_path, MAX_PATH, L"%s%016llx.png", cache_dir, hash);
+
+    // Check if thumbnail already exists
+    DWORD attrs = GetFileAttributesW(thumb_path);
+    if(attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)){
+        // Thumbnail already exists, reuse it
+        return _wcsdup(thumb_path);
+    }
+
+    // Generate new thumbnail
     IShellItemImageFactory* factory = NULL;
     if(FAILED(SHCreateItemFromParsingName(path, NULL, IID_PPV_ARGS(&factory)))){
         return NULL;
@@ -165,18 +187,12 @@ wchar_t* GenerateThumbnail(const wchar_t* path){
     if(FAILED(hr)){
         return NULL;
     }
-    wchar_t tmp[MAX_PATH];
-    if(!GetTempFileNameW(L"", L"ath", 0, tmp)){
-        DeleteObject(hbmp);
-        return NULL;
-    }
-    DeleteFileW(tmp);
-    wcscat_s(tmp, MAX_PATH, L".png");
-    if(!save_hbitmap_png(hbmp, tmp)){
+
+    if(!save_hbitmap_png(hbmp, thumb_path)){
         DeleteObject(hbmp);
         return NULL;
     }
     DeleteObject(hbmp);
-    return _wcsdup(tmp);
+    return _wcsdup(thumb_path);
 }
 #endif

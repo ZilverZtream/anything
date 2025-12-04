@@ -190,12 +190,28 @@ static wchar_t* parse_file(const wchar_t* path){
 
     char line[MAX_LINE_LENGTH];
     while(fgets(line, sizeof(line), f)){
-        // Remove newline characters
         size_t len = strlen(line);
+        // Check if line was truncated (no newline and buffer full)
+        BOOL line_truncated = (len > 0 && len == sizeof(line) - 1 &&
+                               line[len-1] != '\n' && line[len-1] != '\r');
+
+        // Remove newline characters
         while(len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')){
             line[--len] = 0;
         }
-        process_line(line,&out,&l,&cap);
+
+        // Only process complete lines to avoid matching partial keywords
+        if(!line_truncated){
+            process_line(line,&out,&l,&cap);
+        } else {
+            // Skip rest of the truncated line
+            while(fgets(line, sizeof(line), f)){
+                len = strlen(line);
+                if(len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')){
+                    break; // Found end of line
+                }
+            }
+        }
     }
     fclose(f);
 
