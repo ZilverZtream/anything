@@ -1144,6 +1144,17 @@ static DWORD WINAPI usn_thread(void* p){
             (unsigned long long)med.StartFileReferenceNumber,
             (unsigned long long)med.LowUsn,
             (unsigned long long)med.HighUsn);
+
+    // Check for journal wraparound: if NextUsn < FirstUsn, journal has wrapped
+    if(s->journal_info_valid && s->journal_info.NextUsn < s->journal_info.FirstUsn){
+        wprintf(L"WARNING: USN Journal has wrapped around (NextUsn: 0x%llx < FirstUsn: 0x%llx)\n",
+                (unsigned long long)s->journal_info.NextUsn,
+                (unsigned long long)s->journal_info.FirstUsn);
+        wprintf(L"Performing full MFT scan to rebuild index.\n");
+        // Force full scan by using full MFT range
+        using_journal_window = FALSE;
+    }
+
     DWORD bytes;
     frnmap_init(&s->map, 1<<18);
     if(start_in_streaming){
@@ -1439,16 +1450,104 @@ typedef struct TailCtx {
     MPMCQueue* outq;
     wchar_t root[8];
     HANDLE thread;
+    volatile BOOL journal_gap_detected;  // Flag indicating index is dirty
+    struct TailCtx* next;  // For linked list registry
 } TailCtx;
+
+// Global registry of active tailers (protected by critical section)
+#ifdef _WIN32
+static CRITICAL_SECTION g_tailer_registry_lock;
+#else
+static pthread_mutex_t g_tailer_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+static TailCtx* g_tailer_registry_head = NULL;
+static BOOL g_tailer_registry_initialized = FALSE;
+
+static void tailer_registry_init(void){
+    if(g_tailer_registry_initialized) return;
+#ifdef _WIN32
+    InitializeCriticalSection(&g_tailer_registry_lock);
+#endif
+    g_tailer_registry_initialized = TRUE;
+}
+
+static void tailer_registry_add(TailCtx* ctx){
+    if(!ctx) return;
+    tailer_registry_init();
+#ifdef _WIN32
+    EnterCriticalSection(&g_tailer_registry_lock);
+#else
+    pthread_mutex_lock(&g_tailer_registry_lock);
+#endif
+    ctx->next = g_tailer_registry_head;
+    g_tailer_registry_head = ctx;
+#ifdef _WIN32
+    LeaveCriticalSection(&g_tailer_registry_lock);
+#else
+    pthread_mutex_unlock(&g_tailer_registry_lock);
+#endif
+}
+
+static void tailer_registry_remove(TailCtx* ctx){
+    if(!ctx) return;
+#ifdef _WIN32
+    EnterCriticalSection(&g_tailer_registry_lock);
+#else
+    pthread_mutex_lock(&g_tailer_registry_lock);
+#endif
+    TailCtx** current = &g_tailer_registry_head;
+    while(*current){
+        if(*current == ctx){
+            *current = ctx->next;
+            break;
+        }
+        current = &(*current)->next;
+    }
+#ifdef _WIN32
+    LeaveCriticalSection(&g_tailer_registry_lock);
+#else
+    pthread_mutex_unlock(&g_tailer_registry_lock);
+#endif
+}
+
+static TailCtx* tailer_registry_find(HANDLE thread_handle){
+    if(!thread_handle) return NULL;
+    tailer_registry_init();
+#ifdef _WIN32
+    EnterCriticalSection(&g_tailer_registry_lock);
+#else
+    pthread_mutex_lock(&g_tailer_registry_lock);
+#endif
+    TailCtx* found = NULL;
+    TailCtx* current = g_tailer_registry_head;
+    while(current){
+        if(current->thread == thread_handle){
+            found = current;
+            break;
+        }
+        current = current->next;
+    }
+#ifdef _WIN32
+    LeaveCriticalSection(&g_tailer_registry_lock);
+#else
+    pthread_mutex_unlock(&g_tailer_registry_lock);
+#endif
+    return found;
+}
 
 static DWORD WINAPI tail_thread(void* p){
     TailCtx* t = (TailCtx*)p;
     DWORD bytes=0;
     BYTE* buf = (BYTE*)VirtualAlloc(NULL, 1024*1024, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-    if(!buf) return 0;
+    if(!buf){
+        tailer_registry_remove(t);
+        return 0;
+    }
     USN_JOURNAL_DATA_V0 jd={0};
     if(!DeviceIoControl(t->hVol, FSCTL_QUERY_USN_JOURNAL, NULL,0, &jd, sizeof(jd), &bytes, NULL)){
-        VirtualFree(buf,0,MEM_RELEASE); return 0;
+        VirtualFree(buf,0,MEM_RELEASE);
+        tailer_registry_remove(t);
+        return 0;
     }
     READ_USN_JOURNAL_DATA_V0 readData={0};
     readData.UsnJournalID = jd.UsnJournalID;
@@ -1456,9 +1555,48 @@ static DWORD WINAPI tail_thread(void* p){
     readData.ReasonMask = 0xFFFFFFFF;
     readData.BytesToWaitFor = 0; // poll
     readData.Timeout = 0;
+    USN last_usn = jd.NextUsn;
     for(;;){
         if(is_cancelled(t->cancel)) break;
+
+        // Periodically check for journal wraparound by re-querying journal info
+        static int iteration_count = 0;
+        if((++iteration_count % 100) == 0){
+            USN_JOURNAL_DATA_V0 current_jd={0};
+            DWORD check_bytes=0;
+            if(DeviceIoControl(t->hVol, FSCTL_QUERY_USN_JOURNAL, NULL,0, &current_jd, sizeof(current_jd), &check_bytes, NULL)){
+                // Check if our StartUsn is outside the valid journal range
+                if(readData.StartUsn < current_jd.FirstUsn || readData.StartUsn > current_jd.NextUsn){
+                    wprintf(L"CRITICAL: USN Journal gap detected! StartUsn: 0x%llx is outside valid range [0x%llx, 0x%llx]\n",
+                            (unsigned long long)readData.StartUsn,
+                            (unsigned long long)current_jd.FirstUsn,
+                            (unsigned long long)current_jd.NextUsn);
+                    wprintf(L"ERROR: Index is now CORRUPT. File changes were missed during gap.\n");
+                    wprintf(L"ACTION REQUIRED: Stop indexer and trigger full volume re-scan immediately.\n");
+                    // Set dirty flag - index cannot be trusted
+                    t->journal_gap_detected = TRUE;
+                    // Exit tailer - cannot continue with corrupted state
+                    VirtualFree(buf,0,MEM_RELEASE);
+                    tailer_registry_remove(t);
+                    return 1;
+                }
+            }
+        }
+
         if(!DeviceIoControl(t->hVol, FSCTL_READ_USN_JOURNAL, &readData, sizeof(readData), buf, 1024*1024, &bytes, NULL)){
+            DWORD err = GetLastError();
+            if(err == ERROR_JOURNAL_ENTRY_DELETED){
+                // Journal entry was deleted - gap detected, index is now corrupt
+                wprintf(L"CRITICAL: ERROR_JOURNAL_ENTRY_DELETED. StartUsn: 0x%llx no longer exists.\n",
+                        (unsigned long long)readData.StartUsn);
+                wprintf(L"ERROR: USN Journal has wrapped. File changes were LOST.\n");
+                wprintf(L"ACTION REQUIRED: Index is CORRUPT. Full volume re-scan mandatory.\n");
+                // Set dirty flag and exit - cannot continue with corrupted state
+                t->journal_gap_detected = TRUE;
+                VirtualFree(buf,0,MEM_RELEASE);
+                tailer_registry_remove(t);
+                return 1;
+            }
             Sleep(50); continue;
         }
         DWORD_PTR pRec = (DWORD_PTR)buf + sizeof(USN);
@@ -1567,6 +1705,7 @@ static DWORD WINAPI tail_thread(void* p){
         readData.StartUsn = *(USN*)buf;
     }
     VirtualFree(buf,0,MEM_RELEASE);
+    tailer_registry_remove(t);
     return 0;
 }
 
@@ -1576,9 +1715,45 @@ HANDLE StartUSNTailer(const wchar_t* volumeRoot, MPMCQueue* outQueue, CancelToke
     HANDLE hVol = CreateFileW(volprefix, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
     if(hVol==INVALID_HANDLE_VALUE) return NULL;
     TailCtx* t = (TailCtx*)calloc(1,sizeof(TailCtx));
+    if(!t){
+        CloseHandle(hVol);
+        return NULL;
+    }
     t->hVol=hVol; t->cancel=cancelToken; t->outq=outQueue;
+    t->journal_gap_detected = FALSE;
+    t->next = NULL;
     wcscpy_s(t->root, 8, volumeRoot);
     uintptr_t th = _beginthreadex(NULL,0,(unsigned (__stdcall *)(void*))tail_thread,t,0,NULL);
+    if(!th){
+        CloseHandle(hVol);
+        free(t);
+        return NULL;
+    }
     t->thread = (HANDLE)th;
+    tailer_registry_add(t);
     return t->thread;
+}
+
+BOOL USNTailer_IsIndexCorrupt(HANDLE tailer_handle){
+    if(!tailer_handle) return FALSE;
+    TailCtx* ctx = tailer_registry_find(tailer_handle);
+    if(!ctx) return FALSE;
+    return ctx->journal_gap_detected;
+}
+
+void USNTailer_Free(HANDLE tailer_handle){
+    if(!tailer_handle) return;
+    TailCtx* ctx = tailer_registry_find(tailer_handle);
+    if(!ctx) return;
+
+    // Wait for thread to exit
+    WaitForSingleObject(tailer_handle, INFINITE);
+    CloseHandle(tailer_handle);
+
+    // Clean up resources
+    if(ctx->hVol && ctx->hVol != INVALID_HANDLE_VALUE){
+        CloseHandle(ctx->hVol);
+    }
+    tailer_registry_remove(ctx);
+    free(ctx);
 }
