@@ -56,7 +56,7 @@ static void wi_free(void* p){
 #endif
 }
 
-static wchar_t g_oauth_token[256]=L"";
+static wchar_t g_oauth_token[4096]=L"";
 static wchar_t g_container[256]=L"iCloud.com.apple.mail";
 static wchar_t g_environment[64]=L"production";
 static PluginHost g_host;
@@ -148,7 +148,7 @@ static BOOL init(const PluginHost* host){
     if(env){
         fprintf(stderr,"[icloud] WARNING: Using ICLOUD_TOKEN from environment variable is insecure!\n");
         fprintf(stderr,"[icloud] Tokens should be stored in OS credential manager.\n");
-        to_wide(env,g_oauth_token,256);
+        to_wide(env,g_oauth_token,4096);
     }
 
     const char* c=getenv("ICLOUD_CONTAINER"); if(c) to_wide(c,g_container,256);
@@ -157,7 +157,7 @@ static BOOL init(const PluginHost* host){
 }
 
 static void scan(void){
-    if(g_oauth_token[0]==L'\0') return; char token_utf8[256]; to_utf8(g_oauth_token,token_utf8,sizeof(token_utf8));
+    if(g_oauth_token[0]==L'\0') return; char token_utf8[4096]; to_utf8(g_oauth_token,token_utf8,sizeof(token_utf8));
     char container_utf8[256]; to_utf8(g_container,container_utf8,sizeof(container_utf8));
     char env_utf8[64]; to_utf8(g_environment,env_utf8,sizeof(env_utf8));
     char url[512]; snprintf(url,sizeof(url),"https://api.apple-cloudkit.com/database/1/%s/%s/private/records/query",container_utf8,env_utf8);

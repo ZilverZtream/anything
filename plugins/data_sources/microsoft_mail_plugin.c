@@ -108,7 +108,7 @@ static BOOL http_get(const char* url,const char* token,char** out){
     if(out) *out=buf.data; else free(buf.data); return TRUE;
 }
 
-static wchar_t g_token[256]=L"";
+static wchar_t g_token[4096]=L"";
 static PluginHost g_host;
 
 #ifdef _WIN32
@@ -182,15 +182,16 @@ cleanup:
 
 // Verifies that a file is only accessible by the current user on Windows
 // Returns TRUE if secure, FALSE if insecure or on error
-static BOOL verify_windows_acl(const char* path){
+// SECURITY: Uses file handle instead of path to prevent TOCTOU vulnerabilities
+static BOOL verify_windows_acl(HANDLE hFile){
     PSECURITY_DESCRIPTOR pSD = NULL;
     PACL pDacl = NULL;
     PSID pOwnerSid = NULL;
     BOOL result = FALSE;
 
-    // Get the security descriptor for the file
-    DWORD dwRes = GetNamedSecurityInfoA(
-        path,
+    // Get the security descriptor for the file by handle (not path)
+    DWORD dwRes = GetSecurityInfo(
+        hFile,
         SE_FILE_OBJECT,
         DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
         &pOwnerSid,
@@ -201,7 +202,7 @@ static BOOL verify_windows_acl(const char* path){
     );
 
     if(dwRes != ERROR_SUCCESS){
-        fprintf(stderr, "[msmail] GetNamedSecurityInfo failed: error %lu\n", dwRes);
+        fprintf(stderr, "[msmail] GetSecurityInfo failed: error %lu\n", dwRes);
         return FALSE;
     }
 
@@ -296,7 +297,7 @@ static BOOL load_token(void){
     if(env){
         fprintf(stderr,"[msmail] WARNING: Using MS_MAIL_TOKEN from environment variable is insecure!\n");
         fprintf(stderr,"[msmail] Tokens should be stored in OS credential manager or secure file with 0600 permissions.\n");
-        to_wide(env,g_token,256);
+        to_wide(env,g_token,4096);
         return TRUE;
     }
 
@@ -320,8 +321,16 @@ static BOOL load_token(void){
 
     // Verify file permissions on all platforms
 #ifdef _WIN32
-    // On Windows, verify ACL using GetSecurityInfo
-    if(!verify_windows_acl(path_u8)){
+    // On Windows, verify ACL using GetSecurityInfo on the file handle
+    // This prevents TOCTOU vulnerabilities by checking the same object we're reading
+    int fd = _fileno(f);
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    if(hFile == INVALID_HANDLE_VALUE){
+        fprintf(stderr,"[msmail] failed to get OS handle for %s\n", path_u8);
+        fclose(f);
+        return FALSE;
+    }
+    if(!verify_windows_acl(hFile)){
         fprintf(stderr,"[msmail] INSECURE PERMISSIONS on %s (must be readable only by current user)\n", path_u8);
         fclose(f);
         return FALSE;
@@ -340,10 +349,10 @@ static BOOL load_token(void){
     }
 #endif
 
-    char buf[256]; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f);
+    char buf[4096]; size_t n=fread(buf,1,sizeof(buf)-1,f); fclose(f);
     if(n==0){ fprintf(stderr,"[msmail] token file %s empty or unreadable\n",path_u8); return FALSE; }
     buf[n]=0; char* nl=strpbrk(buf,"\r\n"); if(nl) *nl=0;
-    to_wide(buf,g_token,256);
+    to_wide(buf,g_token,4096);
     return g_token[0]!=L'\0';
 }
 
@@ -390,7 +399,7 @@ static BOOL init(const PluginHost* host){
 
     const char* store_path=getenv("MS_MAIL_TOKEN_STORE");
     if(store_path){
-        char tok_u8[256]; to_utf8(g_token,tok_u8,sizeof(tok_u8));
+        char tok_u8[4096]; to_utf8(g_token,tok_u8,sizeof(tok_u8));
         FILE* f=fopen(store_path,"wb");
         if(!f){
             fprintf(stderr,"[msmail] cannot write token store %s: %s\n",store_path,strerror(errno));
@@ -416,7 +425,7 @@ static BOOL init(const PluginHost* host){
 }
 
 static void scan(void){
-    if(g_token[0]==L'\0') return; char token_utf8[256];
+    if(g_token[0]==L'\0') return; char token_utf8[4096];
     to_utf8(g_token,token_utf8,sizeof(token_utf8));
     char* resp=NULL; cJSON* root=NULL;
     if(!http_get("https://graph.microsoft.com/v1.0/me/messages?$top=5",token_utf8,&resp)) goto cleanup;
