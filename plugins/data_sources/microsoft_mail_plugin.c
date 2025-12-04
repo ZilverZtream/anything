@@ -13,6 +13,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 #else
 #include <unistd.h>
 #include <sys/stat.h>
@@ -109,6 +111,183 @@ static BOOL http_get(const char* url,const char* token,char** out){
 static wchar_t g_token[256]=L"";
 static PluginHost g_host;
 
+#ifdef _WIN32
+// Sets ACL on a file to allow access only by the current user
+// Returns TRUE on success, FALSE on failure
+static BOOL set_owner_only_acl(const char* path){
+    HANDLE hToken = NULL;
+    PTOKEN_USER pTokenUser = NULL;
+    PACL pAcl = NULL;
+    EXPLICIT_ACCESSA ea;
+    BOOL success = FALSE;
+
+    // Get current user's SID
+    if(!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)){
+        fprintf(stderr, "[msmail] OpenProcessToken failed: error %lu\n", GetLastError());
+        return FALSE;
+    }
+
+    DWORD dwSize = 0;
+    GetTokenInformation(hToken, TokenUser, NULL, 0, &dwSize);
+    pTokenUser = (PTOKEN_USER)malloc(dwSize);
+    if(!pTokenUser){
+        CloseHandle(hToken);
+        return FALSE;
+    }
+
+    if(!GetTokenInformation(hToken, TokenUser, pTokenUser, dwSize, &dwSize)){
+        fprintf(stderr, "[msmail] GetTokenInformation failed: error %lu\n", GetLastError());
+        goto cleanup;
+    }
+
+    // Create an ACL that grants full control only to the current user
+    ZeroMemory(&ea, sizeof(EXPLICIT_ACCESSA));
+    ea.grfAccessPermissions = GENERIC_ALL;
+    ea.grfAccessMode = SET_ACCESS;
+    ea.grfInheritance = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea.Trustee.ptstrName = (LPSTR)pTokenUser->User.Sid;
+
+    DWORD dwRes = SetEntriesInAclA(1, &ea, NULL, &pAcl);
+    if(dwRes != ERROR_SUCCESS){
+        fprintf(stderr, "[msmail] SetEntriesInAcl failed: error %lu\n", dwRes);
+        goto cleanup;
+    }
+
+    // Apply the ACL to the file
+    dwRes = SetNamedSecurityInfoA(
+        (LPSTR)path,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        NULL,
+        NULL,
+        pAcl,
+        NULL
+    );
+
+    if(dwRes != ERROR_SUCCESS){
+        fprintf(stderr, "[msmail] SetNamedSecurityInfo failed: error %lu\n", dwRes);
+        goto cleanup;
+    }
+
+    success = TRUE;
+
+cleanup:
+    if(pAcl) LocalFree(pAcl);
+    if(pTokenUser) free(pTokenUser);
+    if(hToken) CloseHandle(hToken);
+    return success;
+}
+
+// Verifies that a file is only accessible by the current user on Windows
+// Returns TRUE if secure, FALSE if insecure or on error
+static BOOL verify_windows_acl(const char* path){
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    PACL pDacl = NULL;
+    PSID pOwnerSid = NULL;
+    BOOL result = FALSE;
+
+    // Get the security descriptor for the file
+    DWORD dwRes = GetNamedSecurityInfoA(
+        path,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+        &pOwnerSid,
+        NULL,
+        &pDacl,
+        NULL,
+        &pSD
+    );
+
+    if(dwRes != ERROR_SUCCESS){
+        fprintf(stderr, "[msmail] GetNamedSecurityInfo failed: error %lu\n", dwRes);
+        return FALSE;
+    }
+
+    // Get current user's SID
+    HANDLE hToken = NULL;
+    if(!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)){
+        fprintf(stderr, "[msmail] OpenProcessToken failed: error %lu\n", GetLastError());
+        LocalFree(pSD);
+        return FALSE;
+    }
+
+    DWORD dwSize = 0;
+    GetTokenInformation(hToken, TokenUser, NULL, 0, &dwSize);
+    PTOKEN_USER pTokenUser = (PTOKEN_USER)malloc(dwSize);
+    if(!pTokenUser){
+        CloseHandle(hToken);
+        LocalFree(pSD);
+        return FALSE;
+    }
+
+    if(!GetTokenInformation(hToken, TokenUser, pTokenUser, dwSize, &dwSize)){
+        fprintf(stderr, "[msmail] GetTokenInformation failed: error %lu\n", GetLastError());
+        free(pTokenUser);
+        CloseHandle(hToken);
+        LocalFree(pSD);
+        return FALSE;
+    }
+
+    PSID pCurrentUserSid = pTokenUser->User.Sid;
+
+    // Check if current user is the owner
+    if(!EqualSid(pCurrentUserSid, pOwnerSid)){
+        fprintf(stderr, "[msmail] INSECURE: Token file is not owned by current user\n");
+        free(pTokenUser);
+        CloseHandle(hToken);
+        LocalFree(pSD);
+        return FALSE;
+    }
+
+    // Check DACL entries
+    if(pDacl){
+        ACL_SIZE_INFORMATION aclSize;
+        if(GetAclInformation(pDacl, &aclSize, sizeof(aclSize), AclSizeInformation)){
+            // Well-known SIDs to check for unauthorized access
+            PSID pEveryoneSid = NULL;
+            PSID pUsersSid = NULL;
+            SID_IDENTIFIER_AUTHORITY worldAuth = SECURITY_WORLD_SID_AUTHORITY;
+            SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+
+            AllocateAndInitializeSid(&worldAuth, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &pEveryoneSid);
+            AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_USERS, 0, 0, 0, 0, 0, 0, &pUsersSid);
+
+            result = TRUE; // Assume secure unless we find a problem
+
+            for(DWORD i = 0; i < aclSize.AceCount; i++){
+                LPVOID pAce = NULL;
+                if(GetAce(pDacl, i, &pAce)){
+                    ACCESS_ALLOWED_ACE* pAllowedAce = (ACCESS_ALLOWED_ACE*)pAce;
+                    PSID pAceSid = (PSID)&pAllowedAce->SidStart;
+
+                    // Check if this ACE grants access to Everyone or Users group
+                    if((pEveryoneSid && EqualSid(pAceSid, pEveryoneSid)) ||
+                       (pUsersSid && EqualSid(pAceSid, pUsersSid))){
+                        // Check if this ACE grants read access
+                        if(pAllowedAce->Header.AceType == ACCESS_ALLOWED_ACE_TYPE &&
+                           (pAllowedAce->Mask & (FILE_GENERIC_READ | GENERIC_READ | FILE_READ_DATA))){
+                            fprintf(stderr, "[msmail] INSECURE PERMISSIONS: Token file is readable by other users\n");
+                            result = FALSE;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if(pEveryoneSid) FreeSid(pEveryoneSid);
+            if(pUsersSid) FreeSid(pUsersSid);
+        }
+    }
+
+    free(pTokenUser);
+    CloseHandle(hToken);
+    LocalFree(pSD);
+    return result;
+}
+#endif
+
 static BOOL load_token(void){
     // WARNING: Reading OAuth tokens from environment variables is INSECURE
     // Environment variables can be read by other processes
@@ -141,12 +320,11 @@ static BOOL load_token(void){
 
     // Verify file permissions on all platforms
 #ifdef _WIN32
-    // On Windows, check file is not world-readable
-    HANDLE hFile = CreateFileA(path_u8, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if(hFile != INVALID_HANDLE_VALUE){
-        // TODO: Add proper ACL check using GetSecurityInfo
-        fprintf(stderr,"[msmail] WARNING: Cannot verify file permissions on Windows. Ensure %s is only readable by current user.\n", path_u8);
-        CloseHandle(hFile);
+    // On Windows, verify ACL using GetSecurityInfo
+    if(!verify_windows_acl(path_u8)){
+        fprintf(stderr,"[msmail] INSECURE PERMISSIONS on %s (must be readable only by current user)\n", path_u8);
+        fclose(f);
+        return FALSE;
     }
 #else
     struct stat st;
@@ -219,18 +397,12 @@ static BOOL init(const PluginHost* host){
         }else{
             // Set secure permissions BEFORE writing sensitive data
 #ifdef _WIN32
-            // On Windows, close and reopen with secure ACL
+            // On Windows, write data first then set secure ACL
+            fwrite(tok_u8,1,strlen(tok_u8),f);
             fclose(f);
-            // Create file with restricted access (owner only)
-            SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, FALSE};
-            HANDLE hFile = CreateFileA(store_path, GENERIC_WRITE, 0, &sa,
-                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if(hFile == INVALID_HANDLE_VALUE){
-                fprintf(stderr,"[msmail] cannot create secure token store %s\n",store_path);
-            }else{
-                DWORD written;
-                WriteFile(hFile, tok_u8, (DWORD)strlen(tok_u8), &written, NULL);
-                CloseHandle(hFile);
+            // Set owner-only ACL after file creation
+            if(!set_owner_only_acl(store_path)){
+                fprintf(stderr,"[msmail] WARNING: Failed to set secure ACL on token store %s\n",store_path);
             }
 #else
             // On POSIX, set permissions before writing
