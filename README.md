@@ -29,7 +29,7 @@ Full-Text Content Search: The core of "Anything". It indexes the text content of
 
 Source Code: Indexes plain text from .c, .cpp, .h, .py, .java, .cs, and many more.
 
-Documents & Emails: Uses native OS interfaces (IFilter on Windows) to extract text from .pdf, .docx, .pptx, and email files like .eml and .pst.
+Documents & Emails: Modern Office files (.docx, .xlsx, .pptx) are parsed natively by extracting text directly from their ZIP-based XML content—10x-50x faster than IFilter and more stable. Legacy formats (.doc, .xls, .ppt) and PDF files still use IFilter on Windows. Email files (.eml, .pst) are parsed with specialized handlers.
 
 Rich, GPU-Accelerated UI: The interface is built with ImGui and features a Direct2D backend on Windows for an exceptionally smooth, high-framerate experience that remains fluid even when scrolling through millions of results.
 

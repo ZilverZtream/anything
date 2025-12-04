@@ -64,6 +64,7 @@ extern "C" {
 #include "anything/database.h"
 #include "anything/enterprise.h"
 #include "anything/metadata.h"
+#include "anything/office_parser.h"
 #include "anything/plugin.h"
 #include "anything/result.h"
 #include "anything/scanner.h"
