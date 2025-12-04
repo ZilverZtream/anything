@@ -68,7 +68,7 @@ typedef struct {
     uint64_t bloom_offset;
     uint32_t bloom_length;
     uint8_t  bloom_pending;
-    uint8_t  _reserved[3];
+    uint8_t  _reserved[3]; // _reserved[0] stores compression codec for the string payload
 } StringMeta;
 
 typedef struct {
