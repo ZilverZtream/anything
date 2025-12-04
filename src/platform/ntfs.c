@@ -1144,6 +1144,17 @@ static DWORD WINAPI usn_thread(void* p){
             (unsigned long long)med.StartFileReferenceNumber,
             (unsigned long long)med.LowUsn,
             (unsigned long long)med.HighUsn);
+
+    // Check for journal wraparound: if NextUsn < FirstUsn, journal has wrapped
+    if(s->journal_info_valid && s->journal_info.NextUsn < s->journal_info.FirstUsn){
+        wprintf(L"WARNING: USN Journal has wrapped around (NextUsn: 0x%llx < FirstUsn: 0x%llx)\n",
+                (unsigned long long)s->journal_info.NextUsn,
+                (unsigned long long)s->journal_info.FirstUsn);
+        wprintf(L"Performing full MFT scan to rebuild index.\n");
+        // Force full scan by using full MFT range
+        using_journal_window = FALSE;
+    }
+
     DWORD bytes;
     frnmap_init(&s->map, 1<<18);
     if(start_in_streaming){
@@ -1456,9 +1467,45 @@ static DWORD WINAPI tail_thread(void* p){
     readData.ReasonMask = 0xFFFFFFFF;
     readData.BytesToWaitFor = 0; // poll
     readData.Timeout = 0;
+    USN last_usn = jd.NextUsn;
     for(;;){
         if(is_cancelled(t->cancel)) break;
+
+        // Periodically check for journal wraparound by re-querying journal info
+        static int iteration_count = 0;
+        if((++iteration_count % 100) == 0){
+            USN_JOURNAL_DATA_V0 current_jd={0};
+            DWORD check_bytes=0;
+            if(DeviceIoControl(t->hVol, FSCTL_QUERY_USN_JOURNAL, NULL,0, &current_jd, sizeof(current_jd), &check_bytes, NULL)){
+                // Check if our StartUsn is outside the valid journal range
+                if(readData.StartUsn < current_jd.FirstUsn || readData.StartUsn > current_jd.NextUsn){
+                    wprintf(L"WARNING: USN Journal gap detected! StartUsn: 0x%llx is outside valid range [0x%llx, 0x%llx]\n",
+                            (unsigned long long)readData.StartUsn,
+                            (unsigned long long)current_jd.FirstUsn,
+                            (unsigned long long)current_jd.NextUsn);
+                    wprintf(L"Journal may have wrapped. Missed changes - full re-scan recommended.\n");
+                    // Reset to current NextUsn to continue from now
+                    readData.StartUsn = current_jd.NextUsn;
+                    last_usn = current_jd.NextUsn;
+                }
+            }
+        }
+
         if(!DeviceIoControl(t->hVol, FSCTL_READ_USN_JOURNAL, &readData, sizeof(readData), buf, 1024*1024, &bytes, NULL)){
+            DWORD err = GetLastError();
+            if(err == ERROR_JOURNAL_ENTRY_DELETED){
+                // Journal entry was deleted - gap detected
+                wprintf(L"ERROR: Journal entry deleted. StartUsn: 0x%llx no longer exists. Full re-scan needed.\n",
+                        (unsigned long long)readData.StartUsn);
+                // Try to recover by querying current journal state
+                USN_JOURNAL_DATA_V0 recovery_jd={0};
+                DWORD recovery_bytes=0;
+                if(DeviceIoControl(t->hVol, FSCTL_QUERY_USN_JOURNAL, NULL,0, &recovery_jd, sizeof(recovery_jd), &recovery_bytes, NULL)){
+                    readData.StartUsn = recovery_jd.NextUsn;
+                    last_usn = recovery_jd.NextUsn;
+                    wprintf(L"Recovered by jumping to NextUsn: 0x%llx\n", (unsigned long long)recovery_jd.NextUsn);
+                }
+            }
             Sleep(50); continue;
         }
         DWORD_PTR pRec = (DWORD_PTR)buf + sizeof(USN);

@@ -1398,6 +1398,8 @@ int run_ui(void){
     bool need_sort = true;
     bool indexing_active = false;
     uint64_t indexing_progress = 0;
+    double last_query_change_time = 0.0;
+    const double DEBOUNCE_DELAY_SECONDS = 0.3;
     Db* db = nullptr;
     const DbHeader* header;
 #ifdef _WIN32
@@ -1457,16 +1459,20 @@ int run_ui(void){
     };
 
     auto update_results = [&]() {
-        if (search_th.joinable()) {
+        // Don't block - just check if previous search is done
+        if (search_th.joinable() && search_done) {
             search_th.join();
         }
-        drain_result_queue();
-        clear_filtered_results();
-        search_done = false;
-        sta.query = query_str;
-        sta.filters = filters;
-        search_th = std::thread(search_thread, &sta);
-        need_sort = true;
+        // Only start new search if no search is running
+        if (!search_th.joinable()) {
+            drain_result_queue();
+            clear_filtered_results();
+            search_done = false;
+            sta.query = query_str;
+            sta.filters = filters;
+            search_th = std::thread(search_thread, &sta);
+            need_sort = true;
+        }
     };
 
     static const char* months[] = { "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
@@ -1508,7 +1514,9 @@ int run_ui(void){
                 bool query_edited = ImGui::IsItemEdited();
                 ImGui::SameLine();
                 if (ImGui::Button("Advanced")) show_advanced = !show_advanced;
-                if (query_edited) need_update = true;
+                if (query_edited) {
+                    last_query_change_time = glfwGetTime();
+                }
 
                 if(indexing_active){
                     ImGui::Text("Indexing %llu files...", static_cast<unsigned long long>(indexing_progress));
@@ -1761,7 +1769,17 @@ int run_ui(void){
             advanced_changed |= ImGui::Checkbox("Regex Mode", &filters.regex_mode);
             advanced_changed |= ImGui::Checkbox("Whole Word", &filters.whole_word);
             ImGui::End();
-            if (advanced_changed) need_update = true;
+            if (advanced_changed) {
+                last_query_change_time = glfwGetTime();
+            }
+        }
+
+        // Debounced search: only trigger after delay has passed
+        double current_time = glfwGetTime();
+        if (last_query_change_time > 0.0 &&
+            (current_time - last_query_change_time) >= DEBOUNCE_DELAY_SECONDS) {
+            need_update = true;
+            last_query_change_time = 0.0; // Reset to avoid repeated triggers
         }
 
         if (need_update) {
