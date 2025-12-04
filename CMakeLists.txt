@@ -29,6 +29,7 @@ find_package(unofficial-gumbo CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(libzip CONFIG REQUIRED)
+find_package(lz4 CONFIG REQUIRED)
 if(UNIX)
     find_package(libpst CONFIG REQUIRED)
 endif()
@@ -87,6 +88,7 @@ target_link_libraries(anything_core PUBLIC
     CURL::libcurl
     cjson
     libzip::zip
+    lz4::lz4
 )
 
 if(UNIX)

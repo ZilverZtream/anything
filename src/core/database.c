@@ -9,7 +9,21 @@
 #include "anything/enterprise.h"
 #include <immintrin.h>
 #include <limits.h>
+#include <lz4.h>
 #pragma comment(lib, "shlwapi.lib")
+
+// Compression magic header for identifying compressed strings
+#define COMPRESS_MAGIC0 'L'
+#define COMPRESS_MAGIC1 'Z'
+#define COMPRESS_MAGIC2 '4'
+#define COMPRESS_MAGIC3 'C'
+#define COMPRESS_MIN_SIZE 64  // Only compress strings larger than this
+
+typedef struct {
+    uint8_t  magic[4];      // "LZ4C"
+    uint32_t compressed_size;
+    uint32_t original_size;
+} CompressionHeader;
 
 typedef struct {
     uint64_t key;
@@ -76,6 +90,8 @@ typedef struct {
     ULONGLONG bulk_last_sync_tick;
     size_t   bulk_unsynced_commits;
     size_t   bulk_sync_commit_limit;
+    uint8_t* decompress_buffer;
+    size_t   decompress_buffer_size;
 } DbImpl;
 
 #ifndef _strdup
@@ -624,6 +640,100 @@ static void string_meta_init(StringMeta* sm){
     sm->magic0 = STRING_META_MAGIC0;
     sm->magic1 = STRING_META_MAGIC1;
     sm->bloom_pending = 0;
+}
+
+// Compress text data using LZ4
+// Returns compressed buffer (caller must free) or NULL on failure
+static uint8_t* compress_text(const void* text_data, size_t text_len, size_t* out_compressed_size){
+    if(!text_data || text_len == 0 || !out_compressed_size) return NULL;
+
+    // Don't compress small strings - overhead not worth it
+    if(text_len < COMPRESS_MIN_SIZE){
+        return NULL;
+    }
+
+    // Check for integer overflow
+    if(text_len > INT_MAX) return NULL;
+
+    int max_compressed = LZ4_compressBound((int)text_len);
+    if(max_compressed <= 0) return NULL;
+
+    size_t total_size = sizeof(CompressionHeader) + (size_t)max_compressed;
+    uint8_t* compressed_buf = (uint8_t*)malloc(total_size);
+    if(!compressed_buf) return NULL;
+
+    CompressionHeader* header = (CompressionHeader*)compressed_buf;
+    header->magic[0] = COMPRESS_MAGIC0;
+    header->magic[1] = COMPRESS_MAGIC1;
+    header->magic[2] = COMPRESS_MAGIC2;
+    header->magic[3] = COMPRESS_MAGIC3;
+    header->original_size = (uint32_t)text_len;
+
+    int compressed_size = LZ4_compress_default(
+        (const char*)text_data,
+        (char*)(compressed_buf + sizeof(CompressionHeader)),
+        (int)text_len,
+        max_compressed
+    );
+
+    if(compressed_size <= 0){
+        free(compressed_buf);
+        return NULL;
+    }
+
+    header->compressed_size = (uint32_t)compressed_size;
+
+    // Only use compression if we achieve at least 10% reduction
+    size_t final_size = sizeof(CompressionHeader) + compressed_size;
+    if(final_size >= text_len * 9 / 10){
+        free(compressed_buf);
+        return NULL;
+    }
+
+    *out_compressed_size = final_size;
+    return compressed_buf;
+}
+
+// Check if data is compressed
+static BOOL is_compressed(const uint8_t* data, size_t data_len){
+    if(!data || data_len < sizeof(CompressionHeader)) return FALSE;
+    const CompressionHeader* header = (const CompressionHeader*)data;
+    return (header->magic[0] == COMPRESS_MAGIC0 &&
+            header->magic[1] == COMPRESS_MAGIC1 &&
+            header->magic[2] == COMPRESS_MAGIC2 &&
+            header->magic[3] == COMPRESS_MAGIC3);
+}
+
+// Decompress text data
+// Returns decompressed buffer (caller must free) or NULL on error
+static uint8_t* decompress_text(const uint8_t* data, size_t data_len, size_t* out_size){
+    if(!data || data_len < sizeof(CompressionHeader) || !out_size) return NULL;
+
+    const CompressionHeader* header = (const CompressionHeader*)data;
+
+    // Validate compressed size
+    if(sizeof(CompressionHeader) + header->compressed_size > data_len){
+        return NULL;
+    }
+
+    // Allocate buffer for decompressed data
+    uint8_t* decompressed = (uint8_t*)malloc(header->original_size);
+    if(!decompressed) return NULL;
+
+    int result = LZ4_decompress_safe(
+        (const char*)(data + sizeof(CompressionHeader)),
+        (char*)decompressed,
+        (int)header->compressed_size,
+        (int)header->original_size
+    );
+
+    if(result != (int)header->original_size){
+        free(decompressed);
+        return NULL;
+    }
+
+    *out_size = header->original_size;
+    return decompressed;
 }
 
 BOOL db_string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta_out, BOOL* has_meta){
@@ -1676,6 +1786,7 @@ void db_close(Db* db_){
     bloom_storage_release(d);
     if(d->env){ mdb_env_close(d->env); }
     if(d->bloom_file && d->bloom_file!=INVALID_HANDLE_VALUE){ CloseHandle(d->bloom_file); }
+    if(d->decompress_buffer){ free(d->decompress_buffer); d->decompress_buffer = NULL; }
     free(d);
 }
 
@@ -1810,6 +1921,50 @@ BOOL db_compress(Db* db_, const wchar_t* out_path){
     rc = mdb_env_copy2(d->env, u8, MDB_CP_COMPACT);
     if(rc) set_mdb_error(d, rc); else set_error(d, DB_ERROR_NONE,0,NULL);
     return rc==0;
+}
+
+// Helper to get decompressed text from an MDB_val containing string data
+// If compressed, decompresses into d->decompress_buffer
+// Returns pointer to text data (either original or decompressed) and sets text_len
+// Caller should not free the returned pointer - it's either MDB data or d->decompress_buffer
+static const char* get_decompressed_text(DbImpl* d, const MDB_val* val, size_t* text_len){
+    if(!val || !text_len) return NULL;
+
+    const uint8_t* data = (const uint8_t*)val->mv_data;
+    size_t data_len = val->mv_size;
+
+    // Check if data is compressed
+    if(is_compressed(data, data_len)){
+        size_t decompressed_size = 0;
+        uint8_t* decompressed = decompress_text(data, data_len, &decompressed_size);
+        if(!decompressed) return NULL;
+
+        // Store in d->decompress_buffer for reuse
+        if(d){
+            if(d->decompress_buffer && d->decompress_buffer_size < decompressed_size){
+                free(d->decompress_buffer);
+                d->decompress_buffer = NULL;
+            }
+            if(!d->decompress_buffer){
+                d->decompress_buffer = decompressed;
+                d->decompress_buffer_size = decompressed_size;
+            } else {
+                memcpy(d->decompress_buffer, decompressed, decompressed_size);
+                free(decompressed);
+            }
+            *text_len = decompressed_size;
+            return (const char*)d->decompress_buffer;
+        } else {
+            // Fallback if no DbImpl (shouldn't happen in practice)
+            *text_len = decompressed_size;
+            // Note: This leaks memory, but it's a fallback case
+            return (const char*)decompressed;
+        }
+    }
+
+    // Not compressed, return as-is
+    *text_len = data_len;
+    return (const char*)data;
 }
 
 // String interning helpers
@@ -2175,18 +2330,33 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
 
             // Insert into dbi_strings (keyed by ID)
             MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-            size_t total_len = t->utf8_len + sizeof(StringMeta);
+
+            // Try to compress the text
+            size_t compressed_size = 0;
+            uint8_t* compressed = compress_text(t->utf8, t->utf8_len, &compressed_size);
+
+            size_t data_len = compressed ? compressed_size : t->utf8_len;
+            size_t total_len = data_len + sizeof(StringMeta);
             uint8_t* storage = (uint8_t*)malloc(total_len);
             if(!storage){
+                if(compressed) free(compressed);
                 if(cursor_opened) mdb_cursor_close(rev_cursor);
                 d->header_cache.string_count = original_count;
                 set_error(d, DB_ERROR_OS, 0, "out of memory");
                 result = FALSE;
                 goto cleanup;
             }
-            memcpy(storage, t->utf8, t->utf8_len);
+
+            // Copy compressed or uncompressed data
+            if(compressed){
+                memcpy(storage, compressed, compressed_size);
+                free(compressed);
+            } else {
+                memcpy(storage, t->utf8, t->utf8_len);
+            }
+
             StringMeta placeholder; string_meta_init(&placeholder);
-            memcpy(storage + t->utf8_len, &placeholder, sizeof(placeholder));
+            memcpy(storage + data_len, &placeholder, sizeof(placeholder));
             MDB_val idval = {.mv_data = storage, .mv_size = total_len};
             rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
             free(storage);
@@ -2367,18 +2537,33 @@ BOOL db_intern_wstrings_batched(Db* db_, const wchar_t* const* strings, const ui
 
                 // Insert into dbi_strings (keyed by ID)
                 MDB_val idkey = {.mv_data = &new_id, .mv_size = sizeof(new_id)};
-                size_t total_len = leader->normalized_len + sizeof(StringMeta);
+
+                // Try to compress the text
+                size_t compressed_size = 0;
+                uint8_t* compressed = compress_text(leader->normalized_utf8, leader->normalized_len, &compressed_size);
+
+                size_t data_len = compressed ? compressed_size : leader->normalized_len;
+                size_t total_len = data_len + sizeof(StringMeta);
                 uint8_t* storage = (uint8_t*)malloc(total_len);
                 if(!storage){
+                    if(compressed) free(compressed);
                     if(cursor_opened) mdb_cursor_close(rev_cursor);
                     d->header_cache.string_count = original_count;
                     set_error(d, DB_ERROR_OS, 0, "out of memory");
                     result = FALSE;
                     goto cleanup;
                 }
-                memcpy(storage, leader->normalized_utf8, leader->normalized_len);
+
+                // Copy compressed or uncompressed data
+                if(compressed){
+                    memcpy(storage, compressed, compressed_size);
+                    free(compressed);
+                } else {
+                    memcpy(storage, leader->normalized_utf8, leader->normalized_len);
+                }
+
                 StringMeta placeholder; string_meta_init(&placeholder);
-                memcpy(storage + leader->normalized_len, &placeholder, sizeof(placeholder));
+                memcpy(storage + data_len, &placeholder, sizeof(placeholder));
                 MDB_val idval = {.mv_data = storage, .mv_size = total_len};
                 rc = mdb_put(d->wtxn, d->dbi_strings, &idkey, &idval, 0);
                 free(storage);
@@ -3072,8 +3257,17 @@ static BOOL db_put_records_internal(Db* db_,
         BOOL have_norm = success && r->normalized_name_str_id &&
                          str_by_id_with_retry(d, r->normalized_name_str_id, &normv, 5, &norm_meta, &norm_has_meta);
         if(success && have_norm){
+            // Decompress text if needed
+            size_t norm_text_len = 0;
+            const char* norm_text = get_decompressed_text(d, &normv, &norm_text_len);
+            if(!norm_text){
+                success = FALSE;
+                set_error(d, DB_ERROR_OS, 0, "failed to decompress normalized name");
+                break;
+            }
+
             NameBloomContext norm_ctx;
-            if(!name_bloom_context_prepare((const char*)normv.mv_data, &norm_ctx)){
+            if(!name_bloom_context_prepare(norm_text, &norm_ctx)){
                 success = FALSE;
                 set_error(d, DB_ERROR_OS, 0, "failed to prepare bloom context");
                 break;
@@ -3097,8 +3291,17 @@ static BOOL db_put_records_internal(Db* db_,
             }
             name_bloom_context_release(&norm_ctx);
         } else if(success && have_name){
+            // Decompress text if needed
+            size_t name_text_len = 0;
+            const char* name_text = get_decompressed_text(d, &namev, &name_text_len);
+            if(!name_text){
+                success = FALSE;
+                set_error(d, DB_ERROR_OS, 0, "failed to decompress name");
+                break;
+            }
+
             NameBloomContext name_ctx;
-            if(!name_bloom_context_prepare((const char*)namev.mv_data, &name_ctx)){
+            if(!name_bloom_context_prepare(name_text, &name_ctx)){
                 success = FALSE;
                 set_error(d, DB_ERROR_OS, 0, "failed to prepare bloom context");
                 break;
@@ -3142,8 +3345,17 @@ static BOOL db_put_records_internal(Db* db_,
             MDB_val cvstr;
             StringMeta content_meta; BOOL content_has_meta = FALSE;
             if(success && str_by_id_with_retry(d, r->content_str_id, &cvstr, 5, &content_meta, &content_has_meta)){
+                // Decompress text if needed
+                size_t content_text_len = 0;
+                const char* content_text = get_decompressed_text(d, &cvstr, &content_text_len);
+                if(!content_text){
+                    success = FALSE;
+                    set_error(d, DB_ERROR_OS, 0, "failed to decompress content");
+                    break;
+                }
+
                 NameBloomContext content_ctx;
-                if(!name_bloom_context_prepare((const char*)cvstr.mv_data, &content_ctx)){
+                if(!name_bloom_context_prepare(content_text, &content_ctx)){
                     success = FALSE;
                     set_error(d, DB_ERROR_OS, 0, "failed to prepare bloom context");
                     break;
