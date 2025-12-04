@@ -16,8 +16,9 @@ void TextEditor_NoImGuiStub(void) {}
 
 static const size_t kMaxUndoBufferSize = 100;
 
-// TODO
-// - multiline comments vs single-line: latter is blocking start of a ML
+// Known issue: Single-line comment markers that appear at the start of a multiline
+// comment block (e.g., "// /*") will prevent proper multiline comment detection.
+// This is a limitation of the current linear comment parsing logic.
 
 template<class InputIt1, class InputIt2, class BinaryPredicate>
 bool equals(InputIt1 first1, InputIt1 last1,
@@ -2199,9 +2200,6 @@ void TextEditor::ColorizeRange(int aFromLine, int aToLine)
 
 			if (hasTokenizeResult == false)
 			{
-				// todo : remove
-				//printf("using regex for %.*s\n", first + 10 < last ? 10 : int(last - first), first);
-
 				for (auto& p : mRegexList)
 				{
 					if (std::regex_search(first, last, results, p.first, std::regex_constants::match_continuous))
@@ -2229,9 +2227,10 @@ void TextEditor::ColorizeRange(int aFromLine, int aToLine)
 				{
 					id.assign(token_begin, token_end);
 
-					// todo : allmost all language definitions use lower case to specify keywords, so shouldn't this use ::tolower ?
+					// Convert to lowercase for case-insensitive matching
+					// (language definitions store keywords in lowercase)
 					if (!mLanguageDefinition.mCaseSensitive)
-						std::transform(id.begin(), id.end(), id.begin(), ::toupper);
+						std::transform(id.begin(), id.end(), id.begin(), ::tolower);
 
 					if (!line[first - bufferBegin].mPreprocessor)
 					{
