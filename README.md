@@ -63,7 +63,8 @@ SIMD Optimization: Critical code paths like trigram extraction and hash calculat
 
 Efficient Storage: Leverages LMDB, a high-performance, memory-mapped key-value store, as its database backend.
 
-🚀 **Building From Source**
+ 
+**Building From Source**
 "Anything" is a C/C++ project that uses CMake for building.
 
 Dependencies
@@ -107,7 +108,7 @@ Clone the repository:
 
 Bash
 
-git clone https://github.com/your-username/anything.git
+git clone https://github.com/zilverztream/anything.git
 cd anything
 Configure with CMake:
 
@@ -149,8 +150,8 @@ The first run will take some time as it builds the initial index. Subsequent run
 2. Searching
 Launch the UI executable. It will automatically load the anything.mdb database from its directory and provide an interactive search window.
 
-🤝 **Contributing**
+**Contributing**
 Contributions are welcome! If you have a feature idea, a bug fix, or a new plugin you'd like to build, please open an issue or submit a pull request.
 
-📜 **License**
+**License**
 This project is licensed under the MIT License. See the LICENSE file for details.
