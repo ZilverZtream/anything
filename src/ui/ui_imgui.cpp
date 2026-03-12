@@ -1288,8 +1288,17 @@ static void push_progressive_result(MPMCQueue* queue, ProgressiveResult* item) {
 }
 
 static void search_thread(SearchThreadArgs* sta) {
+    if (!sta->env) {
+        auto* done = new ProgressiveResult(); done->done = true;
+        push_progressive_result(sta->queue, done);
+        return;
+    }
     MDB_txn* txn = nullptr;
-    mdb_txn_begin(sta->env, nullptr, MDB_RDONLY, &txn);
+    if (mdb_txn_begin(sta->env, nullptr, MDB_RDONLY, &txn) != 0) {
+        auto* done = new ProgressiveResult(); done->done = true;
+        push_progressive_result(sta->queue, done);
+        return;
+    }
     MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_strrev;
     mdb_dbi_open(txn, "strings", 0, &dbi_strings);
     mdb_dbi_open(txn, "records", 0, &dbi_records);
@@ -1426,6 +1435,98 @@ static void search_thread(SearchThreadArgs* sta) {
     mdb_txn_abort(txn);
 }
 
+static void setup_modern_theme() {
+    ImGuiStyle& style = ImGui::GetStyle();
+
+    // Rounding
+    style.WindowRounding = 0.0f;  // Fullscreen window, no rounding needed
+    style.FrameRounding = 6.0f;
+    style.GrabRounding = 4.0f;
+    style.TabRounding = 6.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.PopupRounding = 8.0f;
+    style.ChildRounding = 6.0f;
+
+    // Sizing
+    style.FramePadding = ImVec2(10, 6);
+    style.ItemSpacing = ImVec2(10, 8);
+    style.ItemInnerSpacing = ImVec2(8, 6);
+    style.CellPadding = ImVec2(8, 4);
+    style.ScrollbarSize = 14.0f;
+    style.GrabMinSize = 12.0f;
+    style.WindowPadding = ImVec2(16, 16);
+    style.IndentSpacing = 20.0f;
+    style.WindowBorderSize = 0.0f;
+    style.FrameBorderSize = 0.0f;
+    style.TabBorderSize = 0.0f;
+
+    // Colors - Modern dark theme
+    ImVec4* c = style.Colors;
+    ImVec4 bg       = ImVec4(0.12f, 0.12f, 0.18f, 1.00f);  // #1E1E2E
+    ImVec4 surface0 = ImVec4(0.15f, 0.15f, 0.21f, 1.00f);  // #252536
+    ImVec4 surface1 = ImVec4(0.18f, 0.18f, 0.25f, 1.00f);  // #2E2E40
+    ImVec4 surface2 = ImVec4(0.27f, 0.28f, 0.35f, 1.00f);  // #45475A
+    ImVec4 overlay  = ImVec4(0.19f, 0.20f, 0.27f, 1.00f);  // #313244
+    ImVec4 text     = ImVec4(0.80f, 0.84f, 0.96f, 1.00f);  // #CDD6F4
+    ImVec4 subtext  = ImVec4(0.58f, 0.62f, 0.75f, 1.00f);  // #949CBF
+    ImVec4 accent   = ImVec4(0.52f, 0.71f, 0.98f, 1.00f);  // #85B5FA
+    ImVec4 green    = ImVec4(0.65f, 0.89f, 0.63f, 1.00f);  // #A6E3A1
+    ImVec4 red      = ImVec4(0.95f, 0.55f, 0.55f, 1.00f);  // #F28B8B
+
+    c[ImGuiCol_Text]                  = text;
+    c[ImGuiCol_TextDisabled]          = subtext;
+    c[ImGuiCol_WindowBg]              = bg;
+    c[ImGuiCol_ChildBg]               = ImVec4(0,0,0,0);
+    c[ImGuiCol_PopupBg]               = surface0;
+    c[ImGuiCol_Border]                = surface2;
+    c[ImGuiCol_BorderShadow]          = ImVec4(0,0,0,0);
+    c[ImGuiCol_FrameBg]               = surface1;
+    c[ImGuiCol_FrameBgHovered]        = overlay;
+    c[ImGuiCol_FrameBgActive]         = surface2;
+    c[ImGuiCol_TitleBg]               = bg;
+    c[ImGuiCol_TitleBgActive]         = bg;
+    c[ImGuiCol_TitleBgCollapsed]      = bg;
+    c[ImGuiCol_MenuBarBg]             = surface0;
+    c[ImGuiCol_ScrollbarBg]           = bg;
+    c[ImGuiCol_ScrollbarGrab]         = surface2;
+    c[ImGuiCol_ScrollbarGrabHovered]  = subtext;
+    c[ImGuiCol_ScrollbarGrabActive]   = text;
+    c[ImGuiCol_CheckMark]             = accent;
+    c[ImGuiCol_SliderGrab]            = accent;
+    c[ImGuiCol_SliderGrabActive]      = text;
+    c[ImGuiCol_Button]                = surface1;
+    c[ImGuiCol_ButtonHovered]         = overlay;
+    c[ImGuiCol_ButtonActive]          = surface2;
+    c[ImGuiCol_Header]                = surface1;
+    c[ImGuiCol_HeaderHovered]         = overlay;
+    c[ImGuiCol_HeaderActive]          = surface2;
+    c[ImGuiCol_Separator]             = surface2;
+    c[ImGuiCol_SeparatorHovered]      = accent;
+    c[ImGuiCol_SeparatorActive]       = accent;
+    c[ImGuiCol_ResizeGrip]            = surface2;
+    c[ImGuiCol_ResizeGripHovered]     = accent;
+    c[ImGuiCol_ResizeGripActive]      = accent;
+    c[ImGuiCol_Tab]                   = surface0;
+    c[ImGuiCol_TabHovered]            = overlay;
+    c[ImGuiCol_TabActive]             = surface1;
+    c[ImGuiCol_TabUnfocused]          = surface0;
+    c[ImGuiCol_TabUnfocusedActive]    = surface1;
+    c[ImGuiCol_TableHeaderBg]         = surface0;
+    c[ImGuiCol_TableBorderStrong]     = surface2;
+    c[ImGuiCol_TableBorderLight]      = overlay;
+    c[ImGuiCol_TableRowBg]            = ImVec4(0,0,0,0);
+    c[ImGuiCol_TableRowBgAlt]         = ImVec4(0.15f, 0.15f, 0.22f, 0.5f);
+    c[ImGuiCol_TextSelectedBg]        = ImVec4(accent.x, accent.y, accent.z, 0.3f);
+    c[ImGuiCol_DragDropTarget]        = accent;
+    c[ImGuiCol_NavHighlight]          = accent;
+    c[ImGuiCol_NavWindowingHighlight] = accent;
+    c[ImGuiCol_NavWindowingDimBg]     = ImVec4(0,0,0,0.5f);
+    c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0,0,0,0.5f);
+
+    // Unused vars suppression
+    (void)green; (void)red;
+}
+
 #endif
 
 // run_ui - launch the GUI if ImGui is available
@@ -1447,7 +1548,7 @@ int run_ui(void){
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
-    ImGui::StyleColorsDark();
+    setup_modern_theme();
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
@@ -1476,27 +1577,85 @@ int run_ui(void){
     uint64_t indexing_progress = 0;
     double last_query_change_time = 0.0;
     const double DEBOUNCE_DELAY_SECONDS = 0.3;
-    Db* db = nullptr;
-    const DbHeader* header;
+    // --- Determine database path ---
+    wchar_t db_wpath[MAX_LONG_PATH] = {0};
+    char u8db[MAX_PATH * 3] = {0};
+    wchar_t exe_dir[MAX_LONG_PATH] = {0};
 #ifdef _WIN32
-    header = db_open_readonly(L"anything.mdb", &db);
-    char u8db[MAX_PATH*3];
-    to_utf8(L"anything.mdb", u8db, sizeof(u8db));
-    open_bloom(L"anything.mdb");
-#else
-    wchar_t wdb[MAX_PATH];
-    mbstowcs(wdb, "anything.mdb", MAX_PATH);
-    header = db_open_readonly(wdb, &db);
-    char u8db[MAX_PATH*3];
-    strncpy(u8db, "anything.mdb", sizeof(u8db));
-    open_bloom(wdb);
-#endif
-    if (!header) {
-        fprintf(stderr, "Failed to open DB\n");
+    {
+        // Default: %LOCALAPPDATA%\Anything\anything.mdb
+        wchar_t* appdata = _wgetenv(L"LOCALAPPDATA");
+        if (appdata) {
+            _snwprintf(db_wpath, MAX_LONG_PATH - 1, L"%s\\Anything", appdata);
+            CreateDirectoryW(db_wpath, NULL);
+            _snwprintf(db_wpath, MAX_LONG_PATH - 1, L"%s\\Anything\\anything.mdb", appdata);
+        } else {
+            wcscpy_s(db_wpath, MAX_LONG_PATH, L"anything.mdb");
+        }
+        to_utf8(db_wpath, u8db, sizeof(u8db));
+        // Find exe directory for launching indexer
+        GetModuleFileNameW(NULL, exe_dir, MAX_LONG_PATH);
+        wchar_t* last_slash = wcsrchr(exe_dir, L'\\');
+        if (last_slash) *(last_slash + 1) = L'\0';
     }
+#else
+    {
+        const char* home = getenv("HOME");
+        char path8[MAX_PATH * 3];
+        if (home) {
+            snprintf(path8, sizeof(path8), "%s/.anything", home);
+            mkdir(path8, 0755);
+            snprintf(path8, sizeof(path8), "%s/.anything/anything.mdb", home);
+        } else {
+            snprintf(path8, sizeof(path8), "anything.mdb");
+        }
+        strncpy(u8db, path8, sizeof(u8db) - 1);
+        mbstowcs(db_wpath, u8db, MAX_LONG_PATH);
+    }
+#endif
+
+    // --- Open or create database ---
+    Db* db = nullptr;
+    const DbHeader* header = db_open_readonly(db_wpath, &db);
+    bool db_ready = (header != nullptr);
+    bool db_empty = false;
+    bool indexer_running = false;
+#ifdef _WIN32
+    HANDLE hIndexerProcess = NULL;
+#endif
+
+    if (!db_ready) {
+        // Database doesn't exist yet - create an empty one
+        if (db_create(db_wpath, 1024, 16384, &db)) {
+            db_close(db);
+            db = nullptr;
+            header = db_open_readonly(db_wpath, &db);
+            db_ready = (header != nullptr);
+            db_empty = true;
+        }
+    }
+
+    // --- Open LMDB env for search thread ---
     MDB_env* env = nullptr;
-    mdb_env_create(&env);
-    mdb_env_open(env, u8db, MDB_RDONLY, 0664);
+    bool env_ok = false;
+    if (db_ready) {
+        open_bloom(db_wpath);
+        int rc = mdb_env_create(&env);
+        if (rc == 0) {
+            mdb_env_set_maxdbs(env, 64);
+            rc = mdb_env_open(env, u8db, MDB_RDONLY, 0664);
+            if (rc == 0) {
+                env_ok = true;
+            } else {
+                mdb_env_close(env);
+                env = nullptr;
+            }
+        }
+    }
+    if (!env_ok) {
+        db_empty = true; // Treat as empty if env can't open
+    }
+
     std::thread search_th;
     SearchThreadArgs sta;
     bool search_done = true;
@@ -1504,7 +1663,7 @@ int run_ui(void){
     if (!MPMC_Init(&result_queue, 2048)) {
         fprintf(stderr, "Failed to initialize result queue\n");
         if (db) db_close(db);
-        mdb_env_close(env);
+        if (env) mdb_env_close(env);
         close_bloom();
         ImGui_ImplOpenGL3_Shutdown();
         ImGui_ImplGlfw_Shutdown();
@@ -1518,7 +1677,7 @@ int run_ui(void){
     strncpy(sta.db_path, u8db, sizeof(sta.db_path) - 1);
     sta.db_path[sizeof(sta.db_path) - 1] = '\0';
 
-    std::vector<SearchResult> all_items; // Dummy if needed
+    std::vector<SearchResult> all_items;
 
     live_updates_init();
 
@@ -1535,6 +1694,7 @@ int run_ui(void){
     };
 
     auto update_results = [&]() {
+        if (!env_ok) return; // No valid DB - skip search
         // Don't block - just check if previous search is done
         if (search_th.joinable() && search_done) {
             search_th.join();
@@ -1583,13 +1743,28 @@ int run_ui(void){
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Anything Search", nullptr, ImGuiWindowFlags_None);
+        // Fill entire viewport
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::Begin("##MainWindow", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoBringToFrontOnFocus);
+                ImGui::Spacing();
         if (ImGui::BeginTabBar("MainTabs")) {
             if (ImGui::BeginTabItem("Search")) {
-                ImGui::InputText("Query", &query_str);
+                // --- Large Search Bar ---
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12, 12));
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
+                ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 120);
+                ImGui::InputTextWithHint("##SearchBar", "Search files, content, metadata...", &query_str);
                 bool query_edited = ImGui::IsItemEdited();
+                ImGui::PopItemWidth();
+                ImGui::PopStyleVar(2);
                 ImGui::SameLine();
-                if (ImGui::Button("Advanced")) show_advanced = !show_advanced;
+                if (ImGui::Button("Filters")) show_advanced = !show_advanced;
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%zu results)", filtered.size());
                 if (query_edited) {
                     last_query_change_time = glfwGetTime();
                 }
@@ -1598,26 +1773,126 @@ int run_ui(void){
                     ImGui::Text("Indexing %llu files...", static_cast<unsigned long long>(indexing_progress));
                 }
 
+#ifdef _WIN32
+                // Check if indexer process is still running
+                if (indexer_running && hIndexerProcess) {
+                    DWORD exitCode = 0;
+                    if (GetExitCodeProcess(hIndexerProcess, &exitCode) && exitCode != STILL_ACTIVE) {
+                        CloseHandle(hIndexerProcess);
+                        hIndexerProcess = NULL;
+                        indexer_running = false;
+                        // Re-open DB now that indexing is done
+                        if (db) { db_close(db); db = nullptr; }
+                        if (env) { mdb_env_close(env); env = nullptr; }
+                        close_bloom();
+                        header = db_open_readonly(db_wpath, &db);
+                        db_ready = (header != nullptr);
+                        if (db_ready) {
+                            open_bloom(db_wpath);
+                            int rc = mdb_env_create(&env);
+                            if (rc == 0) {
+                                mdb_env_set_maxdbs(env, 64);
+                                rc = mdb_env_open(env, u8db, MDB_RDONLY, 0664);
+                                if (rc == 0) {
+                                    env_ok = true;
+                                    sta.env = env;
+                                    db_empty = false;
+                                    need_update = true;
+                                } else {
+                                    mdb_env_close(env); env = nullptr;
+                                }
+                            }
+                        }
+                    }
+                }
+#endif
+
+                // Show first-run / empty-index state
+                if (db_empty && !indexer_running) {
+                    float avail_w = ImGui::GetContentRegionAvail().x;
+                    float avail_h = ImGui::GetContentRegionAvail().y;
+                    float card_w = 500.0f;
+                    float card_h = 280.0f;
+                    ImGui::SetCursorPos(ImVec2(
+                        ImGui::GetCursorPosX() + (avail_w - card_w) * 0.5f,
+                        ImGui::GetCursorPosY() + (avail_h - card_h) * 0.3f));
+                    ImGui::BeginChild("##WelcomeCard", ImVec2(card_w, card_h), true, ImGuiWindowFlags_NoScrollbar);
+                    ImGui::Spacing();
+                    float text_w = ImGui::CalcTextSize("Welcome to Anything").x;
+                    ImGui::SetCursorPosX((card_w - text_w) * 0.5f);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.52f, 0.71f, 0.98f, 1.0f));
+                    ImGui::Text("Welcome to Anything");
+                    ImGui::PopStyleColor();
+                    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+                    ImGui::TextWrapped("Your file index is empty. Build an index to start searching across all your files instantly.");
+                    ImGui::Spacing(); ImGui::Spacing();
+                    ImGui::TextWrapped("This will scan all drives using NTFS journal for maximum speed. Indexing typically takes 1-5 minutes.");
+                    ImGui::Spacing(); ImGui::Spacing();
+#ifdef _WIN32
+                    float btn_w = 200.0f;
+                    ImGui::SetCursorPosX((card_w - btn_w) * 0.5f);
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.52f, 0.71f, 0.98f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.62f, 0.78f, 1.0f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.42f, 0.61f, 0.88f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.12f, 0.12f, 0.18f, 1.0f));
+                    if (ImGui::Button("Build Index", ImVec2(btn_w, 40))) {
+                        wchar_t cmd[MAX_LONG_PATH * 2];
+                        _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1,
+                            L"\"%sanything.exe\" index --db \"%s\" --all-drives --ntfs --tail",
+                            exe_dir, db_wpath);
+                        STARTUPINFOW si = {}; si.cb = sizeof(si);
+                        PROCESS_INFORMATION pi = {};
+                        if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+                            CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                            CloseHandle(pi.hThread);
+                            hIndexerProcess = pi.hProcess;
+                            indexer_running = true;
+                        }
+                    }
+                    ImGui::PopStyleColor(4);
+#endif
+                    ImGui::EndChild();
+                } else if (indexer_running) {
+                    float avail_w = ImGui::GetContentRegionAvail().x;
+                    float avail_h = ImGui::GetContentRegionAvail().y;
+                    float card_w = 450.0f;
+                    float card_h = 160.0f;
+                    ImGui::SetCursorPos(ImVec2(
+                        ImGui::GetCursorPosX() + (avail_w - card_w) * 0.5f,
+                        ImGui::GetCursorPosY() + (avail_h - card_h) * 0.3f));
+                    ImGui::BeginChild("##IndexingCard", ImVec2(card_w, card_h), true, ImGuiWindowFlags_NoScrollbar);
+                    ImGui::Spacing();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.89f, 0.63f, 1.0f));
+                    ImGui::Text("Indexing in progress...");
+                    ImGui::PopStyleColor();
+                    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+                    ImGui::TextWrapped("Scanning your drives. This typically takes 1-5 minutes.");
+                    ImGui::TextWrapped("You can start searching as soon as results appear.");
+                    ImGui::Spacing();
+                    // Simple animated dots
+                    int dots = ((int)(glfwGetTime() * 2.0)) % 4;
+                    const char* dot_str[] = {"", ".", "..", "..."};
+                    ImGui::Text("Working%s", dot_str[dots]);
+                    ImGui::EndChild();
+                }
+
                 ImGui::BeginChild("ResultsAndPreview", ImVec2(0, 0), false);
                 if (ImGui::BeginTable("split", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_NoSavedSettings)) {
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn();
-                    ImGui::Text("Results:");
-                    ImGui::Separator();
                     bool results_focused = false;
                     ImGui::BeginChild("ResultsList", ImVec2(0, 0), false, ImGuiWindowFlags_None);
                     results_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
                     ImGuiTableFlags tflags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_NoSavedSettings;
                     const std::vector<SearchResult*>* current_view = nullptr;
                     size_t current_view_size = filtered.size();
-                    if (ImGui::BeginTable("ResultsTable", 6, tflags)) {
+                    if (ImGui::BeginTable("ResultsTable", 5, tflags)) {
                         ImGui::TableSetupScrollFreeze(0,1);
-                        ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthFixed, 60.0f);
                         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort, 0.0f, COL_NAME);
                         ImGui::TableSetupColumn("Path", 0, 0.0f, COL_PATH);
-                        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_SIZE);
-                        ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_MOD);
-                        ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_PreferSortDescending, 0.0f, COL_SCORE);
+                        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_PreferSortDescending | ImGuiTableColumnFlags_WidthFixed, 90.0f, COL_SIZE);
+                        ImGui::TableSetupColumn("Modified", ImGuiTableColumnFlags_PreferSortDescending | ImGuiTableColumnFlags_WidthFixed, 140.0f, COL_MOD);
+                        ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_PreferSortDescending | ImGuiTableColumnFlags_WidthFixed, 60.0f, COL_SCORE);
                         ImGui::TableHeadersRow();
                         ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
                         bool force_rebuild = need_sort || (sort_specs && sort_specs->SpecsDirty);
@@ -1634,7 +1909,7 @@ int run_ui(void){
                             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
                                 SearchResult& r = *visible[static_cast<size_t>(row)];
                                 ImGui::TableNextRow();
-                                ImGui::TableSetColumnIndex(1);
+                                ImGui::TableSetColumnIndex(0);
                                 ImGui::PushID(row);
                                 bool is_selected = (selected == row);
                                 if (ImGui::Selectable(r.filename.c_str(), is_selected, ImGuiSelectableFlags_SpanAllColumns)) {
@@ -1652,21 +1927,15 @@ int run_ui(void){
                                     if (ImGui::MenuItem("Delete")) { delete_path_os(full); need_update = true; }
                                     ImGui::EndPopup();
                                 }
-                                ImGui::TableSetColumnIndex(0);
-                                if (r.stage >= 2 && (r.type == "image" || !r.preview_path.empty()) && r.texture != 0) {
-                                    ImGui::Image((ImTextureID)(intptr_t)r.texture, ImVec2(48, 48));
-                                } else {
-                                    ImGui::TextDisabled("...");
-                                }
-                                ImGui::TableSetColumnIndex(2);
+                                ImGui::TableSetColumnIndex(1);
                                 ImGui::TextUnformatted(r.path.c_str());
-                                ImGui::TableSetColumnIndex(3);
+                                ImGui::TableSetColumnIndex(2);
                                 ImGui::Text("%lld", (long long)r.size);
-                                ImGui::TableSetColumnIndex(4);
+                                ImGui::TableSetColumnIndex(3);
                                 char dstr[64];
                                 std::strftime(dstr, sizeof(dstr), "%Y-%m-%d %H:%M:%S", std::localtime(&r.modified));
                                 ImGui::Text("%s", dstr);
-                                ImGui::TableSetColumnIndex(5);
+                                ImGui::TableSetColumnIndex(4);
                                 ImGui::Text("%.1f", r.score);
                                 ImGui::PopID();
                             }
@@ -1803,19 +2072,148 @@ int run_ui(void){
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Settings")) {
-                const char* themes[] = { "Dark", "Light" };
-                if (ImGui::Combo("Theme", &theme_idx, themes, IM_ARRAYSIZE(themes))) {
-                    if (theme_idx == 0) ImGui::StyleColorsDark();
-                    else ImGui::StyleColorsLight();
+                ImGui::Spacing();
+
+                // --- Appearance ---
+                if (ImGui::CollapsingHeader("Appearance", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Indent(10);
+                    const char* themes[] = { "Dark", "Light" };
+                    if (ImGui::Combo("Theme", &theme_idx, themes, IM_ARRAYSIZE(themes))) {
+                        if (theme_idx == 0) setup_modern_theme();
+                        else ImGui::StyleColorsLight();
+                    }
+                    ImGui::Unindent(10);
                 }
+                ImGui::Spacing();
+
+                // --- Database ---
+                if (ImGui::CollapsingHeader("Database", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Indent(10);
+                    ImGui::Text("Location: %s", u8db);
+                    if (db_ready && header) {
+                        ImGui::Text("Records: %llu", static_cast<unsigned long long>(header->record_count));
+                        ImGui::Text("Strings: %llu", static_cast<unsigned long long>(header->string_count));
+                    } else {
+                        ImGui::TextDisabled("No index data available");
+                    }
+                    ImGui::Spacing();
+                    if (!indexer_running) {
+                        if (ImGui::Button(db_empty ? "Build Index" : "Rebuild Index")) {
 #ifdef _WIN32
-                if (ImGui::Checkbox("Enable Taskbar Search integration", &taskbar_integration)) {
-                    set_taskbar_search(taskbar_integration);
-                }
+                            wchar_t cmd[MAX_LONG_PATH * 2];
+                            _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1,
+                                L"\"%sanything.exe\" index --db \"%s\" --all-drives --ntfs --tail",
+                                exe_dir, db_wpath);
+                            STARTUPINFOW si = {}; si.cb = sizeof(si);
+                            PROCESS_INFORMATION pi = {};
+                            if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+                                CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                                CloseHandle(pi.hThread);
+                                hIndexerProcess = pi.hProcess;
+                                indexer_running = true;
+                            }
 #endif
+                        }
+                    } else {
+                        ImGui::TextColored(ImVec4(0.65f, 0.89f, 0.63f, 1.0f), "Indexing in progress...");
+                    }
+                    ImGui::Unindent(10);
+                }
+                ImGui::Spacing();
+
+                // --- Indexing ---
+                if (ImGui::CollapsingHeader("Indexing Options")) {
+                    ImGui::Indent(10);
+                    static int index_threads = 8;
+                    ImGui::SliderInt("Worker Threads", &index_threads, 1, 16);
+                    static bool use_ntfs = true;
+                    ImGui::Checkbox("Use NTFS Journal (fastest)", &use_ntfs);
+                    static bool tail_changes = true;
+                    ImGui::Checkbox("Watch for file changes", &tail_changes);
+                    static bool content_index = true;
+                    ImGui::Checkbox("Index file contents", &content_index);
+                    ImGui::Unindent(10);
+                }
+                ImGui::Spacing();
+
+                // --- Plugins ---
+                if (ImGui::CollapsingHeader("Plugins")) {
+                    ImGui::Indent(10);
+                    ImGui::TextWrapped("Enable or disable search plugins. Changes take effect on next index build.");
+                    ImGui::Spacing();
+
+                    struct PluginEntry { const char* name; const char* desc; bool enabled; };
+                    static PluginEntry plugins[] = {
+                        {"Code Parser",      "Index functions, classes, and code structure",  true},
+                        {"Git Repositories", "Index git commit history and diffs",            true},
+                        {"Duplicate Finder", "Find duplicate files by content hash",          true},
+                        {"OCR (Images)",     "Extract text from images using Tesseract",      false},
+                        {"Gmail",            "Search Gmail messages (requires OAuth token)",   false},
+                        {"Microsoft Mail",   "Search Outlook/Exchange (requires OAuth token)", false},
+                        {"iCloud",           "Search iCloud data (requires token)",            false},
+                        {"Web Archive",      "Index web archive content",                     false},
+                        {"Registry",         "Search Windows Registry keys and values",       true},
+                    };
+
+                    if (ImGui::BeginTable("##PluginTable", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders)) {
+                        ImGui::TableSetupColumn("Enabled", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                        ImGui::TableSetupColumn("Plugin", ImGuiTableColumnFlags_WidthFixed, 160.0f);
+                        ImGui::TableSetupColumn("Description");
+                        ImGui::TableHeadersRow();
+                        for (int i = 0; i < IM_ARRAYSIZE(plugins); i++) {
+                            ImGui::TableNextRow();
+                            ImGui::TableNextColumn();
+                            ImGui::PushID(i);
+                            ImGui::Checkbox("##en", &plugins[i].enabled);
+                            ImGui::PopID();
+                            ImGui::TableNextColumn();
+                            ImGui::Text("%s", plugins[i].name);
+                            ImGui::TableNextColumn();
+                            ImGui::TextDisabled("%s", plugins[i].desc);
+                        }
+                        ImGui::EndTable();
+                    }
+                    ImGui::Unindent(10);
+                }
+                ImGui::Spacing();
+
+                // --- Integration ---
+                if (ImGui::CollapsingHeader("System Integration")) {
+                    ImGui::Indent(10);
+#ifdef _WIN32
+                    if (ImGui::Checkbox("Windows Taskbar Search", &taskbar_integration)) {
+                        set_taskbar_search(taskbar_integration);
+                    }
+                    ImGui::TextDisabled("Integrates Anything into the Windows search bar");
+#endif
+                    ImGui::Unindent(10);
+                }
+
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
+        }
+        // --- Status Bar ---
+        {
+            float footer_h = ImGui::GetFrameHeightWithSpacing();
+            ImGui::SetCursorPosY(ImGui::GetWindowHeight() - footer_h - 8);
+            ImGui::Separator();
+            if (db_ready && header) {
+                ImGui::Text("  %llu files indexed", static_cast<unsigned long long>(header->record_count));
+                ImGui::SameLine(0, 20);
+                ImGui::TextDisabled("|");
+                ImGui::SameLine(0, 20);
+                ImGui::Text("DB: %s", u8db);
+            } else {
+                ImGui::TextDisabled("  No index");
+            }
+            if (indexer_running) {
+                ImGui::SameLine(ImGui::GetWindowWidth() - 200);
+                ImGui::TextColored(ImVec4(0.65f, 0.89f, 0.63f, 1.0f), "Indexing...");
+            } else if (db_ready) {
+                ImGui::SameLine(ImGui::GetWindowWidth() - 200);
+                ImGui::TextColored(ImVec4(0.52f, 0.71f, 0.98f, 1.0f), "Ready");
+            }
         }
         ImGui::End();
 
@@ -1870,7 +2268,7 @@ int run_ui(void){
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
-        glClearColor(0.45f, 0.55f, 0.60f, 1.00f);
+        glClearColor(0.12f, 0.12f, 0.18f, 1.00f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
@@ -1891,9 +2289,12 @@ int run_ui(void){
     }
     filtered.clear();
 
-    db_close(db);
-    mdb_env_close(env);
+    if (db) db_close(db);
+    if (env) mdb_env_close(env);
     close_bloom();
+#ifdef _WIN32
+    if (hIndexerProcess) CloseHandle(hIndexerProcess);
+#endif
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
