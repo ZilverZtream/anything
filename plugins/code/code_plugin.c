@@ -32,7 +32,7 @@ static void append_token(char** buf, size_t* len, size_t* cap, const char* type,
         if(!new_buf) return;
         *buf = new_buf; *cap = new_cap;
     }
-    int written = sprintf(*buf + *len, "%s:%s\n", type, name);
+    int written = snprintf(*buf + *len, *cap - *len, "%s:%s\n", type, name);
     if(written > 0) *len += written;
 }
 

@@ -767,7 +767,7 @@ BOOL db_string_value_parse(const MDB_val* value, MDB_val* text, StringMeta* meta
                 memcpy(&raw_len, payload, sizeof(raw_len));
                 const uint8_t* compressed = payload + STRING_COMPRESSION_HEADER_SIZE;
                 size_t compressed_len = payload_len - STRING_COMPRESSION_HEADER_SIZE;
-                if(raw_len > SIZE_MAX){
+                if(raw_len == 0 || raw_len > SIZE_MAX){
                     ok = FALSE;
                 } else if(!ensure_decompress_buffer((size_t)raw_len, text)){
                     ok = FALSE;
@@ -2813,6 +2813,7 @@ static void remove_trigrams_fast(DbImpl* d, uint64_t string_id){
     // Trigrams are stored as packed 3-byte values
     const uint8_t* blob = (const uint8_t*)v.mv_data;
     size_t blob_len = v.mv_size;
+    if(blob_len % 3 != 0) return; // corrupted trigram blob
     size_t tri_count = blob_len / 3;
 
     // Delete each trigram from the index
@@ -3605,7 +3606,7 @@ BOOL db_delete_path(Db* db_, const wchar_t* parent, const wchar_t* name){
     while(rc==0){
         uint64_t id = *(uint64_t*)val.mv_data;
         MDB_val rk,rv; to_mdb_val(&id,sizeof(id),&rk);
-        if(mdb_get(d->wtxn, d->dbi_records, &rk, &rv)==0){
+        if(mdb_get(d->wtxn, d->dbi_records, &rk, &rv)==0 && rv.mv_size >= sizeof(DbRecord)){
             DbRecord r; memcpy(&r, rv.mv_data, sizeof(r));
             if(r.parent_str_id == parent_id && r.name_str_id == name_id){
                 db_delete_record(d, id, &r);
@@ -3647,7 +3648,7 @@ BOOL db_get_record_by_path(Db* db_, const wchar_t* parent, const wchar_t* name, 
     while(rc==0){
         uint64_t id = *(uint64_t*)val.mv_data;
         MDB_val rk,rv; to_mdb_val(&id,sizeof(id),&rk);
-        if(mdb_get(txn, d->dbi_records, &rk, &rv)==0){
+        if(mdb_get(txn, d->dbi_records, &rk, &rv)==0 && rv.mv_size >= sizeof(DbRecord)){
             DbRecord* r=(DbRecord*)rv.mv_data;
             if(r->parent_str_id == parent_id && r->name_str_id == name_id){
                 if(out) *out = *r;

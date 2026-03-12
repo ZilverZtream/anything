@@ -55,7 +55,7 @@ void extract_exif_metadata(Db* db, const wchar_t* path, DbRecord* r){
             uint8_t marker=buf[i+1];
             if(marker==0xE1){
                 uint16_t seglen=(buf[i+2]<<8)|buf[i+3];
-                if(i+4+6<n && memcmp(buf+i+4,"Exif\0\0",6)==0){
+                if(i+4+6<n && seglen>=10 && memcmp(buf+i+4,"Exif\0\0",6)==0){
                     exif=buf+i+10; len=seglen-8; break;
                 }
                 i+=1+seglen;
@@ -70,7 +70,9 @@ void extract_exif_metadata(Db* db, const wchar_t* path, DbRecord* r){
     if(exif[0]=='M' && exif[1]=='M') be=1;
     else if(exif[0]=='I' && exif[1]=='I') be=0;
     else return;
+    if(len < 8) return;
     uint32_t ifd0 = rd32(exif+4,be);
+    if(ifd0 >= len) return;
     parse_ifd(exif,len,be,ifd0,db,r);
 }
 

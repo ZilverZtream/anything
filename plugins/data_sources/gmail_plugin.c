@@ -61,7 +61,9 @@ static PluginHost g_host;
 
 struct curl_buf{ char* data; size_t size; };
 static size_t curl_write_cb(void* contents,size_t size,size_t nmemb,void* userp){
+    if(size && nmemb > SIZE_MAX / size) return 0;
     size_t realsize=size*nmemb; struct curl_buf* mem=(struct curl_buf*)userp;
+    if(realsize > SIZE_MAX - mem->size - 1) return 0;
     char* ptr=(char*)realloc(mem->data, mem->size+realsize+1);
     if(!ptr){
         free(mem->data);
@@ -202,6 +204,7 @@ static void scan(void){
     }
 
 cleanup:
+    memset(token_utf8, 0, sizeof(token_utf8));
     if(root) cJSON_Delete(root);
     if(resp) free(resp);
 }
