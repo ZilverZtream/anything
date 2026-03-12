@@ -221,6 +221,7 @@ static wchar_t* parse_file(const wchar_t* path){
     if(wout) MultiByteToWideChar(CP_UTF8,0,out,-1,wout,wlen);
 #else
     size_t wlen = mbstowcs(NULL, out, 0);
+    if(wlen == (size_t)-1){ free(out); return NULL; }
     wchar_t* wout = (wchar_t*)malloc(sizeof(wchar_t)*(wlen+1));
     if(wout) mbstowcs(wout, out, wlen+1);
 #endif

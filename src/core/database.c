@@ -1876,7 +1876,8 @@ BOOL db_commit_write_ex(Db* db_, BOOL force_sync){
         d->header_cache.updated_time = now_filetime();
         MDB_val mk,mv; const char* H="header"; to_mdb_val(H, strlen(H), &mk);
         to_mdb_val(&d->header_cache, sizeof(d->header_cache), &mv);
-        mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
+        int put_rc = mdb_put(d->wtxn, d->dbi_meta, &mk, &mv, 0);
+        if(put_rc){ set_mdb_error(d, put_rc); mdb_txn_abort(d->wtxn); d->wtxn=NULL; return FALSE; }
     }
     if(!bloom_storage_flush(d)){
         mdb_txn_abort(d->wtxn);

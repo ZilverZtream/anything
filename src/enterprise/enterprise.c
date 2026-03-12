@@ -99,16 +99,33 @@ int enterprise_check_permission(void* session_ptr, const char *path){
     return access ? 1 : 0;
 }
 
+static void sanitize_log_field(const char *in, char *out, size_t outcch){
+    size_t j = 0;
+    for(size_t i = 0; in[i] && j < outcch - 1; ++i){
+        unsigned char c = (unsigned char)in[i];
+        if(c == '\t' || c == '\n' || c == '\r') out[j++] = ' ';
+        else if(c >= 0x20) out[j++] = (char)c;
+    }
+    out[j] = '\0';
+}
+
 void enterprise_audit_log(const char *user, const char *query){
     if(!user || !query) return;
-    FILE *f = fopen("audit.log", "a");
+    char log_path[MAX_PATH];
+    char* appdata = getenv("LOCALAPPDATA");
+    if(appdata) snprintf(log_path, sizeof(log_path), "%s\\Anything\\audit.log", appdata);
+    else strncpy(log_path, "audit.log", sizeof(log_path));
+    FILE *f = fopen(log_path, "a");
     if(!f) return;
+    char safe_user[256], safe_query[4096];
+    sanitize_log_field(user, safe_user, sizeof(safe_user));
+    sanitize_log_field(query, safe_query, sizeof(safe_query));
     SYSTEMTIME st;
     GetLocalTime(&st);
     fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d\t%s\t%s\n",
             st.wYear, st.wMonth, st.wDay,
             st.wHour, st.wMinute, st.wSecond,
-            user, query);
+            safe_user, safe_query);
     fclose(f);
 }
 

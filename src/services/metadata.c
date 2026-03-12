@@ -54,14 +54,19 @@ void extract_exif_metadata(Db* db, const wchar_t* path, DbRecord* r){
         if(buf[i]==0xFF){
             uint8_t marker=buf[i+1];
             if(marker==0xE1){
-                uint16_t seglen=(buf[i+2]<<8)|buf[i+3];
-                if(i+4+6<n && seglen>=10 && memcmp(buf+i+4,"Exif\0\0",6)==0){
-                    exif=buf+i+10; len=seglen-8; break;
+                uint16_t seglen=(uint16_t)((buf[i+2]<<8)|buf[i+3]);
+                if(seglen < 2) break; // invalid segment
+                if(i+2+(size_t)seglen > n) break; // segment exceeds buffer
+                if(seglen>=10 && i+4+6<=n && memcmp(buf+i+4,"Exif\0\0",6)==0){
+                    exif=buf+i+10; len=(size_t)seglen-8; break;
                 }
-                i+=1+seglen;
+                i += 1 + (size_t)seglen;
             } else {
-                uint16_t seglen=(buf[i+2]<<8)|buf[i+3];
-                i+=1+seglen;
+                if(i+4>n) break;
+                uint16_t seglen=(uint16_t)((buf[i+2]<<8)|buf[i+3]);
+                if(seglen < 2) break;
+                if(i+2+(size_t)seglen > n) break;
+                i += 1 + (size_t)seglen;
             }
         }
     }
@@ -84,6 +89,7 @@ void extract_id3_metadata(Db* db, const wchar_t* path, DbRecord* r){
     uint8_t hdr[10];
     if(fread(hdr,1,10,f)==10 && memcmp(hdr,"ID3",3)==0){
         uint32_t size = ((hdr[6]&0x7F)<<21)|((hdr[7]&0x7F)<<14)|((hdr[8]&0x7F)<<7)|(hdr[9]&0x7F);
+        if(size > 10*1024*1024){ fclose(f); return; } // cap at 10MB
         uint8_t* buf=(uint8_t*)malloc(size);
         if(buf){
             size_t got=fread(buf,1,size,f);
@@ -92,6 +98,7 @@ void extract_id3_metadata(Db* db, const wchar_t* path, DbRecord* r){
                 char id[5]; memcpy(id,buf+pos,4); id[4]=0;
                 uint32_t fsize=(buf[pos+4]<<24)|(buf[pos+5]<<16)|(buf[pos+6]<<8)|buf[pos+7];
                 if(fsize==0||pos+10+fsize>got) break;
+                if(fsize < 1){ pos+=10+fsize; continue; }
                 uint8_t enc=buf[pos+10];
                 const uint8_t* data=buf+pos+11; size_t dlen=fsize-1;
                 char tmp[256]={0};
