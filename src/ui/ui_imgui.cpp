@@ -1288,8 +1288,17 @@ static void push_progressive_result(MPMCQueue* queue, ProgressiveResult* item) {
 }
 
 static void search_thread(SearchThreadArgs* sta) {
+    if (!sta->env) {
+        auto* done = new ProgressiveResult(); done->done = true;
+        push_progressive_result(sta->queue, done);
+        return;
+    }
     MDB_txn* txn = nullptr;
-    mdb_txn_begin(sta->env, nullptr, MDB_RDONLY, &txn);
+    if (mdb_txn_begin(sta->env, nullptr, MDB_RDONLY, &txn) != 0) {
+        auto* done = new ProgressiveResult(); done->done = true;
+        push_progressive_result(sta->queue, done);
+        return;
+    }
     MDB_dbi dbi_strings, dbi_records, dbi_fname_index, dbi_trigram, dbi_size, dbi_date, dbi_ext, dbi_smeta, dbi_content, dbi_author, dbi_strrev;
     mdb_dbi_open(txn, "strings", 0, &dbi_strings);
     mdb_dbi_open(txn, "records", 0, &dbi_records);
@@ -1476,27 +1485,85 @@ int run_ui(void){
     uint64_t indexing_progress = 0;
     double last_query_change_time = 0.0;
     const double DEBOUNCE_DELAY_SECONDS = 0.3;
-    Db* db = nullptr;
-    const DbHeader* header;
+    // --- Determine database path ---
+    wchar_t db_wpath[MAX_LONG_PATH] = {0};
+    char u8db[MAX_PATH * 3] = {0};
+    wchar_t exe_dir[MAX_LONG_PATH] = {0};
 #ifdef _WIN32
-    header = db_open_readonly(L"anything.mdb", &db);
-    char u8db[MAX_PATH*3];
-    to_utf8(L"anything.mdb", u8db, sizeof(u8db));
-    open_bloom(L"anything.mdb");
-#else
-    wchar_t wdb[MAX_PATH];
-    mbstowcs(wdb, "anything.mdb", MAX_PATH);
-    header = db_open_readonly(wdb, &db);
-    char u8db[MAX_PATH*3];
-    strncpy(u8db, "anything.mdb", sizeof(u8db));
-    open_bloom(wdb);
-#endif
-    if (!header) {
-        fprintf(stderr, "Failed to open DB\n");
+    {
+        // Default: %LOCALAPPDATA%\Anything\anything.mdb
+        wchar_t* appdata = _wgetenv(L"LOCALAPPDATA");
+        if (appdata) {
+            _snwprintf(db_wpath, MAX_LONG_PATH - 1, L"%s\\Anything", appdata);
+            CreateDirectoryW(db_wpath, NULL);
+            _snwprintf(db_wpath, MAX_LONG_PATH - 1, L"%s\\Anything\\anything.mdb", appdata);
+        } else {
+            wcscpy_s(db_wpath, MAX_LONG_PATH, L"anything.mdb");
+        }
+        to_utf8(db_wpath, u8db, sizeof(u8db));
+        // Find exe directory for launching indexer
+        GetModuleFileNameW(NULL, exe_dir, MAX_LONG_PATH);
+        wchar_t* last_slash = wcsrchr(exe_dir, L'\\');
+        if (last_slash) *(last_slash + 1) = L'\0';
     }
+#else
+    {
+        const char* home = getenv("HOME");
+        char path8[MAX_PATH * 3];
+        if (home) {
+            snprintf(path8, sizeof(path8), "%s/.anything", home);
+            mkdir(path8, 0755);
+            snprintf(path8, sizeof(path8), "%s/.anything/anything.mdb", home);
+        } else {
+            snprintf(path8, sizeof(path8), "anything.mdb");
+        }
+        strncpy(u8db, path8, sizeof(u8db) - 1);
+        mbstowcs(db_wpath, u8db, MAX_LONG_PATH);
+    }
+#endif
+
+    // --- Open or create database ---
+    Db* db = nullptr;
+    const DbHeader* header = db_open_readonly(db_wpath, &db);
+    bool db_ready = (header != nullptr);
+    bool db_empty = false;
+    bool indexer_running = false;
+#ifdef _WIN32
+    HANDLE hIndexerProcess = NULL;
+#endif
+
+    if (!db_ready) {
+        // Database doesn't exist yet - create an empty one
+        if (db_create(db_wpath, 1024, 16384, &db)) {
+            db_close(db);
+            db = nullptr;
+            header = db_open_readonly(db_wpath, &db);
+            db_ready = (header != nullptr);
+            db_empty = true;
+        }
+    }
+
+    // --- Open LMDB env for search thread ---
     MDB_env* env = nullptr;
-    mdb_env_create(&env);
-    mdb_env_open(env, u8db, MDB_RDONLY, 0664);
+    bool env_ok = false;
+    if (db_ready) {
+        open_bloom(db_wpath);
+        int rc = mdb_env_create(&env);
+        if (rc == 0) {
+            mdb_env_set_maxdbs(env, 64);
+            rc = mdb_env_open(env, u8db, MDB_RDONLY, 0664);
+            if (rc == 0) {
+                env_ok = true;
+            } else {
+                mdb_env_close(env);
+                env = nullptr;
+            }
+        }
+    }
+    if (!env_ok) {
+        db_empty = true; // Treat as empty if env can't open
+    }
+
     std::thread search_th;
     SearchThreadArgs sta;
     bool search_done = true;
@@ -1504,7 +1571,7 @@ int run_ui(void){
     if (!MPMC_Init(&result_queue, 2048)) {
         fprintf(stderr, "Failed to initialize result queue\n");
         if (db) db_close(db);
-        mdb_env_close(env);
+        if (env) mdb_env_close(env);
         close_bloom();
         ImGui_ImplOpenGL3_Shutdown();
         ImGui_ImplGlfw_Shutdown();
@@ -1518,7 +1585,7 @@ int run_ui(void){
     strncpy(sta.db_path, u8db, sizeof(sta.db_path) - 1);
     sta.db_path[sizeof(sta.db_path) - 1] = '\0';
 
-    std::vector<SearchResult> all_items; // Dummy if needed
+    std::vector<SearchResult> all_items;
 
     live_updates_init();
 
@@ -1535,6 +1602,7 @@ int run_ui(void){
     };
 
     auto update_results = [&]() {
+        if (!env_ok) return; // No valid DB - skip search
         // Don't block - just check if previous search is done
         if (search_th.joinable() && search_done) {
             search_th.join();
@@ -1596,6 +1664,69 @@ int run_ui(void){
 
                 if(indexing_active){
                     ImGui::Text("Indexing %llu files...", static_cast<unsigned long long>(indexing_progress));
+                }
+
+#ifdef _WIN32
+                // Check if indexer process is still running
+                if (indexer_running && hIndexerProcess) {
+                    DWORD exitCode = 0;
+                    if (GetExitCodeProcess(hIndexerProcess, &exitCode) && exitCode != STILL_ACTIVE) {
+                        CloseHandle(hIndexerProcess);
+                        hIndexerProcess = NULL;
+                        indexer_running = false;
+                        // Re-open DB now that indexing is done
+                        if (db) { db_close(db); db = nullptr; }
+                        if (env) { mdb_env_close(env); env = nullptr; }
+                        close_bloom();
+                        header = db_open_readonly(db_wpath, &db);
+                        db_ready = (header != nullptr);
+                        if (db_ready) {
+                            open_bloom(db_wpath);
+                            int rc = mdb_env_create(&env);
+                            if (rc == 0) {
+                                mdb_env_set_maxdbs(env, 64);
+                                rc = mdb_env_open(env, u8db, MDB_RDONLY, 0664);
+                                if (rc == 0) {
+                                    env_ok = true;
+                                    sta.env = env;
+                                    db_empty = false;
+                                    need_update = true;
+                                } else {
+                                    mdb_env_close(env); env = nullptr;
+                                }
+                            }
+                        }
+                    }
+                }
+#endif
+
+                // Show first-run / empty-index state
+                if (db_empty && !indexer_running) {
+                    ImGui::Spacing();
+                    ImGui::TextWrapped("Welcome to Anything! No file index exists yet.");
+                    ImGui::TextWrapped("Click 'Build Index' to scan all drives and create a searchable index of your files.");
+                    ImGui::Spacing();
+#ifdef _WIN32
+                    if (ImGui::Button("Build Index")) {
+                        wchar_t cmd[MAX_LONG_PATH * 2];
+                        _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1,
+                            L"\"%sanything.exe\" index --db \"%s\" --all-drives --ntfs --tail",
+                            exe_dir, db_wpath);
+                        STARTUPINFOW si = {}; si.cb = sizeof(si);
+                        PROCESS_INFORMATION pi = {};
+                        if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+                            CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                            CloseHandle(pi.hThread);
+                            hIndexerProcess = pi.hProcess;
+                            indexer_running = true;
+                        }
+                    }
+#endif
+                } else if (indexer_running) {
+                    ImGui::Spacing();
+                    ImGui::TextWrapped("Indexing in progress... This may take a few minutes.");
+                    ImGui::TextWrapped("You can close this window and reopen it after indexing completes.");
+                    ImGui::Spacing();
                 }
 
                 ImGui::BeginChild("ResultsAndPreview", ImVec2(0, 0), false);
@@ -1891,9 +2022,12 @@ int run_ui(void){
     }
     filtered.clear();
 
-    db_close(db);
-    mdb_env_close(env);
+    if (db) db_close(db);
+    if (env) mdb_env_close(env);
     close_bloom();
+#ifdef _WIN32
+    if (hIndexerProcess) CloseHandle(hIndexerProcess);
+#endif
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
