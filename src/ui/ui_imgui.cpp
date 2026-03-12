@@ -1681,6 +1681,10 @@ int run_ui(void){
 
     live_updates_init();
 
+    // Progress polling during indexing
+    double last_progress_poll = 0.0;
+    uint64_t indexing_file_count = 0;
+
     auto clear_filtered_results = [&]() {
         filtered.clear();
         selected = -1;
@@ -1774,6 +1778,27 @@ int run_ui(void){
                 }
 
 #ifdef _WIN32
+                // Poll LMDB for live progress during indexing
+                if (indexer_running && env) {
+                    double now_t = glfwGetTime();
+                    if (now_t - last_progress_poll > 1.5) {
+                        last_progress_poll = now_t;
+                        MDB_txn* ptxn = nullptr;
+                        if (mdb_txn_begin(env, nullptr, MDB_RDONLY, &ptxn) == 0) {
+                            MDB_dbi pmeta;
+                            if (mdb_dbi_open(ptxn, "meta", 0, &pmeta) == 0) {
+                                MDB_val pk, pv;
+                                const char* pH = "header";
+                                pk.mv_size = strlen(pH);
+                                pk.mv_data = const_cast<char*>(pH);
+                                if (mdb_get(ptxn, pmeta, &pk, &pv) == 0 && pv.mv_size >= sizeof(DbHeader)) {
+                                    indexing_file_count = ((const DbHeader*)pv.mv_data)->record_count;
+                                }
+                            }
+                            mdb_txn_abort(ptxn);
+                        }
+                    }
+                }
                 // Check if indexer process is still running
                 if (indexer_running && hIndexerProcess) {
                     DWORD exitCode = 0;
@@ -1836,17 +1861,29 @@ int run_ui(void){
                     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.42f, 0.61f, 0.88f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.12f, 0.12f, 0.18f, 1.0f));
                     if (ImGui::Button("Build Index", ImVec2(btn_w, 40))) {
-                        wchar_t cmd[MAX_LONG_PATH * 2];
-                        _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]) - 1,
-                            L"\"%sanything.exe\" index --db \"%s\" --all-drives --ntfs --tail",
-                            exe_dir, db_wpath);
-                        STARTUPINFOW si = {}; si.cb = sizeof(si);
-                        PROCESS_INFORMATION pi = {};
-                        if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
-                            CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-                            CloseHandle(pi.hThread);
-                            hIndexerProcess = pi.hProcess;
+                        // Close DB handles to avoid lock conflicts with indexer
+                        if (db) { db_close(db); db = nullptr; header = nullptr; }
+                        close_bloom();
+                        // Keep env open for progress monitoring (LMDB supports multi-process)
+
+                        // Launch indexer with admin elevation (NTFS USN journal requires it)
+                        wchar_t exe_path[MAX_LONG_PATH];
+                        _snwprintf(exe_path, MAX_LONG_PATH - 1, L"%sanything.exe", exe_dir);
+                        wchar_t params[MAX_LONG_PATH * 2];
+                        _snwprintf(params, sizeof(params) / sizeof(params[0]) - 1,
+                            L"index --db \"%s\" --all-drives --ntfs", db_wpath);
+                        SHELLEXECUTEINFOW sei = {};
+                        sei.cbSize = sizeof(sei);
+                        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+                        sei.lpVerb = L"runas";
+                        sei.lpFile = exe_path;
+                        sei.lpParameters = params;
+                        sei.nShow = SW_HIDE;
+                        if (ShellExecuteExW(&sei) && sei.hProcess) {
+                            hIndexerProcess = sei.hProcess;
                             indexer_running = true;
+                            indexing_file_count = 0;
+                            last_progress_poll = 0.0;
                         }
                     }
                     ImGui::PopStyleColor(4);
@@ -1866,7 +1903,11 @@ int run_ui(void){
                     ImGui::Text("Indexing in progress...");
                     ImGui::PopStyleColor();
                     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-                    ImGui::TextWrapped("Scanning your drives. This typically takes 1-5 minutes.");
+                    if (indexing_file_count > 0) {
+                        ImGui::Text("%llu files indexed so far", static_cast<unsigned long long>(indexing_file_count));
+                    } else {
+                        ImGui::TextWrapped("Scanning your drives. This typically takes 1-5 minutes.");
+                    }
                     ImGui::TextWrapped("You can start searching as soon as results appear.");
                     ImGui::Spacing();
                     // Simple animated dots
@@ -2198,7 +2239,13 @@ int run_ui(void){
             float footer_h = ImGui::GetFrameHeightWithSpacing();
             ImGui::SetCursorPosY(ImGui::GetWindowHeight() - footer_h - 8);
             ImGui::Separator();
-            if (db_ready && header) {
+            if (indexer_running) {
+                ImGui::Text("  %llu files indexed", static_cast<unsigned long long>(indexing_file_count));
+                ImGui::SameLine(0, 20);
+                ImGui::TextDisabled("|");
+                ImGui::SameLine(0, 20);
+                ImGui::Text("DB: %s", u8db);
+            } else if (db_ready && header) {
                 ImGui::Text("  %llu files indexed", static_cast<unsigned long long>(header->record_count));
                 ImGui::SameLine(0, 20);
                 ImGui::TextDisabled("|");
