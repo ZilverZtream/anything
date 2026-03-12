@@ -84,9 +84,12 @@ static BOOL http_post(const char* url,const char* token,const char* body,char** 
     curl_easy_setopt(curl,CURLOPT_URL,url);
     curl_easy_setopt(curl,CURLOPT_POST,1L);
     curl_easy_setopt(curl,CURLOPT_POSTFIELDS,body);
-    struct curl_slist* hdr=NULL; char auth[512];
-    snprintf(auth,sizeof(auth),"Authorization: Bearer %s",token);
-    hdr=curl_slist_append(hdr,auth);
+    struct curl_slist* hdr=NULL;
+    size_t auth_len = strlen("Authorization: Bearer ") + strlen(token) + 1;
+    char* auth = (char*)malloc(auth_len);
+    if(!auth){ curl_easy_cleanup(curl); return FALSE; }
+    snprintf(auth, auth_len, "Authorization: Bearer %s", token);
+    hdr=curl_slist_append(hdr,auth); free(auth);
     hdr=curl_slist_append(hdr,"Content-Type: application/json");
     curl_easy_setopt(curl,CURLOPT_HTTPHEADER,hdr);
     struct curl_buf buf={0};
@@ -184,7 +187,7 @@ cleanup:
 }
 
 static void icloud_shutdown(void){
-    // no persistent resources
+    memset(g_oauth_token, 0, sizeof(g_oauth_token));
 }
 
 static AnythingPlugin g_plugin={

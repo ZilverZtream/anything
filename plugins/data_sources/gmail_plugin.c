@@ -90,9 +90,13 @@ static BOOL http_get(const char* url, const char* token, char** out){
         return FALSE;
     }
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    struct curl_slist* hdr=NULL; char auth[512];
-    snprintf(auth,sizeof(auth),"Authorization: Bearer %s",token);
-    hdr=curl_slist_append(hdr,auth); curl_easy_setopt(curl,CURLOPT_HTTPHEADER,hdr);
+    struct curl_slist* hdr=NULL;
+    size_t auth_len = strlen("Authorization: Bearer ") + strlen(token) + 1;
+    char* auth = (char*)malloc(auth_len);
+    if(!auth){ curl_easy_cleanup(curl); return FALSE; }
+    snprintf(auth, auth_len, "Authorization: Bearer %s", token);
+    hdr=curl_slist_append(hdr,auth); free(auth);
+    curl_easy_setopt(curl,CURLOPT_HTTPHEADER,hdr);
     struct curl_buf buf={0};
     curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,curl_write_cb);
     curl_easy_setopt(curl,CURLOPT_WRITEDATA,&buf);
@@ -210,7 +214,7 @@ cleanup:
 }
 
 static void gmail_shutdown(void){
-    // no persistent resources
+    memset(g_oauth_token, 0, sizeof(g_oauth_token));
 }
 
 static AnythingPlugin g_plugin={

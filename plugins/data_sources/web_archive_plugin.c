@@ -143,7 +143,9 @@ static void init_state_path(void){
 // ---- HTTP fetch and HTML parsing ----
 struct curl_buf{ char* data; size_t size; };
 static size_t curl_write_cb(void* contents,size_t sz,size_t nmemb,void* userp){
+    if(sz && nmemb > SIZE_MAX / sz) return 0;
     size_t realsz=sz*nmemb; struct curl_buf* mem=(struct curl_buf*)userp;
+    if(realsz > SIZE_MAX - mem->size - 1) return 0;
     char* ptr=(char*)realloc(mem->data,mem->size+realsz+1);
     if(!ptr){
         free(mem->data);
@@ -158,6 +160,7 @@ static char* http_fetch(const char* url){
     if(!url) return NULL; static int inited=0; if(!inited){ curl_global_init(CURL_GLOBAL_DEFAULT); inited=1; }
     CURL* curl=curl_easy_init(); if(!curl) return NULL; struct curl_buf buf={0};
     curl_easy_setopt(curl,CURLOPT_URL,url); curl_easy_setopt(curl,CURLOPT_FOLLOWLOCATION,1L);
+    curl_easy_setopt(curl,CURLOPT_MAXREDIRS,5L);
     curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,curl_write_cb); curl_easy_setopt(curl,CURLOPT_WRITEDATA,&buf);
     CURLcode res=curl_easy_perform(curl); curl_easy_cleanup(curl);
     if(res!=CURLE_OK){ free(buf.data); return NULL; } return buf.data;

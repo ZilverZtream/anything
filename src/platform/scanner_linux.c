@@ -31,7 +31,7 @@ struct FileScanner {
     NetworkScanner* net;
 };
 
-static FileScanner* g_current;
+static _Thread_local FileScanner* g_current;
 
 static void emit(FileScanner* s, const char* parent, const char* name, const struct stat* st){
     DbWorkItem* wi;
@@ -120,13 +120,15 @@ static void* thread_proc(void* arg){
     g_current = s;
     nftw(s->root, enum_cb, 16, FTW_PHYS);
     char buf[4096];
-    for(;;){
+    while(!is_cancelled(s->cancel)){
         int len = read(s->inotify_fd, buf, sizeof(buf));
         if(len <= 0){ sched_yield(); continue; }
-        for(char* p = buf; p < buf + len; ){
+        for(char* p = buf; p + sizeof(struct inotify_event) <= buf + len; ){
             struct inotify_event* ev = (struct inotify_event*)p;
+            size_t ev_size = sizeof(struct inotify_event) + ev->len;
+            if(p + ev_size > buf + len) break;
             process_event(s, ev);
-            p += sizeof(struct inotify_event) + ev->len;
+            p += ev_size;
         }
     }
     return NULL;

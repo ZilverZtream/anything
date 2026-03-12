@@ -59,14 +59,23 @@ static void process_commit(const wchar_t* repo_path, git_repository* repo, const
     git_tree* commit_tree = NULL;
     git_tree* parent_tree = NULL;
     git_diff* diff = NULL;
-    git_commit_tree(&commit_tree, commit);
+    if(git_commit_tree(&commit_tree, commit) != 0){
+        git_commit_free(commit);
+        return;
+    }
     if(git_commit_parentcount(commit) > 0){
         git_commit* parent = NULL;
-        git_commit_parent(&parent, commit, 0);
-        git_commit_tree(&parent_tree, parent);
-        git_commit_free(parent);
+        if(git_commit_parent(&parent, commit, 0) == 0){
+            git_commit_tree(&parent_tree, parent);
+            git_commit_free(parent);
+        }
     }
-    git_diff_tree_to_tree(&diff, repo, parent_tree, commit_tree, NULL);
+    if(git_diff_tree_to_tree(&diff, repo, parent_tree, commit_tree, NULL) != 0){
+        git_tree_free(commit_tree);
+        git_tree_free(parent_tree);
+        git_commit_free(commit);
+        return;
+    }
     git_buf buf = GIT_BUF_INIT;
     git_diff_to_buf(&buf, diff, GIT_DIFF_FORMAT_PATCH);
 

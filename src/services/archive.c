@@ -112,7 +112,13 @@ BOOL index_archive(Db* db, const wchar_t* archive_path){
     }
     uint64_t parent_id = db_intern_wstring(db, archive_path);
     struct archive_entry* entry;
+    uint64_t total_entries = 0;
+    static const uint64_t MAX_ARCHIVE_ENTRIES = 500000; // prevent zip bombs
     while(archive_read_next_header(a, &entry) == ARCHIVE_OK){
+        if(++total_entries > MAX_ARCHIVE_ENTRIES){
+            fprintf(stderr, "[archive] entry limit exceeded for %s, aborting\n", u8);
+            break;
+        }
         const char* name = archive_entry_pathname(entry);
 
         // First check: Use libarchive's built-in path type detection

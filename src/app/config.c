@@ -1,6 +1,14 @@
 #include "core/pch.h"
+#include <limits.h>
 
 AppConfig g_config;
+
+static int safe_wcstol_int(const wchar_t* val){
+    long v = wcstol(val, NULL, 10);
+    if(v > INT_MAX) return INT_MAX;
+    if(v < INT_MIN) return INT_MIN;
+    return (int)v;
+}
 
 static FILE* cfg_fopen(const wchar_t* path, const wchar_t* mode){
 #ifdef _WIN32
@@ -42,17 +50,17 @@ BOOL config_load_file(const wchar_t* path){
         trim_newline(key);
         trim_newline(val);
         if(wcscmp(key, L"default_index_threads")==0){
-            g_config.default_index_threads = (int)wcstol(val, NULL, 10);
+            g_config.default_index_threads = safe_wcstol_int(val);
         } else if(wcscmp(key, L"max_index_threads")==0){
-            g_config.max_index_threads = (int)wcstol(val, NULL, 10);
+            g_config.max_index_threads = safe_wcstol_int(val);
         } else if(wcscmp(key, L"default_batch")==0){
-            g_config.default_batch = (int)wcstol(val, NULL, 10);
+            g_config.default_batch = safe_wcstol_int(val);
         } else if(wcscmp(key, L"default_search_workers")==0){
-            g_config.default_search_workers = (int)wcstol(val, NULL, 10);
+            g_config.default_search_workers = safe_wcstol_int(val);
         } else if(wcscmp(key, L"max_search_workers")==0){
-            g_config.max_search_workers = (int)wcstol(val, NULL, 10);
+            g_config.max_search_workers = safe_wcstol_int(val);
         } else if(wcscmp(key, L"max_content_index_bytes")==0){
-            g_config.max_content_index_bytes = (int)wcstol(val, NULL, 10);
+            g_config.max_content_index_bytes = safe_wcstol_int(val);
         }
     }
     fclose(f);

@@ -39,6 +39,7 @@
 #include <sstream>
 #include <array>
 #include <mutex>
+#include <shared_mutex>
 #include <cstring>
 extern "C" {
 #include "../../third_party/lmdb/lmdb.h"
@@ -91,6 +92,7 @@ static int bloom_fd = -1;
 #endif
 static const uint8_t* bloom_readonly_base = nullptr;
 static size_t g_bloom_size = 0;
+static std::shared_mutex g_bloom_rw_mu; // protects bloom_readonly_base + g_bloom_size + bloom_mapping
 
 static inline size_t bloom_log2_to_bytes(uint8_t log2){
     if(log2 >= 8 && log2 <= 20){
@@ -184,10 +186,14 @@ static void bloom_cache_reset(){
     g_bloom_cache_clock = 0;
 }
 
-static uint8_t* bloom_cache_get(uint64_t string_id, const StringMeta* meta, size_t* out_len){
-    if(!meta || meta->hash_count == 0 || meta->bloom_length == 0) return nullptr;
+static bool bloom_cache_copy(uint64_t string_id, const StringMeta* meta, std::vector<uint8_t>& out_data, size_t* out_len){
+    if(!meta || meta->hash_count == 0 || meta->bloom_length == 0) return false;
     size_t bloom_bytes = string_meta_bloom_bytes(meta);
-    if(bloom_bytes == 0 || !bloom_readonly_base) return nullptr;
+    if(bloom_bytes == 0) return false;
+
+    // Hold shared lock on the bloom mapping so it can't be unmapped while we read
+    std::shared_lock<std::shared_mutex> rlock(g_bloom_rw_mu);
+    if(!bloom_readonly_base) return false;
 
     std::lock_guard<std::mutex> lock(g_bloom_cache_mu);
     BloomCacheEntry* slot = nullptr;
@@ -197,7 +203,8 @@ static uint8_t* bloom_cache_get(uint64_t string_id, const StringMeta* meta, size
             if(e.bloom_offset == meta->bloom_offset && e.bloom_length == meta->bloom_length && e.bloom_log2 == meta->bloom_log2){
                 e.stamp = ++g_bloom_cache_clock;
                 if(out_len) *out_len = e.bloom_bytes;
-                return e.data.data();
+                out_data = e.data; // copy data while holding lock
+                return true;
             }
             slot = &e;
             break;
@@ -236,7 +243,7 @@ static uint8_t* bloom_cache_get(uint64_t string_id, const StringMeta* meta, size
     } else {
         if(!bloom_packbits_decompress(encoded, meta->bloom_length, slot->data.data(), bloom_bytes)){
             slot->in_use = false;
-            return nullptr;
+            return false;
         }
     }
 
@@ -249,10 +256,12 @@ static uint8_t* bloom_cache_get(uint64_t string_id, const StringMeta* meta, size
     slot->stamp = ++g_bloom_cache_clock;
     slot->in_use = true;
     if(out_len) *out_len = bloom_bytes;
-    return slot->data.data();
+    out_data = slot->data; // copy data while holding lock
+    return true;
 }
 
 static bool open_bloom(const wchar_t* dbPath){
+    std::unique_lock<std::shared_mutex> wlock(g_bloom_rw_mu);
 #ifdef _WIN32
     wchar_t bp[MAX_LONG_PATH]; swprintf(bp, MAX_LONG_PATH, L"%s\\bloom.dat", dbPath);
     wchar_t lp[MAX_LONG_PATH]; make_long_path(bp, lp, MAX_LONG_PATH);
@@ -287,6 +296,7 @@ static bool open_bloom(const wchar_t* dbPath){
 }
 
 static void close_bloom(){
+    std::unique_lock<std::shared_mutex> wlock(g_bloom_rw_mu);
     if(!bloom_readonly_base) return;
 #ifdef _WIN32
     UnmapViewOfFile(bloom_readonly_base);
@@ -1045,8 +1055,9 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
             bool ok = false;
             if(use_bloom && sm && sm->bloom_offset < g_bloom_size && g_bloom_size - sm->bloom_offset >= sm->bloom_length){
                 size_t bloom_bytes = 0;
-                uint8_t* bloom = bloom_cache_get(name_ids.ids[i], sm, &bloom_bytes);
-                if(bloom){
+                std::vector<uint8_t> bloom_copy;
+                if(bloom_cache_copy(name_ids.ids[i], sm, bloom_copy, &bloom_bytes)){
+                    const uint8_t* bloom = bloom_copy.data();
                     uint32_t mask = string_meta_bloom_mask(sm);
                     if(mask == 0 && bloom_bytes) mask = static_cast<uint32_t>(bloom_bytes * 8 - 1);
                     uint32_t hash_to_check = sm->hash_count;
