@@ -47,7 +47,9 @@ static BOOL normalize_archive_path(const char* name, char* out, size_t outcch){
             int hi = isxdigit((unsigned char)name[i+1]) ? (isdigit((unsigned char)name[i+1]) ? name[i+1]-'0' : tolower((unsigned char)name[i+1])-'a'+10) : -1;
             int lo = isxdigit((unsigned char)name[i+2]) ? (isdigit((unsigned char)name[i+2]) ? name[i+2]-'0' : tolower((unsigned char)name[i+2])-'a'+10) : -1;
             if(hi<0 || lo<0) return FALSE;
-            decoded[di++] = (char)((hi<<4)|lo);
+            char ch = (char)((hi<<4)|lo);
+            if(ch == '\0') return FALSE; // reject NUL bytes
+            decoded[di++] = ch;
             i+=2;
         }else{
             decoded[di++] = name[i];

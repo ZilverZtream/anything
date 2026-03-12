@@ -98,7 +98,8 @@ static void seen_add_mem(const char* url){
         Seen* tmp=(Seen*)realloc(g_seen,nc*sizeof(Seen));
         if(!tmp) return; g_seen=tmp; g_seen_cap=nc;
     }
-    g_seen[g_seen_count].url=strdup(url); g_seen_count++;
+    char* dup=strdup(url); if(!dup) return;
+    g_seen[g_seen_count].url=dup; g_seen_count++;
 }
 
 static void seen_add(const char* url){

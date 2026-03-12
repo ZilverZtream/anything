@@ -88,7 +88,7 @@ target_link_libraries(anything_core PUBLIC
     CURL::libcurl
     cjson
     libzip::zip
-    zstd::zstd
+    zstd::libzstd
 )
 
 if(UNIX)

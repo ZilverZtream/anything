@@ -84,10 +84,13 @@ static int enum_cb_net(const char* fpath, const struct stat* sb, int typeflag, s
     const char* name = fpath + ftwbuf->base;
     char parent[PATH_MAX];
     if(ftwbuf->base > 0){
-        strncpy(parent, fpath, ftwbuf->base);
-        parent[ftwbuf->base-1] = '\0';
+        size_t copy_len = (size_t)ftwbuf->base < sizeof(parent) ? (size_t)ftwbuf->base : sizeof(parent) - 1;
+        memcpy(parent, fpath, copy_len);
+        if(copy_len > 0 && parent[copy_len-1] == '/') copy_len--;
+        parent[copy_len] = '\0';
     } else {
-        strcpy(parent, fpath);
+        strncpy(parent, fpath, sizeof(parent));
+        parent[sizeof(parent)-1] = '\0';
     }
     emit_net(s, parent, name, sb);
     return 0;
@@ -177,10 +180,13 @@ static int enum_cb_net(const char* fpath, const struct stat* sb, int typeflag, s
     const char* name = fpath + ftwbuf->base;
     char parent[PATH_MAX];
     if(ftwbuf->base > 0){
-        strncpy(parent, fpath, ftwbuf->base);
-        parent[ftwbuf->base-1] = '\0';
+        size_t copy_len = (size_t)ftwbuf->base < sizeof(parent) ? (size_t)ftwbuf->base : sizeof(parent) - 1;
+        memcpy(parent, fpath, copy_len);
+        if(copy_len > 0 && parent[copy_len-1] == '/') copy_len--;
+        parent[copy_len] = '\0';
     } else {
-        strcpy(parent, fpath);
+        strncpy(parent, fpath, sizeof(parent));
+        parent[sizeof(parent)-1] = '\0';
     }
     emit_net(s, parent, name, sb);
     return 0;

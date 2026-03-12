@@ -240,13 +240,15 @@ typedef struct {
     size_t n;
 } IdMap;
 
-static void idmap_init(IdMap* m, size_t initial){
+static BOOL idmap_init(IdMap* m, size_t initial){
     m->cap = 1;
-    while(m->cap < initial) m->cap <<= 1;
+    while(m->cap < initial && m->cap < (SIZE_MAX / 2)) m->cap <<= 1;
     m->keys = (uint32_t*)malloc(m->cap * sizeof(uint32_t));
     m->vals = (uint16_t*)malloc(m->cap * sizeof(uint16_t));
+    if(!m->keys || !m->vals){ free(m->keys); free(m->vals); m->keys=NULL; m->vals=NULL; m->cap=0; m->n=0; return FALSE; }
     for(size_t i=0;i<m->cap;i++){ m->keys[i]=0xFFFFFFFFu; m->vals[i]=0; }
     m->n = 0;
+    return TRUE;
 }
 
 static void idmap_free(IdMap* m){
@@ -263,10 +265,13 @@ static BOOL idmap_get(IdMap* m, uint32_t key, uint16_t* out){
     }
 }
 
-static void idmap_grow(IdMap* m){
+static BOOL idmap_grow(IdMap* m){
     size_t oldcap = m->cap; uint32_t* oldk = m->keys; uint16_t* oldv = m->vals;
-    m->cap <<= 1; m->keys = (uint32_t*)malloc(m->cap*sizeof(uint32_t));
-    m->vals = (uint16_t*)malloc(m->cap*sizeof(uint16_t));
+    size_t newcap = m->cap << 1;
+    uint32_t* nk = (uint32_t*)malloc(newcap*sizeof(uint32_t));
+    uint16_t* nv = (uint16_t*)malloc(newcap*sizeof(uint16_t));
+    if(!nk || !nv){ free(nk); free(nv); return FALSE; }
+    m->cap = newcap; m->keys = nk; m->vals = nv;
     for(size_t i=0;i<m->cap;i++){ m->keys[i]=0xFFFFFFFFu; m->vals[i]=0; }
     m->n = 0;
     for(size_t i=0;i<oldcap;i++) if(oldk[i]!=0xFFFFFFFFu){
@@ -275,15 +280,16 @@ static void idmap_grow(IdMap* m){
         m->keys[j]=oldk[i]; m->vals[j]=oldv[i]; m->n++;
     }
     free(oldk); free(oldv);
+    return TRUE;
 }
 
-static void idmap_set(IdMap* m, uint32_t key, uint16_t val){
-    if(m->n * 2 >= m->cap) idmap_grow(m);
+static BOOL idmap_set(IdMap* m, uint32_t key, uint16_t val){
+    if(m->n * 2 >= m->cap){ if(!idmap_grow(m)) return FALSE; }
     size_t mask = m->cap - 1; size_t i = key & mask;
     for(;;){
         uint32_t k = m->keys[i];
-        if(k == 0xFFFFFFFFu){ m->keys[i]=key; m->vals[i]=val; m->n++; return; }
-        if(k == key){ m->vals[i]=val; return; }
+        if(k == 0xFFFFFFFFu){ m->keys[i]=key; m->vals[i]=val; m->n++; return TRUE; }
+        if(k == key){ m->vals[i]=val; return TRUE; }
         i = (i + 1) & mask;
     }
 }
@@ -311,11 +317,15 @@ typedef struct {
     BOOL done[3];          // completion flags per stage
 } ProgState;
 
-void prog_state_init(ProgState* ps, MPMCQueue* out){
+BOOL prog_state_init(ProgState* ps, MPMCQueue* out){
     InitializeCriticalSection(&ps->mu);
-    idmap_init(&ps->best, 1024);
+    if(!idmap_init(&ps->best, 1024)){
+        DeleteCriticalSection(&ps->mu);
+        return FALSE;
+    }
     ps->out = out;
     ps->done[0]=ps->done[1]=ps->done[2]=FALSE;
+    return TRUE;
 }
 
 void prog_state_release(ProgState* ps){
@@ -330,6 +340,7 @@ void prog_state_release(ProgState* ps){
 }
 
 void prog_submit(ProgState* ps, const uint32_t* ids, size_t n, uint8_t stage, uint8_t conf){
+    if(!ps || !ids || n==0) return;
     EnterCriticalSection(&ps->mu);
     for(size_t i=0;i<n;i++){
         uint32_t id = ids[i];
@@ -340,6 +351,7 @@ void prog_submit(ProgState* ps, const uint32_t* ids, size_t n, uint8_t stage, ui
         if(!have || stage>pst || (stage==pst && conf>pconf)){
             idmap_set(&ps->best, id, (uint16_t)((stage<<8)|conf));
             ProgHit* h = (ProgHit*)malloc(sizeof(ProgHit)); // ownership passed to consumer
+            if(!h) continue;
             h->rec_id = id; h->confidence = conf; h->stage = stage;
             MPMC_Push(ps->out, h);
         }
@@ -348,11 +360,10 @@ void prog_submit(ProgState* ps, const uint32_t* ids, size_t n, uint8_t stage, ui
 }
 
 void prog_mark_done(ProgState* ps, uint8_t stage){
-    if(stage<3){
-        EnterCriticalSection(&ps->mu);
-        ps->done[stage] = TRUE;
-        LeaveCriticalSection(&ps->mu);
-    }
+    if(!ps || stage>=3) return;
+    EnterCriticalSection(&ps->mu);
+    ps->done[stage] = TRUE;
+    LeaveCriticalSection(&ps->mu);
 }
 
 #ifndef THREAD_LOCAL
@@ -490,7 +501,7 @@ typedef enum TermType { TERM_NAME, TERM_AUTHOR, TERM_CAMERA, TERM_LENS, TERM_ART
 typedef struct { TokType type; TermType ttype; char* text; } Token;
 typedef struct { Token* items; int n, cap; } TokenList;
 static void tokenlist_init(TokenList* t){ t->items=NULL; t->n=t->cap=0; }
-static void tokenlist_push(TokenList* t, Token tk){ if(t->n==t->cap){ t->cap=t->cap?t->cap*2:64; t->items=(Token*)realloc(t->items,t->cap*sizeof(Token)); } t->items[t->n++]=tk; }
+static BOOL tokenlist_push(TokenList* t, Token tk){ if(t->n==t->cap){ size_t nc=t->cap?t->cap*2:64; Token* p=(Token*)realloc(t->items,nc*sizeof(Token)); if(!p) return FALSE; t->items=p; t->cap=nc; } t->items[t->n++]=tk; return TRUE; }
 static void tokenlist_free(TokenList* t){
     for(int i=0;i<t->n;i++){ if(t->items[i].type==TOK_TERM && t->items[i].text) free(t->items[i].text); }
     free(t->items); t->items=NULL; t->n=t->cap=0;
@@ -629,9 +640,11 @@ static int search_names(Query* q, SearchStageResult* results){
     size_t n = ids.n;
     if(g_prog_state && n>0){
         uint32_t* out=(uint32_t*)malloc(n*sizeof(uint32_t));
-        for(size_t i=0;i<n;i++) out[i]=(uint32_t)ids.ids[i];
-        prog_submit(g_prog_state,out,n,0,60);
-        free(out);
+        if(out){
+            for(size_t i=0;i<n;i++) out[i]=(uint32_t)ids.ids[i];
+            prog_submit(g_prog_state,out,n,0,60);
+            free(out);
+        }
     }
     prog_mark_done(g_prog_state,0);
     idvec_free(&ids);
@@ -736,9 +749,11 @@ static int search_metadata(Query* q, SearchStageResult* results){
     size_t n = ids.n;
     if(g_prog_state && n>0){
         uint32_t* out=(uint32_t*)malloc(n*sizeof(uint32_t));
-        for(size_t i=0;i<n;i++) out[i]=(uint32_t)ids.ids[i];
-        prog_submit(g_prog_state,out,n,1,75);
-        free(out);
+        if(out){
+            for(size_t i=0;i<n;i++) out[i]=(uint32_t)ids.ids[i];
+            prog_submit(g_prog_state,out,n,1,75);
+            free(out);
+        }
     }
     prog_mark_done(g_prog_state,1);
     idvec_free(&ids);
@@ -779,9 +794,11 @@ static int search_content(Query* q, SearchStageResult* results){
     size_t n = ids.n;
     if(g_prog_state && n>0){
         uint32_t* out=(uint32_t*)malloc(n*sizeof(uint32_t));
-        for(size_t i=0;i<n;i++) out[i]=(uint32_t)ids.ids[i];
-        prog_submit(g_prog_state,out,n,2,95);
-        free(out);
+        if(out){
+            for(size_t i=0;i<n;i++) out[i]=(uint32_t)ids.ids[i];
+            prog_submit(g_prog_state,out,n,2,95);
+            free(out);
+        }
     }
     prog_mark_done(g_prog_state,2);
     idvec_free(&ids);

@@ -176,6 +176,14 @@ static BOOL path_dirname(const wchar_t* path, wchar_t* out, size_t outcch){
     if(!p) return FALSE; *p=0; return TRUE;
 }
 
+// Reject cloud API names that could cause path traversal
+static BOOL name_safe(const char* name){
+    if(!name || !name[0]) return FALSE;
+    if(strchr(name,'/') || strchr(name,'\\') || strchr(name,':')) return FALSE;
+    if(strcmp(name,"..")==0 || strcmp(name,".")==0) return FALSE;
+    return TRUE;
+}
+
 static void to_wide(const char* u8, wchar_t* w, size_t wcap){
     if(!u8 || !w || wcap==0){ if(w) w[0]=0; return; }
 #ifdef _WIN32
@@ -188,8 +196,10 @@ static void to_wide(const char* u8, wchar_t* w, size_t wcap){
 
 struct curl_buf { char* data; size_t size; };
 static size_t curl_write_cb(void* contents, size_t size, size_t nmemb, void* userp){
+    if(size && nmemb > SIZE_MAX / size) return 0;
     size_t realsize = size * nmemb;
     struct curl_buf* mem = (struct curl_buf*)userp;
+    if(realsize > SIZE_MAX - mem->size - 1) return 0;
     char* ptr = (char*)realloc(mem->data, mem->size + realsize + 1);
     if(!ptr){
         free(mem->data);
@@ -406,7 +416,7 @@ static void onedrive_walk(const char* token, const wchar_t* root, const char* ro
         cJSON_ArrayForEach(item, value){
             cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
             cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
-            if(cJSON_IsString(name) && cJSON_IsString(id)){
+            if(cJSON_IsString(name) && cJSON_IsString(id) && name_safe(name->valuestring)){
                 uint64_t size=0; uint64_t ct=0, mt=0;
                 cJSON* sizeItem = cJSON_GetObjectItemCaseSensitive(item, "size");
                 if(cJSON_IsNumber(sizeItem)) size = (uint64_t)sizeItem->valuedouble;
@@ -494,7 +504,7 @@ static void google_drive_walk(const char* token, const wchar_t* root, const char
         cJSON_ArrayForEach(item, files){
             cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
             cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
-            if(cJSON_IsString(name) && cJSON_IsString(id)){
+            if(cJSON_IsString(name) && cJSON_IsString(id) && name_safe(name->valuestring)){
                 const char* mime = NULL;
                 cJSON* mimeItem = cJSON_GetObjectItemCaseSensitive(item, "mimeType");
                 if(cJSON_IsString(mimeItem)) mime = mimeItem->valuestring;
@@ -540,7 +550,7 @@ static void pcloud_process(cJSON* contents, const wchar_t* parent, MPMCQueue* q)
     cJSON* item;
     cJSON_ArrayForEach(item, contents){
         cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
-        if(!cJSON_IsString(name)) continue;
+        if(!cJSON_IsString(name) || !name_safe(name->valuestring)) continue;
         cJSON* sizeItem = cJSON_GetObjectItemCaseSensitive(item, "size");
         cJSON* isfolder = cJSON_GetObjectItemCaseSensitive(item, "isfolder");
         uint64_t size=0;
@@ -586,7 +596,7 @@ static void dropbox_walk(const char* token, const wchar_t* parent, MPMCQueue* q)
             cJSON_ArrayForEach(item, entries){
                 cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
                 cJSON* path_lower = cJSON_GetObjectItemCaseSensitive(item, "path_lower");
-                if(cJSON_IsString(name) && cJSON_IsString(path_lower)){
+                if(cJSON_IsString(name) && cJSON_IsString(path_lower) && name_safe(name->valuestring)){
                     cJSON* tag = cJSON_GetObjectItemCaseSensitive(item, ".tag");
                     BOOL is_dir = cJSON_IsString(tag) && strcmp(tag->valuestring,"folder")==0;
                     uint64_t size=0;
