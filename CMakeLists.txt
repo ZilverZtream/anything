@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.16)
 project(Anything C CXX)
 
 # --- Project Settings ---
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -30,6 +30,8 @@ find_package(LibArchive REQUIRED)
 find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(libzip CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
+find_package(imgui CONFIG REQUIRED)
+find_package(Stb REQUIRED)
 if(UNIX)
     find_package(libpst CONFIG REQUIRED)
 endif()
@@ -129,14 +131,17 @@ target_link_libraries(anything PRIVATE
 target_link_libraries(anything_ui PRIVATE
     anything_core
     glfw
+    imgui::imgui
     CURL::libcurl
     cjson
 )
+target_compile_definitions(anything_ui PRIVATE HAS_IMGUI NOMINMAX)
+target_include_directories(anything_ui PRIVATE ${Stb_INCLUDE_DIR})
 
 target_link_libraries(search_test PRIVATE anything_core)
 
 if(WIN32)
-    target_link_libraries(anything_ui PRIVATE gdiplus.lib d2d1.lib dwrite.lib Shlwapi.lib Shell32.lib)
+    target_link_libraries(anything_ui PRIVATE gdiplus.lib d2d1.lib dwrite.lib Shlwapi.lib Shell32.lib opengl32.lib)
 endif()
 
 # =============================================================================

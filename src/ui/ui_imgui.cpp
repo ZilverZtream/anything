@@ -4,7 +4,10 @@
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
+#include <imgui_impl_opengl3_loader.h>
+#include <imgui_stdlib.h>
 #include <GLFW/glfw3.h>
+#define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include "TextEditor.h"
 #ifdef _WIN32
@@ -40,6 +43,12 @@
 extern "C" {
 #include "../../third_party/lmdb/lmdb.h"
 }
+#ifndef GL_RGB
+#define GL_RGB 0x1907
+#endif
+#ifndef GL_RED
+#define GL_RED 0x1903
+#endif
 #endif
 #include <stdio.h>
 
@@ -51,6 +60,26 @@ extern "C" {
 #endif
 
 #ifdef HAS_IMGUI
+
+// --- Live updates stubs (originals are in anything.c which is CLI-only) ---
+static MPMCQueue g_ui_live_updates;
+static BOOL g_ui_live_inited = FALSE;
+extern "C" void live_updates_init(void) {
+    if (!g_ui_live_inited) {
+        MPMC_Init(&g_ui_live_updates, 1 << 12);
+        g_ui_live_inited = TRUE;
+    }
+}
+extern "C" BOOL live_updates_poll(LiveUpdate* out) {
+    if (!g_ui_live_inited || !out) return FALSE;
+    void* p = NULL;
+    if (!MPMC_Pop(&g_ui_live_updates, &p)) return FALSE;
+    if (!p) return FALSE;
+    LiveUpdate* lu = (LiveUpdate*)p;
+    *out = *lu;
+    return TRUE;
+}
+
 #ifndef MDB_DBI_INVALID
 #define MDB_DBI_INVALID ((MDB_dbi)~(unsigned)0)
 #endif
@@ -274,7 +303,7 @@ static void close_bloom(){
     g_bloom_size = 0;
     bloom_cache_reset();
 }
-struct Result {
+struct SearchResult {
     std::string filename;
     std::string path;
     std::string snippet;
@@ -293,7 +322,7 @@ struct Result {
 };
 
 struct ProgressiveResult {
-    Result result;
+    SearchResult result;
     int stage = 0;
     bool done = false;
 };
@@ -431,9 +460,9 @@ static void render_markdown(const std::string& text) {
 enum ResultColumn { COL_NAME, COL_PATH, COL_SIZE, COL_MOD, COL_SCORE };
 
 struct TieredResults {
-    std::vector<Result> hot_window;
-    std::vector<Result> cold_storage;
-    std::vector<Result*> view_cache;
+    std::vector<SearchResult> hot_window;
+    std::vector<SearchResult> cold_storage;
+    std::vector<SearchResult*> view_cache;
     size_t hot_limit = 1000;
     float min_hot_score = -std::numeric_limits<float>::infinity();
     int last_sort_column = COL_SCORE;
@@ -450,13 +479,13 @@ struct TieredResults {
         view_dirty = true;
     }
 
-    void insert(Result&& r) {
+    void insert(SearchResult&& r) {
         if (hot_window.size() < hot_limit || r.score > min_hot_score) {
             auto it = std::lower_bound(hot_window.begin(), hot_window.end(), r.score,
-                [](const Result& existing, float score) { return existing.score > score; });
+                [](const SearchResult& existing, float score) { return existing.score > score; });
             hot_window.insert(it, std::move(r));
             if (hot_window.size() > hot_limit) {
-                Result demoted = std::move(hot_window.back());
+                SearchResult demoted = std::move(hot_window.back());
                 hot_window.pop_back();
                 release_texture(demoted);
                 cold_storage.push_back(std::move(demoted));
@@ -468,13 +497,13 @@ struct TieredResults {
         }
     }
 
-    void upsert(Result&& r) {
+    void upsert(SearchResult&& r) {
         if (r.stage <= 0) {
             insert(std::move(r));
             return;
         }
-        auto merge_into = [&](std::vector<Result>& bucket) -> bool {
-            for (Result& existing : bucket) {
+        auto merge_into = [&](std::vector<SearchResult>& bucket) -> bool {
+            for (SearchResult& existing : bucket) {
                 if (existing.rec_id == r.rec_id) {
                     apply_stage_update(existing, r);
                     return true;
@@ -491,7 +520,7 @@ struct TieredResults {
 
     size_t size() const { return hot_window.size(); }
 
-    const std::vector<Result*>& view(const ImGuiTableSortSpecs* specs, bool force_rebuild) {
+    const std::vector<SearchResult*>& view(const ImGuiTableSortSpecs* specs, bool force_rebuild) {
         int desired_col = COL_SCORE;
         ImGuiSortDirection desired_dir = ImGuiSortDirection_Descending;
         if (specs && specs->SpecsCount > 0) {
@@ -504,7 +533,7 @@ struct TieredResults {
         if (force_rebuild || view_dirty || desired_col != last_sort_column || desired_dir != last_sort_dir) {
             view_cache.clear();
             view_cache.reserve(hot_window.size());
-            for (Result& r : hot_window) {
+            for (SearchResult& r : hot_window) {
                 view_cache.push_back(&r);
             }
             if (desired_col == COL_SCORE) {
@@ -512,7 +541,7 @@ struct TieredResults {
                     std::reverse(view_cache.begin(), view_cache.end());
                 }
             } else {
-                auto cmp = [desired_col, desired_dir](const Result* a, const Result* b) {
+                auto cmp = [desired_col, desired_dir](const SearchResult* a, const SearchResult* b) {
                     bool asc = (desired_dir == ImGuiSortDirection_Ascending);
                     switch (desired_col) {
                         case COL_NAME: return asc ? a->filename < b->filename : a->filename > b->filename;
@@ -532,15 +561,15 @@ struct TieredResults {
     }
 
 private:
-    void release_texture(Result& r) {
+    void release_texture(SearchResult& r) {
         if (r.texture != 0) {
             glDeleteTextures(1, &r.texture);
             r.texture = 0;
         }
     }
 
-    void release_bucket(std::vector<Result>& bucket) {
-        for (Result& r : bucket) {
+    void release_bucket(std::vector<SearchResult>& bucket) {
+        for (SearchResult& r : bucket) {
             release_texture(r);
         }
     }
@@ -553,7 +582,7 @@ private:
         }
     }
 
-    void apply_stage_update(Result& dest, Result& src) {
+    void apply_stage_update(SearchResult& dest, SearchResult& src) {
         if (src.stage == 0) {
             if (!src.filename.empty()) dest.filename = std::move(src.filename);
             if (!src.path.empty()) dest.path = std::move(src.path);
@@ -648,7 +677,7 @@ static void delete_path_os(const std::string& p){
 #endif
 }
 
-static void load_result_texture(Result& r) {
+static void load_result_texture(SearchResult& r) {
     std::string full = r.preview_path.empty() ? r.path + "\\" + r.filename : r.preview_path;
     int channels;
     unsigned char* data = stbi_load(full.c_str(), &r.width, &r.height, &channels, 0);
@@ -670,22 +699,44 @@ struct IdVec {
     size_t n, cap;
 };
 
-void idvec_init(IdVec* v) { v->ids = NULL; v->n = v->cap = 0; }
+struct RankedResult {
+    uint64_t rec_id;
+    float score;
+};
 
-void idvec_push(IdVec* v, uint64_t x) {
+struct SearchQuery {
+    char* name_pattern;
+    char* content_pattern;
+    char* author_pattern;
+    char* camera_pattern;
+    char* lens_pattern;
+    char* artist_pattern;
+    char* album_pattern;
+    char* title_pattern;
+    char* ext_pattern;
+    uint64_t size_min, size_max;
+    uint64_t date_min_day, date_max_day;
+    char* path_filter;
+    bool regex_mode;
+    bool whole_word;
+};
+
+static void idvec_init(IdVec* v) { v->ids = NULL; v->n = v->cap = 0; }
+
+static void idvec_push(IdVec* v, uint64_t x) {
     if (v->n == v->cap) { v->cap = v->cap ? v->cap * 2 : 512; v->ids = (uint64_t*)realloc(v->ids, v->cap * sizeof(uint64_t)); }
     v->ids[v->n++] = x;
 }
 
-void idvec_free(IdVec* v) { free(v->ids); v->ids = NULL; v->n = v->cap = 0; }
+static void idvec_free(IdVec* v) { free(v->ids); v->ids = NULL; v->n = v->cap = 0; }
 
-int cmp_u64(const void* A, const void* B) {
+static int ui_cmp_u64(const void* A, const void* B) {
     uint64_t a = *(const uint64_t*)A, b = *(const uint64_t*)B;
     return (a > b) - (a < b);
 }
 
-void sort_unique(IdVec* v) {
-    qsort(v->ids, v->n, sizeof(uint64_t), cmp_u64);
+static void sort_unique(IdVec* v) {
+    qsort(v->ids, v->n, sizeof(uint64_t), ui_cmp_u64);
     size_t w = 0; uint64_t prev = 0;
     for (size_t i = 0; i < v->n; i++) {
         if (i == 0 || v->ids[i] != prev) {
@@ -699,7 +750,7 @@ static size_t lower_bound_u64(const uint64_t* arr, size_t n, uint64_t x){
     size_t lo=0, hi=n; while(lo<hi){ size_t mid=lo+((hi-lo)>>1); if(arr[mid]<x) lo=mid+1; else hi=mid; } return lo;
 }
 
-void intersect_inplace(IdVec* a, const IdVec* b) {
+static void intersect_inplace(IdVec* a, const IdVec* b) {
     if(a->n==0 || b->n==0){ a->n=0; return; }
     if(a->n*8 < b->n){
         size_t w=0, j=0;
@@ -719,7 +770,7 @@ void intersect_inplace(IdVec* a, const IdVec* b) {
     a->n=w;
 }
 
-void union_inplace(IdVec* a, const IdVec* b) {
+static void union_inplace(IdVec* a, const IdVec* b) {
     if(b->n==0) return;
     size_t need=a->n+b->n;
     if(a->cap < need){ a->cap = need; a->ids = (uint64_t*)realloc(a->ids, a->cap*sizeof(uint64_t)); }
@@ -880,7 +931,7 @@ void collect_trigram_candidates(MDB_txn* txn, MDB_dbi dbi_trigram, const std::st
     bool first = true;
     for (size_t i = 0; i + 3 <= len; i++) {
         uint32_t key = ((uint8_t)tmp[i] << 16) | ((uint8_t)tmp[i + 1] << 8) | ((uint8_t)tmp[i + 2]);
-        MDB_val k = {.mv_data = &key, .mv_size = 3};
+        MDB_val k = {.mv_size = 3, .mv_data = &key};
         MDB_cursor* c = nullptr;
         mdb_cursor_open(txn, dbi_trigram, &c);
         IdVec gram; idvec_init(&gram);
@@ -951,8 +1002,8 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
     uint32_t hbuf[4096]; size_t hn = 0;
     if(use_bloom){
         const uint32_t seeds[4] = {0xA5A5A5A5u, 0x3C3C3C3Cu, 0x5A5A5A5Au, 0x1F1F1F1Fu};
-        size_t limit = std::min(term_len, static_cast<size_t>(DB_BLOOM_MAX_BYTES));
-        size_t full = std::min(limit, static_cast<size_t>(DB_BLOOM_STRIDE_AFTER));
+        size_t limit = (std::min)(term_len, static_cast<size_t>(DB_BLOOM_MAX_BYTES));
+        size_t full = (std::min)(limit, static_cast<size_t>(DB_BLOOM_STRIDE_AFTER));
         auto append_hashes = [&](size_t idx){
             if(idx + 3 > limit || hn + 4 > (sizeof(hbuf)/sizeof(hbuf[0]))) return;
             for(uint32_t seed : seeds){
@@ -975,7 +1026,7 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
     if(name_ids.n > 0){
         size_t keep = 0;
         for(size_t i = 0; i < name_ids.n; ++i){
-            MDB_val key = {.mv_data = &name_ids.ids[i], .mv_size = sizeof(uint64_t)};
+            MDB_val key = {.mv_size = sizeof(uint64_t), .mv_data = &name_ids.ids[i]};
             MDB_val val;
             if(mdb_get(txn, dbi_strings, &key, &val) != 0) continue;
             MDB_val text_val;
@@ -1030,7 +1081,7 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
     mdb_cursor_open(txn, dbi_fname, &cix);
     if(name_ids.n > 0){
         for(size_t i = 0; i < name_ids.n; ++i){
-            MDB_val k = {.mv_data = &name_ids.ids[i], .mv_size = sizeof(uint64_t)};
+            MDB_val k = {.mv_size = sizeof(uint64_t), .mv_data = &name_ids.ids[i]};
             MDB_val v;
             if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY) == 0){
                 do {
@@ -1064,7 +1115,7 @@ void records_for_name(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_fname, MDB_
                 norm.assign(tmp.data());
             }
             if(fuzzy_match(norm.c_str(), npat.c_str(), maxd)){
-                MDB_val k = {.mv_data = &sid, .mv_size = sizeof(sid)};
+                MDB_val k = {.mv_size = sizeof(sid), .mv_data = &sid};
                 MDB_val v;
                 if(mdb_cursor_get(cix, &k, &v, MDB_SET_KEY) == 0){
                     do {
@@ -1086,7 +1137,7 @@ void records_for_content(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_content,
     MDB_cursor* cc = nullptr;
     mdb_cursor_open(txn, dbi_content, &cc);
     for (size_t i = 0; i < ids.n; i++) {
-        MDB_val k = {.mv_data = &ids.ids[i], .mv_size = sizeof(uint64_t)};
+        MDB_val k = {.mv_size = sizeof(uint64_t), .mv_data = &ids.ids[i]};
         MDB_val v;
         if (mdb_cursor_get(cc, &k, &v, MDB_SET_KEY) == 0) {
             do {
@@ -1099,13 +1150,13 @@ void records_for_content(MDB_txn* txn, MDB_dbi dbi_trigram, MDB_dbi dbi_content,
 }
 
 void records_for_author(MDB_txn* txn, MDB_dbi dbi_author, MDB_dbi dbi_strrev, const std::string& author, IdVec* out) {
-    MDB_val k = {.mv_data = (void*)author.c_str(), .mv_size = author.length()};
+    MDB_val k = {.mv_size = author.length(), .mv_data = (void*)author.c_str()};
     MDB_val v;
     if (mdb_get(txn, dbi_strrev, &k, &v) == 0) {
         uint64_t sid = *(uint64_t*)v.mv_data;
         MDB_cursor* ca = nullptr;
         mdb_cursor_open(txn, dbi_author, &ca);
-        MDB_val ak = {.mv_data = &sid, .mv_size = sizeof(sid)};
+        MDB_val ak = {.mv_size = sizeof(sid), .mv_data = &sid};
         MDB_val av;
         if (mdb_cursor_get(ca, &ak, &av, MDB_SET_KEY) == 0) {
             do {
@@ -1118,7 +1169,7 @@ void records_for_author(MDB_txn* txn, MDB_dbi dbi_author, MDB_dbi dbi_strrev, co
 
 void records_for_ext(MDB_txn* txn, MDB_dbi dbi_ext, const std::string& ext, IdVec* out) {
     std::string buf = to_lower(ext);
-    MDB_val k = {.mv_data = (void*)buf.c_str(), .mv_size = buf.length()};
+    MDB_val k = {.mv_size = buf.length(), .mv_data = (void*)buf.c_str()};
     MDB_cursor* ce = nullptr;
     mdb_cursor_open(txn, dbi_ext, &ce);
     MDB_val v;
@@ -1128,6 +1179,35 @@ void records_for_ext(MDB_txn* txn, MDB_dbi dbi_ext, const std::string& ext, IdVe
         } while (mdb_cursor_get(ce, &k, &v, MDB_NEXT_DUP) == 0);
     }
     mdb_cursor_close(ce);
+}
+
+static float ui_calculate_relevance(MDB_txn* txn, MDB_dbi dbi_strings, const DbRecord* r, const char* parent_utf8, const char* name_utf8, const SearchQuery* q, size_t total_docs, size_t docs_with_term) {
+    (void)txn; (void)dbi_strings; (void)parent_utf8; (void)total_docs;
+    float score = 0.0f;
+    if (q->name_pattern && name_utf8) {
+        std::string ln = to_lower(name_utf8);
+        std::string lp = to_lower(q->name_pattern);
+        if (ln == lp) score += 3.0f;
+        else if (ln.find(lp) == 0) score += 2.0f;
+        else if (ln.find(lp) != std::string::npos) score += 1.0f;
+        float idf = (docs_with_term > 0) ? logf((float)(total_docs + 1) / (float)(docs_with_term + 1)) : 0.0f;
+        score += idf * 0.1f;
+    }
+    uint64_t now_days = (uint64_t)(time(nullptr) / 86400);
+    uint64_t mod_days = filetime_days(r->modified_time);
+    if (now_days > mod_days) {
+        float age = (float)(now_days - mod_days);
+        score += 1.0f / (1.0f + age / 365.0f);
+    }
+    return score;
+}
+
+static int cmp_rank(const void* a, const void* b) {
+    float sa = ((const RankedResult*)a)->score;
+    float sb = ((const RankedResult*)b)->score;
+    if (sb > sa) return 1;
+    if (sb < sa) return -1;
+    return 0;
 }
 
 typedef void (*RecordCallback)(uint64_t id, void* ctx);
@@ -1146,13 +1226,9 @@ static void stream_all_records(MDB_txn* txn, MDB_dbi dbi_date,
 }
 
 struct DiffCtx { const IdVec* excl; IdVec* out; };
-static int cmp_u64(const void* a, const void* b) {
-    uint64_t ua = *(const uint64_t*)a, ub = *(const uint64_t*)b;
-    if (ua < ub) return -1; if (ua > ub) return 1; return 0;
-}
 static void diff_collect(uint64_t id, void* p) {
     DiffCtx* c = (DiffCtx*)p;
-    if (!bsearch(&id, c->excl->ids, c->excl->n, sizeof(uint64_t), cmp_u64))
+    if (!bsearch(&id, c->excl->ids, c->excl->n, sizeof(uint64_t), ui_cmp_u64))
         idvec_push(c->out, id);
 }
 
@@ -1257,28 +1333,28 @@ static void search_thread(SearchThreadArgs* sta) {
     sq.whole_word = sta->filters.whole_word;
     for (size_t i = 0; i < rec_ids.n; i++) {
         uint64_t rid = rec_ids.ids[i];
-        MDB_val rk = {.mv_data = &rid, .mv_size = sizeof(rid)};
+        MDB_val rk = {.mv_size = sizeof(rid), .mv_data = &rid};
         MDB_val rv;
         if (mdb_get(txn, dbi_records, &rk, &rv) != 0 || rv.mv_size < sizeof(DbRecord)) continue;
         DbRecord* r = (DbRecord*)rv.mv_data;
         if (r->file_size < sq.size_min || r->file_size > sq.size_max) continue;
         uint64_t day = filetime_days(r->modified_time);
         if (day < sq.date_min_day || day > sq.date_max_day) continue;
-        MDB_val pk = {.mv_data = &r->parent_str_id, .mv_size = sizeof(r->parent_str_id)};
+        MDB_val pk = {.mv_size = sizeof(r->parent_str_id), .mv_data = &r->parent_str_id};
         MDB_val pv;
-        MDB_val nk = {.mv_data = &r->name_str_id, .mv_size = sizeof(r->name_str_id)};
+        MDB_val nk = {.mv_size = sizeof(r->name_str_id), .mv_data = &r->name_str_id};
         MDB_val nv;
         if (mdb_get(txn, dbi_strings, &pk, &pv) != 0) continue;
         if (mdb_get(txn, dbi_strings, &nk, &nv) != 0) continue;
         std::string parent = string_from_value_trimmed(pv);
         std::string name = string_from_value_trimmed(nv);
         std::string lower_parent = to_lower(parent);
-        if (!sq.path_filter.empty() && lower_parent.find(to_lower(sq.path_filter)) == std::string::npos) continue;
+        if ((sq.path_filter && sq.path_filter[0]) && lower_parent.find(to_lower(std::string(sq.path_filter))) == std::string::npos) continue;
         std::string ext = "";
         size_t dot = name.rfind('.');
         if (dot != std::string::npos) ext = to_lower(name.substr(dot + 1));
-        if (!sq.ext_pattern.empty() && ext != to_lower(sq.ext_pattern)) continue;
-        float score = calculate_relevance(txn, dbi_strings, r, parent.c_str(), name.c_str(), &sq, total_docs, docs_with_term);
+        if ((sq.ext_pattern && sq.ext_pattern[0]) && ext != to_lower(std::string(sq.ext_pattern))) continue;
+        float score = ui_calculate_relevance(txn, dbi_strings, r, parent.c_str(), name.c_str(), &sq, total_docs, docs_with_term);
         ranked[rankedn].rec_id = rid;
         ranked[rankedn].score = score;
         rankedn++;
@@ -1286,13 +1362,13 @@ static void search_thread(SearchThreadArgs* sta) {
     qsort(ranked.data(), rankedn, sizeof(RankedResult), cmp_rank);
     for (size_t i = 0; i < rankedn && i < 1000; i++) {
         uint64_t rid = ranked[i].rec_id;
-        MDB_val rk = {.mv_data = &rid, .mv_size = sizeof(rid)};
+        MDB_val rk = {.mv_size = sizeof(rid), .mv_data = &rid};
         MDB_val rv;
         if (mdb_get(txn, dbi_records, &rk, &rv) != 0) continue;
         DbRecord* r = (DbRecord*)rv.mv_data;
         MDB_val pv, nv;
-        MDB_val pk = {.mv_data = &r->parent_str_id, .mv_size = sizeof(r->parent_str_id)};
-        MDB_val nk = {.mv_data = &r->name_str_id, .mv_size = sizeof(r->name_str_id)};
+        MDB_val pk = {.mv_size = sizeof(r->parent_str_id), .mv_data = &r->parent_str_id};
+        MDB_val nk = {.mv_size = sizeof(r->name_str_id), .mv_data = &r->name_str_id};
         if (mdb_get(txn, dbi_strings, &pk, &pv) != 0) continue;
         if (mdb_get(txn, dbi_strings, &nk, &nv) != 0) continue;
         ProgressiveResult* stage0 = new ProgressiveResult();
@@ -1322,7 +1398,7 @@ static void search_thread(SearchThreadArgs* sta) {
         std::string snippet;
         std::string preview_path;
         if (r->content_str_id) {
-            MDB_val ck = {.mv_data = &r->content_str_id, .mv_size = sizeof(r->content_str_id)};
+            MDB_val ck = {.mv_size = sizeof(r->content_str_id), .mv_data = &r->content_str_id};
             MDB_val cv;
             if (mdb_get(txn, dbi_strings, &ck, &cv) == 0) {
                 snippet = string_from_value_trimmed(cv);
@@ -1330,7 +1406,7 @@ static void search_thread(SearchThreadArgs* sta) {
             }
         }
         if (r->preview_str_id) {
-            MDB_val pk_img = {.mv_data = &r->preview_str_id, .mv_size = sizeof(r->preview_str_id)};
+            MDB_val pk_img = {.mv_size = sizeof(r->preview_str_id), .mv_data = &r->preview_str_id};
             MDB_val pvimg;
             if (mdb_get(txn, dbi_strings, &pk_img, &pvimg) == 0) {
                 preview_path = string_from_value_trimmed(pvimg);
@@ -1442,7 +1518,7 @@ int run_ui(void){
     strncpy(sta.db_path, u8db, sizeof(sta.db_path) - 1);
     sta.db_path[sizeof(sta.db_path) - 1] = '\0';
 
-    std::vector<Result> all_items; // Dummy if needed
+    std::vector<SearchResult> all_items; // Dummy if needed
 
     live_updates_init();
 
@@ -1532,7 +1608,7 @@ int run_ui(void){
                     ImGui::BeginChild("ResultsList", ImVec2(0, 0), false, ImGuiWindowFlags_None);
                     results_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
                     ImGuiTableFlags tflags = ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_NoSavedSettings;
-                    const std::vector<Result*>* current_view = nullptr;
+                    const std::vector<SearchResult*>* current_view = nullptr;
                     size_t current_view_size = filtered.size();
                     if (ImGui::BeginTable("ResultsTable", 6, tflags)) {
                         ImGui::TableSetupScrollFreeze(0,1);
@@ -1545,7 +1621,7 @@ int run_ui(void){
                         ImGui::TableHeadersRow();
                         ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
                         bool force_rebuild = need_sort || (sort_specs && sort_specs->SpecsDirty);
-                        const std::vector<Result*>& visible = filtered.view(sort_specs, force_rebuild);
+                        const std::vector<SearchResult*>& visible = filtered.view(sort_specs, force_rebuild);
                         current_view = &visible;
                         current_view_size = visible.size();
                         if (sort_specs) {
@@ -1556,7 +1632,7 @@ int run_ui(void){
                         clipper.Begin(static_cast<int>(visible.size()));
                         while (clipper.Step()) {
                             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
-                                Result& r = *visible[static_cast<size_t>(row)];
+                                SearchResult& r = *visible[static_cast<size_t>(row)];
                                 ImGui::TableNextRow();
                                 ImGui::TableSetColumnIndex(1);
                                 ImGui::PushID(row);
@@ -1600,7 +1676,7 @@ int run_ui(void){
                     ImGui::EndChild();
 
                     if (!current_view) {
-                        const std::vector<Result*>& fallback = filtered.view(nullptr, false);
+                        const std::vector<SearchResult*>& fallback = filtered.view(nullptr, false);
                         current_view = &fallback;
                         current_view_size = fallback.size();
                     }
@@ -1611,7 +1687,7 @@ int run_ui(void){
                         if (ImGui::IsKeyPressed(ImGuiKey_DownArrow) && selected + 1 < (int)current_view_size) selected++;
                         if (selected >= (int)current_view_size) selected = (int)current_view_size - 1;
                         if (selected >= 0 && selected < (int)current_view_size && current_view) {
-                            const Result& r = *(*current_view)[selected];
+                            const SearchResult& r = *(*current_view)[selected];
                             std::string full = r.path + "\\" + r.filename;
                             if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
                                 open_file_os(full);
@@ -1633,7 +1709,7 @@ int run_ui(void){
                     ImGui::TableNextColumn();
                     ImGui::BeginChild("QuickViewPane", ImVec2(0, 0), false, ImGuiWindowFlags_None);
                     if (selected >= 0 && selected < static_cast<int>(current_view_size) && current_view) {
-                        const Result& r = *(*current_view)[selected];
+                        const SearchResult& r = *(*current_view)[selected];
                         if (ImGui::BeginTabBar("QuickViewTabs")) {
                             if (ImGui::BeginTabItem("Info")) {
                                 ImGui::Text("Path: %s", r.path.c_str());
@@ -1647,7 +1723,7 @@ int run_ui(void){
                                 if (r.stage < 2) {
                                     ImGui::TextDisabled("Loading preview...");
                                 } else if (r.type == "image" || !r.preview_path.empty()) {
-                                    if (r.texture == 0) load_result_texture(const_cast<Result&>(r));
+                                    if (r.texture == 0) load_result_texture(const_cast<SearchResult&>(r));
                                     if (r.texture != 0) {
                                         float aspect = static_cast<float>(r.height) / static_cast<float>(r.width);
                                         float preview_width = ImGui::GetContentRegionAvail().x;
@@ -1668,7 +1744,7 @@ int run_ui(void){
                                         std::string ext;
                                         size_t d = r.filename.rfind('.');
                                         if (d != std::string::npos) ext = to_lower(r.filename.substr(d + 1));
-                                        if (ext == "py") g_code_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::Python());
+                                        if (ext == "c" || ext == "h") g_code_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::C());
                                         else g_code_editor.SetLanguageDefinition(TextEditor::LanguageDefinition::CPlusPlus());
                                         g_code_editor.SetText(r.snippet);
                                     }
