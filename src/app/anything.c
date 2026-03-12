@@ -2806,8 +2806,22 @@ int wmain(int argc, wchar_t** argv){
     Args args;
     live_updates_init();
     if(!parse_args(argc, argv, &args)) return 1;
-    enterprise_ad_authenticate("user", "");
-    enterprise_index_network("\\\\networkshare");
+
+    /* Enterprise authentication: read credentials from environment. */
+    const char* ent_user = getenv("ANYTHING_ENTERPRISE_USER");
+    const char* ent_pass = getenv("ANYTHING_ENTERPRISE_PASSWORD");
+    const char* ent_share = getenv("ANYTHING_ENTERPRISE_SHARE");
+    if(ent_user && ent_user[0] && ent_pass){
+        void* ent_session = enterprise_ad_login(ent_user, ent_pass);
+        if(!ent_session){
+            fwprintf(stderr, L"[enterprise] Authentication failed. Aborting.\n");
+            return 1;
+        }
+        enterprise_close_session(ent_session);
+    }
+    if(ent_share && ent_share[0]){
+        enterprise_index_network(ent_share);
+    }
 
     Db* db=NULL;
     if(!db_create(args.dbPath, /*init_mb*/1024, /*max_mb*/16384, &db)){

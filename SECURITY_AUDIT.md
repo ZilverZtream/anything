@@ -7,7 +7,7 @@ The data source plugins (Microsoft Mail, Gmail, iCloud, Web Archive) currently s
 
 ### Current Implementation
 
-#### What Works ✅
+#### What Works
 1. **Linux**: Enforces 0600 file permissions (user-only read/write)
 2. **Windows**: Verifies file ACLs using GetSecurityInfo API to ensure owner-only access
 3. **All Platforms**: Warns users about insecure environment variable usage
@@ -15,7 +15,7 @@ The data source plugins (Microsoft Mail, Gmail, iCloud, Web Archive) currently s
 5. **Error handling**: Fails safely if permissions are incorrect (all platforms)
 6. **Windows**: Sets owner-only ACLs when creating token store files
 
-#### What's Missing ❌
+#### What's Missing
 1. **OS Credential Manager Integration**: Tokens should use platform APIs
    - **Windows**: Should use `CredWrite/CredRead` from Credential Manager
    - **macOS**: Should use Keychain Services API
@@ -45,7 +45,7 @@ The data source plugins (Microsoft Mail, Gmail, iCloud, Web Archive) currently s
 
 ### Implementation Priority
 
-1. **~~HIGH~~** ✅ **COMPLETED**: Implement Windows ACL checking (GetSecurityInfo)
+1. **~~HIGH~~** COMPLETED: Implement Windows ACL checking (GetSecurityInfo)
    - Implemented in `microsoft_mail_plugin.c` with `verify_windows_acl()` function
    - Verifies file ownership and checks for unauthorized access by other users/groups
    - Sets owner-only ACLs when creating token store files
@@ -54,7 +54,30 @@ The data source plugins (Microsoft Mail, Gmail, iCloud, Web Archive) currently s
 
 ---
 
+## Audit Fix Log (Section 5/6 Remediation)
+
+### Fixes Applied
+
+| Finding | Severity | Fix | Files Changed |
+|---------|----------|-----|---------------|
+| Plugin loader OOB write | High | Pre-check bounds before array store in Windows do...while loop | `src/system/plugin.c` |
+| Enterprise auth bypass | High | New session-based API (`enterprise_ad_login`/`enterprise_check_permission` with user token), fail-closed, no hardcoded credentials | `include/anything/enterprise.h`, `src/enterprise/enterprise.c`, `src/core/search.c`, `src/app/anything.c` |
+| Cloud sync false-success | High | `CloudSync_Download`/`CloudSync_Upload` (non-Windows) now return FALSE instead of silent TRUE; team_id=0 rejected | `src/services/cloud.c` |
+| Predictable shared secret | Medium | Replaced `rand()%36` with CSPRNG (`RtlGenRandom`/`/dev/urandom`) | `src/services/cloud.c` |
+| Queue stall on cancel | Medium | Added `CancelToken` and max-retry bounds to `enqueue_item` loop | `src/services/cloud.c`, `include/anything/cloud.h` |
+
+### Tests Added
+
+| Test File | Covers |
+|-----------|--------|
+| `tests/plugin_test.c` | Plugin loader bounds enforcement (>16 plugins) |
+| `tests/enterprise_test.c` | Enterprise auth API contract (fail-closed, NULL safety) |
+| `tests/cloud_test.c` | Cloud sync false-success prevention, team_id validation, secret entropy |
+| `tests/queue_test.c` | MPMC queue operations, cancel token stops blocked producer |
+
+---
+
 **Audit Date**: 2025-12-04
-**Last Update**: 2025-12-04
+**Last Update**: 2026-03-12
 **Auditor**: Production code review
-**Status**: Windows ACL checking implemented; remaining TODOs documented and not blocking release
+**Status**: Section 5/6 audit remediation complete; credential storage TODOs remain documented

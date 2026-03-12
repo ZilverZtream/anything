@@ -5,6 +5,12 @@
 #include "../../third_party/cJSON/cJSON.h"
 #ifdef _WIN32
 #include <malloc.h>
+/* RtlGenRandom (SystemFunction036) for CSPRNG */
+#ifdef __cplusplus
+extern "C"
+#endif
+BOOLEAN NTAPI SystemFunction036(PVOID, ULONG);
+#define RtlGenRandom SystemFunction036
 #else
 #include <sched.h>
 #include <malloc.h>
@@ -258,11 +264,14 @@ static uint64_t parse_rfc3339(const char* s){
     return (uint64_t)t;
 }
 
-static void enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_utf8,
-                         uint64_t size, uint64_t ctime, uint64_t mtime, BOOL is_dir){
-    if(!q) return;
+#define ENQUEUE_MAX_RETRIES 100000
+
+static BOOL enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_utf8,
+                         uint64_t size, uint64_t ctime, uint64_t mtime, BOOL is_dir,
+                         CancelToken* cancel){
+    if(!q) return FALSE;
     DbWorkItem* wi = (DbWorkItem*)aligned_malloc(sizeof(DbWorkItem), CACHE_LINE_SIZE);
-    if(!wi) return;
+    if(!wi) return FALSE;
     wi->content = NULL;
     wi->preview = NULL;
     wcscpy_s(wi->parent_path, MAX_LONG_PATH, parent);
@@ -278,11 +287,19 @@ static void enqueue_item(MPMCQueue* q, const wchar_t* parent, const char* name_u
     wi->hash_ready = FALSE;
     wi->stage = INDEX_METADATA_LIGHT;
     wi->op = WI_ADD;
+    int retries = 0;
+    while(!MPMC_Push(q, wi)){
+        if(is_cancelled(cancel) || ++retries > ENQUEUE_MAX_RETRIES){
+            aligned_free(wi);
+            return FALSE;
+        }
 #ifdef _WIN32
-    while(!MPMC_Push(q, wi)) { SwitchToThread(); }
+        SwitchToThread();
 #else
-    while(!MPMC_Push(q, wi)) { sched_yield(); }
+        sched_yield();
 #endif
+    }
+    return TRUE;
 }
 
 // Obtain OAuth2 token using refresh_token flow. Credentials are taken from environment variables.
@@ -357,7 +374,7 @@ cleanup:
 }
 
 // ---- Provider specific scanners ----
-static void onedrive_walk(const char* token, const wchar_t* root, const char* root_id, MPMCQueue* q){
+static void onedrive_walk(const char* token, const wchar_t* root, const char* root_id, MPMCQueue* q, CancelToken* cancel){
     typedef struct ODriveNode {
         struct ODriveNode* next;
         wchar_t parent[MAX_LONG_PATH];
@@ -418,7 +435,7 @@ static void onedrive_walk(const char* token, const wchar_t* root, const char* ro
                     if(cJSON_IsString(mtime)) mt = parse_rfc3339(mtime->valuestring);
                 }
                 BOOL is_dir = cJSON_GetObjectItemCaseSensitive(item, "folder") != NULL;
-                enqueue_item(q, curr->parent, name->valuestring, size, ct, mt, is_dir);
+                enqueue_item(q, curr->parent, name->valuestring, size, ct, mt, is_dir, cancel);
                 if(is_dir){
                     ODriveNode* child=(ODriveNode*)malloc(sizeof(ODriveNode));
                     if(child){
@@ -445,7 +462,7 @@ cleanup_odrive:
     }
 }
 
-static void google_drive_walk(const char* token, const wchar_t* root, const char* root_id, MPMCQueue* q){
+static void google_drive_walk(const char* token, const wchar_t* root, const char* root_id, MPMCQueue* q, CancelToken* cancel){
     typedef struct GDriveNode {
         struct GDriveNode* next;
         wchar_t parent[MAX_LONG_PATH];
@@ -508,7 +525,7 @@ static void google_drive_walk(const char* token, const wchar_t* root, const char
                 uint64_t mt=0;
                 cJSON* mtime = cJSON_GetObjectItemCaseSensitive(item, "modifiedTime");
                 if(cJSON_IsString(mtime)) mt = parse_rfc3339(mtime->valuestring);
-                enqueue_item(q,curr->parent,name->valuestring,size,mt,mt,is_dir);
+                enqueue_item(q,curr->parent,name->valuestring,size,mt,mt,is_dir,cancel);
                 if(is_dir){
                     GDriveNode* child=(GDriveNode*)malloc(sizeof(GDriveNode));
                     if(child){
@@ -535,7 +552,7 @@ cleanup_gdrive:
     }
 }
 
-static void pcloud_process(cJSON* contents, const wchar_t* parent, MPMCQueue* q){
+static void pcloud_process(cJSON* contents, const wchar_t* parent, MPMCQueue* q, CancelToken* cancel){
     if(!cJSON_IsArray(contents)) return;
     cJSON* item;
     cJSON_ArrayForEach(item, contents){
@@ -546,18 +563,18 @@ static void pcloud_process(cJSON* contents, const wchar_t* parent, MPMCQueue* q)
         uint64_t size=0;
         if(cJSON_IsNumber(sizeItem)) size = (uint64_t)sizeItem->valuedouble;
         BOOL is_dir = cJSON_IsNumber(isfolder) && isfolder->valueint==1;
-        enqueue_item(q,parent,name->valuestring,size,0,0,is_dir);
+        enqueue_item(q,parent,name->valuestring,size,0,0,is_dir,cancel);
         if(is_dir){
             wchar_t child_parent[MAX_LONG_PATH];
             wchar_t wname[MAX_PATH]; to_wide(name->valuestring,wname,MAX_PATH);
             path_join(child_parent,MAX_LONG_PATH,parent,wname);
             cJSON* sub = cJSON_GetObjectItemCaseSensitive(item, "contents");
-            if(sub) pcloud_process(sub, child_parent, q);
+            if(sub) pcloud_process(sub, child_parent, q, cancel);
         }
     }
 }
 
-static void pcloud_walk(const char* token, const wchar_t* parent, MPMCQueue* q){
+static void pcloud_walk(const char* token, const wchar_t* parent, MPMCQueue* q, CancelToken* cancel){
     char path[512];
     snprintf(path,512,"/listfolder?auth=%s&folderid=0&recursive=1", token);
     char* resp=NULL; if(!http_request("api.pcloud.com", path, "GET", "", NULL,&resp)) return;
@@ -566,14 +583,14 @@ static void pcloud_walk(const char* token, const wchar_t* parent, MPMCQueue* q){
         cJSON* metadata = cJSON_GetObjectItemCaseSensitive(root, "metadata");
         if(metadata){
             cJSON* contents = cJSON_GetObjectItemCaseSensitive(metadata, "contents");
-            if(contents) pcloud_process(contents, parent, q);
+            if(contents) pcloud_process(contents, parent, q, cancel);
         }
         cJSON_Delete(root);
     }
     free(resp);
 }
 
-static void dropbox_walk(const char* token, const wchar_t* parent, MPMCQueue* q){
+static void dropbox_walk(const char* token, const wchar_t* parent, MPMCQueue* q, CancelToken* cancel){
     char headers[512];
     snprintf(headers,512,"Authorization: Bearer %s\r\nContent-Type: application/json\r\n", token);
     const char* body="{\"path\":\"\",\"recursive\":true}";
@@ -595,7 +612,7 @@ static void dropbox_walk(const char* token, const wchar_t* parent, MPMCQueue* q)
                     wchar_t full_parent[MAX_LONG_PATH];
                     wchar_t wpath[MAX_LONG_PATH]; to_wide(path_lower->valuestring,wpath,MAX_LONG_PATH);
                     path_dirname(wpath,full_parent,MAX_LONG_PATH);
-                    enqueue_item(q,full_parent,name->valuestring,size,0,0,is_dir);
+                    enqueue_item(q,full_parent,name->valuestring,size,0,0,is_dir,cancel);
                 }
             }
         }
@@ -604,7 +621,7 @@ static void dropbox_walk(const char* token, const wchar_t* parent, MPMCQueue* q)
     free(resp);
 }
 
-BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
+BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue, CancelToken* cancel){
     if(!db || !out_queue) return FALSE;
     CloudToken token_store; cloud_token_init(&token_store);
     if(!obtain_token(provider,&token_store)){
@@ -627,16 +644,16 @@ BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
     switch(provider){
     case CLOUD_ONEDRIVE:
         wcscpy_s(root,MAX_LONG_PATH,L"OneDrive:");
-        onedrive_walk(token,root,NULL,out_queue); break;
+        onedrive_walk(token,root,NULL,out_queue,cancel); break;
     case CLOUD_GOOGLE_DRIVE:
         wcscpy_s(root,MAX_LONG_PATH,L"GDrive:");
-        google_drive_walk(token,root,NULL,out_queue); break;
+        google_drive_walk(token,root,NULL,out_queue,cancel); break;
     case CLOUD_PCLOUD:
         wcscpy_s(root,MAX_LONG_PATH,L"pCloud:");
-        pcloud_walk(token,root,out_queue); break;
+        pcloud_walk(token,root,out_queue,cancel); break;
     case CLOUD_DROPBOX:
         wcscpy_s(root,MAX_LONG_PATH,L"Dropbox:");
-        dropbox_walk(token,root,out_queue); break;
+        dropbox_walk(token,root,out_queue,cancel); break;
     default:
         sensitive_free(&plain_token);
         cloud_token_clear(&token_store);
@@ -658,22 +675,44 @@ BOOL CloudScanner_Start(CloudProvider provider, Db* db, MPMCQueue* out_queue){
     return TRUE;
 }
 
+static BOOL csprng_bytes(void* buf, size_t len){
+#ifdef _WIN32
+    return RtlGenRandom(buf, (ULONG)len);
+#else
+    FILE* f = fopen("/dev/urandom", "rb");
+    if(!f) return FALSE;
+    size_t r = fread(buf, 1, len, f);
+    fclose(f);
+    return r == len;
+#endif
+}
+
 BOOL CloudSync_CreateSharedIndex(SharedIndex* idx, uint64_t team_id, uint8_t permissions){
     if(!idx) return FALSE;
     idx->team_id = team_id;
     idx->access_permissions = permissions;
+
+    unsigned char raw[31];
+    if(!csprng_bytes(raw, sizeof(raw))){
+        return FALSE;
+    }
     for(int i=0;i<31;i++){
-        int r = rand() % 36;
+        int r = raw[i] % 36;
         if(r < 10) idx->shared_secret[i] = '0' + r;
         else idx->shared_secret[i] = 'A' + (r-10);
     }
     idx->shared_secret[31] = '\0';
+    secure_memzero(raw, sizeof(raw));
     return TRUE;
 }
 
 BOOL CloudSync_Upload(Db* db, CloudProvider provider, const SharedIndex* idx){
     (void)provider;
     if(!db || !idx) return FALSE;
+    if(idx->team_id == 0){
+        fprintf(stderr, "[cloud] CloudSync_Upload: invalid team_id (0)\n");
+        return FALSE;
+    }
 #ifdef _WIN32
     wchar_t tmp[MAX_PATH];
     if(GetTempFileNameW(L".", L"cs", 0, tmp)==0) return FALSE;
@@ -681,15 +720,19 @@ BOOL CloudSync_Upload(Db* db, CloudProvider provider, const SharedIndex* idx){
     DeleteFileW(tmp);
     return ok;
 #else
-    (void)db;
-    return TRUE;
+    fprintf(stderr, "[cloud] CloudSync_Upload: not implemented on this platform\n");
+    return FALSE;
 #endif
 }
 
 BOOL CloudSync_Download(Db* db, CloudProvider provider, const SharedIndex* idx){
     (void)provider;
     if(!db || !idx) return FALSE;
-    // Real implementation would download and merge the index. Stub returns success.
-    return TRUE;
+    if(idx->team_id == 0){
+        fprintf(stderr, "[cloud] CloudSync_Download: invalid team_id (0)\n");
+        return FALSE;
+    }
+    fprintf(stderr, "[cloud] CloudSync_Download: not yet implemented\n");
+    return FALSE;
 }
 

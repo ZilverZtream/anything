@@ -14,7 +14,9 @@ typedef struct {
     AnythingPlugin* api;
 } LoadedPlugin;
 
-static LoadedPlugin g_plugins[16];
+#define MAX_PLUGINS 16
+
+static LoadedPlugin g_plugins[MAX_PLUGINS];
 static size_t g_plugin_count = 0;
 static PluginHost g_host;
 
@@ -27,6 +29,7 @@ void Plugin_LoadAll(const wchar_t* dir, PluginHost* host){
     HANDLE h = FindFirstFileW(pattern, &fd);
     if(h==INVALID_HANDLE_VALUE) return;
     do{
+        if(g_plugin_count >= MAX_PLUGINS) break;
         wchar_t path[MAX_PATH];
         _snwprintf(path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
         PluginModule mod = LoadLibraryW(path);
@@ -43,7 +46,7 @@ void Plugin_LoadAll(const wchar_t* dir, PluginHost* host){
         g_plugins[g_plugin_count].module = mod;
         g_plugins[g_plugin_count].api = api;
         g_plugin_count++;
-    }while(FindNextFileW(h, &fd) && g_plugin_count < 16);
+    }while(FindNextFileW(h, &fd));
     FindClose(h);
 #else
     char dir_mb[PATH_MAX];
@@ -51,7 +54,7 @@ void Plugin_LoadAll(const wchar_t* dir, PluginHost* host){
     DIR* d = opendir(dir_mb);
     if(!d) return;
     struct dirent* ent;
-    while((ent = readdir(d)) && g_plugin_count < 16){
+    while((ent = readdir(d)) && g_plugin_count < MAX_PLUGINS){
         const char* name = ent->d_name;
         size_t len = strlen(name);
         int is_shared = 0;

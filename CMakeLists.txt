@@ -88,7 +88,7 @@ target_link_libraries(anything_core PUBLIC
     CURL::libcurl
     cjson
     libzip::zip
-    zstd::zstd
+    zstd::libzstd
 )
 
 if(UNIX)
@@ -100,7 +100,7 @@ if(UNIX AND NOT APPLE)
 endif()
 
 if(WIN32)
-    target_link_libraries(anything_core PUBLIC Shlwapi.lib Ole32.lib Query.lib)
+    target_link_libraries(anything_core PUBLIC Shlwapi.lib Ole32.lib Query.lib Advapi32.lib Crypt32.lib)
 endif()
 
 # =============================================================================
@@ -116,8 +116,6 @@ target_sources(anything_ui PRIVATE
     "third_party/cJSON/cJSON.c"
 )
 
-add_executable(search_test "tests/search_test.c")
-
 # =============================================================================
 # Link Libraries to Executables
 # =============================================================================
@@ -132,8 +130,6 @@ target_link_libraries(anything_ui PRIVATE
     CURL::libcurl
     cjson
 )
-
-target_link_libraries(search_test PRIVATE anything_core)
 
 if(WIN32)
     target_link_libraries(anything_ui PRIVATE gdiplus.lib d2d1.lib dwrite.lib Shlwapi.lib Shell32.lib)
@@ -162,7 +158,79 @@ add_anything_plugin(duplicates_plugin "plugins/system/duplicates_plugin.c")
 add_anything_plugin(registry_plugin "plugins/system/registry_plugin.c")
 
 # --- Link plugin-specific dependencies (with corrected target names) ---
-# --- FIX: Changed libgit2::git2 to libgit2::libgit2package ---
 target_link_libraries(git_plugin PRIVATE libgit2::libgit2package)
 target_link_libraries(ocr_plugin PRIVATE Tesseract::libtesseract)
 target_link_libraries(web_archive_plugin PRIVATE unofficial::gumbo::gumbo unofficial::sqlite3::sqlite3)
+
+# =============================================================================
+# Tests (CTest)
+# =============================================================================
+enable_testing()
+
+# Test stubs for cross-platform testing (Unix stubs for Windows APIs)
+set(TEST_STUBS "")
+if(NOT WIN32)
+    set(TEST_STUBS
+        tests/stubs/windows_stub.c
+        tests/stubs/bcrypt_stub.c
+    )
+endif()
+
+# Search test (existing)
+add_executable(search_test "tests/search_test.c" ${TEST_STUBS})
+target_link_libraries(search_test PRIVATE anything_core)
+if(NOT WIN32)
+    target_include_directories(search_test PRIVATE tests/stubs)
+endif()
+add_test(NAME search_test COMMAND search_test)
+
+# Database test (existing)
+add_executable(database_test "tests/database_test.c" ${TEST_STUBS})
+target_link_libraries(database_test PRIVATE anything_core)
+if(NOT WIN32)
+    target_include_directories(database_test PRIVATE tests/stubs)
+endif()
+add_test(NAME database_test COMMAND database_test)
+
+# Util test (existing)
+add_executable(util_test "tests/util_test.c" ${TEST_STUBS})
+target_link_libraries(util_test PRIVATE anything_core)
+if(NOT WIN32)
+    target_include_directories(util_test PRIVATE tests/stubs)
+endif()
+add_test(NAME util_test COMMAND util_test)
+
+# Plugin loader bounds test (new — audit fix)
+add_executable(plugin_test "tests/plugin_test.c" ${TEST_STUBS})
+target_link_libraries(plugin_test PRIVATE anything_core)
+if(NOT WIN32)
+    target_include_directories(plugin_test PRIVATE tests/stubs)
+endif()
+add_test(NAME plugin_test COMMAND plugin_test)
+
+# Enterprise auth test (new — audit fix)
+add_executable(enterprise_test "tests/enterprise_test.c" ${TEST_STUBS})
+target_link_libraries(enterprise_test PRIVATE anything_core)
+if(NOT WIN32)
+    target_include_directories(enterprise_test PRIVATE tests/stubs)
+endif()
+add_test(NAME enterprise_test COMMAND enterprise_test)
+
+# Cloud sync test (new — audit fix)
+add_executable(cloud_test "tests/cloud_test.c" ${TEST_STUBS})
+target_link_libraries(cloud_test PRIVATE anything_core)
+if(WIN32)
+    target_link_libraries(cloud_test PRIVATE Crypt32.lib Advapi32.lib)
+endif()
+if(NOT WIN32)
+    target_include_directories(cloud_test PRIVATE tests/stubs)
+endif()
+add_test(NAME cloud_test COMMAND cloud_test)
+
+# Queue + cancellation test (new — audit fix)
+add_executable(queue_test "tests/queue_test.c" ${TEST_STUBS})
+target_link_libraries(queue_test PRIVATE anything_core)
+if(NOT WIN32)
+    target_include_directories(queue_test PRIVATE tests/stubs)
+endif()
+add_test(NAME queue_test COMMAND queue_test)

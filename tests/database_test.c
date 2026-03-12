@@ -2,12 +2,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <wchar.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#else
+#include <unistd.h>
+#endif
 
-#include "anything/database.h"
+#include <lmdb.h>
 #include "anything/anything.h"
-#include "../third_party/lmdb/lmdb.h"
+#include "anything/database.h"
 
 extern void extract_trigrams(const char* text, uint32_t** out_tris, size_t* out_count);
 extern uint32_t build_bloom_for_name(const char* name_u8, uint8_t* bloom);
@@ -22,10 +28,22 @@ static BOOL bloom_has_local(const uint8_t* bloom, uint32_t h){
 }
 
 static void make_temp_dir(wchar_t* out, size_t outsz){
+#ifdef _WIN32
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    wchar_t dir[MAX_PATH];
+    GetTempFileNameW(tmp, L"adb", 0, dir);
+    /* GetTempFileNameW creates a file; delete it so we can make a dir */
+    _wremove(dir);
+    _wmkdir(dir);
+    wcsncpy(out, dir, outsz);
+    out[outsz-1] = 0;
+#else
     char tmpl[] = "/tmp/adbXXXXXX";
     char* dir = mkdtemp(tmpl);
     assert(dir);
     mbstowcs(out, dir, outsz);
+#endif
 }
 
 static int read_string_meta(const wchar_t* path, uint64_t id, StringMeta* out){

@@ -3,6 +3,11 @@
 
 #ifdef ENTERPRISE
 
+typedef struct EnterpriseSession {
+    HANDLE token;
+    char username[256];
+} EnterpriseSession;
+
 static void index_share_recursive(const wchar_t* path){
     wchar_t pattern[MAX_LONG_PATH];
     _snwprintf(pattern, MAX_LONG_PATH, L"%s\\*.*", path);
@@ -28,50 +33,83 @@ void enterprise_index_network(const char *share){
     index_share_recursive(wshare);
 }
 
-int enterprise_check_permission(const char *user, const char *path){
-    (void)user; // In a full implementation we would evaluate this specific user's token
-    if(!path) return 0;
+void* enterprise_ad_login(const char *user, const char *password){
+    if(!user || !password) return NULL;
+    if(user[0] == '\0') return NULL;
+
+    HANDLE tok = NULL;
+    if(!LogonUserA(user, NULL, password, LOGON32_LOGON_NETWORK,
+                   LOGON32_PROVIDER_DEFAULT, &tok)){
+        fprintf(stderr, "[enterprise] AD authentication failed for '%s' (err=%lu)\n",
+                user, GetLastError());
+        return NULL;
+    }
+
+    EnterpriseSession* session = (EnterpriseSession*)calloc(1, sizeof(EnterpriseSession));
+    if(!session){
+        CloseHandle(tok);
+        return NULL;
+    }
+    session->token = tok;
+    strncpy(session->username, user, sizeof(session->username) - 1);
+    session->username[sizeof(session->username) - 1] = '\0';
+    return session;
+}
+
+void enterprise_close_session(void* session_ptr){
+    if(!session_ptr) return;
+    EnterpriseSession* session = (EnterpriseSession*)session_ptr;
+    if(session->token) CloseHandle(session->token);
+    SecureZeroMemory(session, sizeof(EnterpriseSession));
+    free(session);
+}
+
+const char* enterprise_session_user(void* session_ptr){
+    if(!session_ptr) return "";
+    return ((EnterpriseSession*)session_ptr)->username;
+}
+
+int enterprise_check_permission(void* session_ptr, const char *path){
+    /* Fail-closed: no session or no path means no access. */
+    if(!session_ptr || !path) return 0;
+
+    EnterpriseSession* session = (EnterpriseSession*)session_ptr;
+    if(!session->token) return 0;
 
     PSECURITY_DESCRIPTOR sd = NULL;
     DWORD err = GetNamedSecurityInfoA(path, SE_FILE_OBJECT,
-                                      DACL_SECURITY_INFORMATION,
+                                      DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
                                       NULL, NULL, NULL, NULL, &sd);
     if(err != ERROR_SUCCESS) return 0;
-
-    HANDLE token = NULL;
-    if(!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)){
-        LocalFree(sd);
-        return 0;
-    }
 
     DWORD desired = FILE_GENERIC_READ;
     GENERIC_MAPPING mapping = { FILE_GENERIC_READ, FILE_GENERIC_WRITE,
                                 FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS };
     MapGenericMask(&desired, &mapping);
-    PRIVILEGE_SET privs; DWORD privs_len = sizeof(privs); DWORD granted = 0; BOOL access = FALSE;
-    if(!AccessCheck(sd, token, desired, &mapping, &privs, &privs_len, &granted, &access)){
+    PRIVILEGE_SET privs;
+    DWORD privs_len = sizeof(privs);
+    DWORD granted = 0;
+    BOOL access = FALSE;
+    if(!AccessCheck(sd, session->token, desired, &mapping,
+                    &privs, &privs_len, &granted, &access)){
         access = FALSE;
     }
 
-    CloseHandle(token);
     LocalFree(sd);
     return access ? 1 : 0;
 }
 
 void enterprise_audit_log(const char *user, const char *query){
+    if(!user || !query) return;
     FILE *f = fopen("audit.log", "a");
     if(!f) return;
-    fprintf(f, "%s\t%s\n", user, query);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d\t%s\t%s\n",
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond,
+            user, query);
     fclose(f);
-}
-
-int enterprise_ad_authenticate(const char *user, const char *password){
-    HANDLE tok=NULL;
-    if(LogonUserA(user, NULL, password, LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, &tok)){
-        CloseHandle(tok);
-        return 1;
-    }
-    return 0;
 }
 
 void enterprise_deploy_msi(void){
