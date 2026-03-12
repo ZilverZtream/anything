@@ -2798,8 +2798,16 @@ int wmain(int argc, wchar_t** argv){
             }
         }
     }
-    enterprise_audit_log("user", qcanon);
-    enterprise_ad_authenticate("user", "");
+    /* Enterprise authentication: read credentials from environment. */
+    const char* ent_user = getenv("ANYTHING_ENTERPRISE_USER");
+    const char* ent_pass = getenv("ANYTHING_ENTERPRISE_PASSWORD");
+    if(!ent_user) ent_user = "";
+    if(!ent_pass) ent_pass = "";
+
+    void* ent_session = enterprise_ad_login(ent_user, ent_pass);
+    const char* session_user = enterprise_session_user(ent_session);
+    enterprise_audit_log(session_user, qcanon);
+
     wchar_t dbPath[MAX_LONG_PATH];
     SearchQuery q; TokenList tokens;
     int workers = g_config.default_search_workers; bool json_output=false;
@@ -2818,10 +2826,14 @@ int wmain(int argc, wchar_t** argv){
     if(workers<1) workers=1;
     if(workers>g_config.max_search_workers) workers=g_config.max_search_workers;
     parse_query(argc, argv, dbPath, &q, &tokens);
-    if(!dbPath[0]){ if(json_output) output_error(json_output, "missing --db"); else usage(); free_search_query(&q); tokenlist_free(&tokens); return 1; }
-    if(!enterprise_check_permission("user", "db")){
+    if(!dbPath[0]){ if(json_output) output_error(json_output, "missing --db"); else usage(); free_search_query(&q); tokenlist_free(&tokens); enterprise_close_session(ent_session); return 1; }
+
+    /* Permission check uses actual db path and authenticated session (fail-closed). */
+    char dbPathU8[MAX_LONG_PATH*3];
+    to_utf8(dbPath, dbPathU8, sizeof(dbPathU8));
+    if(!enterprise_check_permission(ent_session, dbPathU8)){
         output_error(json_output, "Permission denied");
-        free_search_query(&q); tokenlist_free(&tokens); return 1;
+        free_search_query(&q); tokenlist_free(&tokens); enterprise_close_session(ent_session); return 1;
     }
     if(admin_start || admin_pause){
         int rc = set_indexer_state(dbPath, admin_start, json_output);
@@ -2965,7 +2977,7 @@ int wmain(int argc, wchar_t** argv){
         if(mdb_get(txnprint, dbi_stringsP, &nk, &nv)==0) nstr=(const char*)nv.mv_data;
         char full_path[MAX_LONG_PATH*3];
         snprintf(full_path, sizeof(full_path), "%s\\%s", pstr, nstr);
-        if(!enterprise_check_permission("user", full_path)) continue;
+        if(!enterprise_check_permission(ent_session, full_path)) continue;
         if(json_output){
             printf("  {\"path\":");
             print_json_path(pstr, nstr);
@@ -2999,5 +3011,6 @@ int wmain(int argc, wchar_t** argv){
     idvec_free(&cache_copy);
     tokenlist_free(&tokens);
     close_bloom();
+    enterprise_close_session(ent_session);
     return 0;
 }
